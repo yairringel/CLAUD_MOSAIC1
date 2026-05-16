@@ -1,0 +1,59 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Data / outputs / resources — kept locally only, not pushed to git.
+# (Re-creatable from the scripts in scripts/ and the workflows in workflows/.)
+# ──────────────────────────────────────────────────────────────────────────
+output/
+resources/
+
+# Input data files (sample CSVs etc.)
+A1.csv
+*.csv
+
+# Binary assets anywhere in the repo
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.dxf
+*.pdf
+
+# ──────────────────────────────────────────────────────────────────────────
+# Python
+# ──────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# ──────────────────────────────────────────────────────────────────────────
+# IDE / editor / OS
+# ──────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ──────────────────────────────────────────────────────────────────────────
+# Claude Code local settings (per-user, do not push)
+# ──────────────────────────────────────────────────────────────────────────
+.claude/
+
+# ──────────────────────────────────────────────────────────────────────────
+# Secrets — never commit
+# ──────────────────────────────────────────────────────────────────────────
+.env
+*.key
+*credentials*
