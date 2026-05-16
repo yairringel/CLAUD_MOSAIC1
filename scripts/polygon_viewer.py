@@ -185,7 +185,23 @@ def load_polygons(csv_path: Path) -> tuple[list, list, tuple[float, float, float
 # ---------------------------------------------------------------------------
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-TILES_DIR = ROOT_DIR / "output" / "roman colors"
+DEFAULT_TILES_DIR = ROOT_DIR / "output" / "roman colors"
+
+
+def _count_hex_pngs(folder: Path) -> int:
+    """How many *.png files in `folder` have a 6-hex-char stem (tile library format)."""
+    if not folder.exists():
+        return 0
+    n = 0
+    for p in folder.glob("*.png"):
+        stem = p.stem
+        if len(stem) == 6:
+            try:
+                int(stem, 16)
+                n += 1
+            except ValueError:
+                pass
+    return n
 
 
 class PolygonViewer:
@@ -193,7 +209,7 @@ class PolygonViewer:
         self.root = root
         self.root.title("Polygon Viewer")
         self.root.geometry("1100x850")
-        self.tile_library = TileLibrary(TILES_DIR)
+        self.tile_library: TileLibrary | None = None  # chosen on first Create Image
 
         # menu
         menubar = tk.Menu(root)
@@ -203,6 +219,8 @@ class PolygonViewer:
         filemenu.add_separator()
         filemenu.add_command(label="Create Image...", command=self.create_image,
                              accelerator="Ctrl+E")
+        filemenu.add_command(label="Set Tile Library...", command=self.set_tile_library,
+                             accelerator="Ctrl+L")
         filemenu.add_separator()
         filemenu.add_command(label="Exit", command=root.quit, accelerator="Ctrl+Q")
         menubar.add_cascade(label="File", menu=filemenu)
@@ -222,6 +240,7 @@ class PolygonViewer:
         root.bind_all("<Control-o>", lambda e: self.open_csv())
         root.bind_all("<Control-q>", lambda e: root.quit())
         root.bind_all("<Control-e>", lambda e: self.create_image())
+        root.bind_all("<Control-l>", lambda e: self.set_tile_library())
         root.bind_all("<F5>", lambda e: self.reload())
         root.bind_all("<f>", lambda e: self.fit_view())
 
@@ -352,17 +371,53 @@ class PolygonViewer:
     # Create Image: render polygons filled with their nearest-matching tiles
     # -----------------------------------------------------------------------
 
+    def _pick_tile_library(self, title: str = "Choose tile library folder") -> bool:
+        """Prompt for a tile-library folder, validate it, store on self.tile_library.
+
+        Returns True if a valid library is now set, False if the user cancelled or
+        the chosen folder has no hex-named PNGs.
+        """
+        if self.tile_library is not None:
+            initial = str(self.tile_library.tiles_dir)
+        elif DEFAULT_TILES_DIR.exists():
+            initial = str(DEFAULT_TILES_DIR)
+        else:
+            initial = str(ROOT_DIR / "output") if (ROOT_DIR / "output").exists() else str(ROOT_DIR)
+
+        chosen = filedialog.askdirectory(
+            title=title,
+            initialdir=initial,
+            mustexist=True,
+            parent=self.root,
+        )
+        if not chosen:
+            return False
+
+        folder = Path(chosen)
+        n = _count_hex_pngs(folder)
+        if n == 0:
+            messagebox.showerror(
+                "Not a tile library",
+                f"No hex-named PNGs (e.g. 5E251A.png) found in:\n{folder}\n\n"
+                "Pick a folder produced by scripts/divide_into_tesserae.py.",
+            )
+            return False
+
+        self.tile_library = TileLibrary(folder)
+        self.status.config(text=f"tile library: {folder}  ({n} tiles)")
+        return True
+
+    def set_tile_library(self) -> None:
+        """Menu command: switch the active tile library."""
+        self._pick_tile_library(title="Set tile library folder")
+
     def create_image(self) -> None:
         if not self.coords_list:
             messagebox.showinfo("No data", "Open a CSV first.")
             return
-        if not self.tile_library.is_available():
-            messagebox.showerror(
-                "Tile library missing",
-                f"Could not find tiles in:\n{TILES_DIR}\n\n"
-                "Run scripts/divide_into_tesserae.py first to generate them.",
-            )
-            return
+        if self.tile_library is None:
+            if not self._pick_tile_library(title="Choose tile library for rendering"):
+                return
 
         dpi = simpledialog.askinteger(
             "Output DPI",
