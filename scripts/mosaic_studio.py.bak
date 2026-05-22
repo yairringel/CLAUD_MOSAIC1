@@ -10,7 +10,6 @@ application:
 """
 
 import sys
-import os
 import csv
 import math
 import random
@@ -19,10 +18,9 @@ import cv2
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QPushButton, QFileDialog, QLabel,
                            QMessageBox, QCheckBox, QLineEdit, QDialog,
-                           QSpinBox, QDoubleSpinBox, QGroupBox, QInputDialog)
+                           QSpinBox, QDoubleSpinBox, QGroupBox)
 from PyQt5.QtCore import Qt, QPointF, QRect
-from PyQt5.QtGui import (QPainter, QPen, QBrush, QColor, QPolygonF, QFont,
-                         QWheelEvent, QImage)
+from PyQt5.QtGui import QPainter, QPen, QBrush, QColor, QPolygonF, QFont, QWheelEvent
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
@@ -211,7 +209,7 @@ class CutterCanvas(QWidget):
         
         # Grid variables
         self.show_grid = False  # Whether to show the grid
-        self.grid_size = 210  # Size of each individual grid box/cell in world coordinates
+        self.grid_size = 300  # Size of each individual grid box/cell in world coordinates
         self.grid_offset_x = 0  # Grid offset in world coordinates
         self.grid_offset_y = 0  # Grid offset in world coordinates
         self.grid_dragging = False  # Whether we're dragging the grid
@@ -817,7 +815,7 @@ class ControlPanel(QWidget):
         layout.addWidget(grid_size_label)
         
         self.grid_size_input = QLineEdit()
-        self.grid_size_input.setText('210')
+        self.grid_size_input.setText('300')
         self.grid_size_input.setPlaceholderText('Enter box size (e.g.,300)')
         self.grid_size_input.textChanged.connect(self.on_grid_size_changed)
         layout.addWidget(self.grid_size_input)
@@ -837,7 +835,7 @@ class ControlPanel(QWidget):
         layout.addWidget(offset_line_label)
         
         self.offset_line_input = QLineEdit()
-        self.offset_line_input.setText('1')
+        self.offset_line_input.setText('5')
         self.offset_line_input.setPlaceholderText('Enter offset % (e.g., 5)')
         self.offset_line_input.textChanged.connect(self.on_offset_line_changed)
         layout.addWidget(self.offset_line_input)
@@ -875,7 +873,7 @@ class ControlPanel(QWidget):
         rand_layout.addWidget(QLabel("Max ctrl pts / edge:"))
         self.rand_ctrl_spin = QSpinBox()
         self.rand_ctrl_spin.setRange(0, 30)
-        self.rand_ctrl_spin.setValue(5)
+        self.rand_ctrl_spin.setValue(2)
         self.rand_ctrl_spin.setToolTip(
             "Each edge picks a random number of extra vertices in [0, max].\n"
             "Shared edges always use the same count so polygons can't overlap."
@@ -885,7 +883,7 @@ class ControlPanel(QWidget):
         rand_layout.addWidget(QLabel("Strength (world units):"))
         self.rand_strength_spin = QDoubleSpinBox()
         self.rand_strength_spin.setRange(0.0, 1_000_000.0)
-        self.rand_strength_spin.setValue(1.0)
+        self.rand_strength_spin.setValue(10.0)
         self.rand_strength_spin.setSingleStep(1.0)
         self.rand_strength_spin.setDecimals(2)
         self.rand_strength_spin.setToolTip(
@@ -897,7 +895,7 @@ class ControlPanel(QWidget):
         rand_layout.addWidget(QLabel("Max downscale (%):"))
         self.rand_downscale_spin = QDoubleSpinBox()
         self.rand_downscale_spin.setRange(0.0, 99.0)
-        self.rand_downscale_spin.setValue(5.0)
+        self.rand_downscale_spin.setValue(0.0)
         self.rand_downscale_spin.setSingleStep(1.0)
         self.rand_downscale_spin.setDecimals(1)
         self.rand_downscale_spin.setToolTip(
@@ -923,12 +921,6 @@ class ControlPanel(QWidget):
         self.save_csv_btn.setEnabled(False)
         self.save_csv_btn.clicked.connect(self.on_save_csv_clicked)
         layout.addWidget(self.save_csv_btn)
-
-        # Save PNG button (renders current polygons to a PNG image)
-        self.save_png_btn = QPushButton("Save PNG")
-        self.save_png_btn.setEnabled(False)
-        self.save_png_btn.clicked.connect(self.on_save_png_clicked)
-        layout.addWidget(self.save_png_btn)
 
         # Add stretch to push everything to the top
         layout.addStretch()
@@ -960,7 +952,6 @@ class ControlPanel(QWidget):
                 self.randomize_btn.setEnabled(True)
                 self.reset_rand_btn.setEnabled(True)
                 self.save_csv_btn.setEnabled(True)
-                self.save_png_btn.setEnabled(True)
             else:
                 QMessageBox.warning(self, "Error", "Failed to load CSV file. Please check the file format.")
     
@@ -1116,115 +1107,6 @@ class ControlPanel(QWidget):
                         'color_a':    color.alpha() / 255.0,
                         'color_hex':  color.name(),
                     })
-
-    def on_save_png_clicked(self):
-        """Render the current polygon array to a PNG image at a user-chosen resolution."""
-        if not self.canvas or not self.canvas.polygons:
-            return
-
-        text, ok = QInputDialog.getText(
-            self, "Output resolution",
-            "Final resolution (WIDTHxHEIGHT, e.g. 1000x1000):",
-            text="1000x1000",
-        )
-        if not ok or not text.strip():
-            return
-        try:
-            w_str, h_str = text.lower().replace(" ", "").split("x")
-            out_w, out_h = int(w_str), int(h_str)
-            if out_w <= 0 or out_h <= 0:
-                raise ValueError
-        except Exception:
-            QMessageBox.critical(
-                self, "Invalid input",
-                "Please enter resolution as WIDTHxHEIGHT, e.g. 1000x1000.",
-            )
-            return
-
-        # Default to project output/ folder per project convention.
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        out_dir = os.path.join(project_root, "output")
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except Exception:
-            out_dir = ""
-        default_path = os.path.join(out_dir, "mosaic.png") if out_dir else ""
-
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save PNG", default_path, "PNG image (*.png);;All files (*.*)"
-        )
-        if not path:
-            return
-        if not path.lower().endswith(".png"):
-            path += ".png"
-
-        try:
-            self._render_polygons_to_png(path, out_w, out_h)
-            QMessageBox.information(self, "Saved", f"Saved {out_w}x{out_h} PNG.")
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Could not save PNG:\n{e}")
-
-    def _render_polygons_to_png(self, filename, out_w, out_h):
-        """Render canvas polygons into an out_w x out_h PNG with transparent
-        background, preserving aspect ratio and the canvas fill/edge settings."""
-        polygons   = self.canvas.polygons
-        colors     = self.canvas.colors
-        edge_colors = self.canvas.edge_colors
-        transparent_fill = self.canvas.transparent_fill
-
-        min_x = min_y = float('inf')
-        max_x = max_y = float('-inf')
-        for poly in polygons:
-            if poly is None:
-                continue
-            bx0, by0, bx1, by1 = poly.bounds
-            if bx0 < min_x: min_x = bx0
-            if by0 < min_y: min_y = by0
-            if bx1 > max_x: max_x = bx1
-            if by1 > max_y: max_y = by1
-        if not (max_x > min_x and max_y > min_y):
-            raise ValueError("No drawable polygons.")
-
-        world_w = max_x - min_x
-        world_h = max_y - min_y
-        scale = min(out_w / world_w, out_h / world_h)
-        used_w = world_w * scale
-        used_h = world_h * scale
-        off_x = (out_w - used_w) / 2.0
-        off_y = (out_h - used_h) / 2.0
-
-        image = QImage(out_w, out_h, QImage.Format_ARGB32)
-        image.fill(Qt.transparent)
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-
-        edge_pen_width = max(1.0, scale * 0.05)
-
-        for i, polygon in enumerate(polygons):
-            if polygon is None:
-                continue
-            color = colors[i] if i < len(colors) else QColor(100, 100, 100)
-            edge_color = edge_colors[i] if i < len(edge_colors) else QColor(0, 0, 0)
-
-            geoms = list(polygon.geoms) if hasattr(polygon, 'geoms') else [polygon]
-            for g in geoms:
-                if not hasattr(g, 'exterior'):
-                    continue
-                qt_poly = QPolygonF()
-                for x, y in g.exterior.coords:
-                    ix = off_x + (x - min_x) * scale
-                    iy = off_y + (y - min_y) * scale
-                    qt_poly.append(QPointF(ix, iy))
-                if transparent_fill:
-                    painter.setBrush(QBrush(Qt.NoBrush))
-                else:
-                    painter.setBrush(QBrush(color))
-                painter.setPen(QPen(edge_color, edge_pen_width))
-                painter.drawPolygon(qt_poly)
-
-        painter.end()
-        if not image.save(filename, "PNG"):
-            raise IOError(f"QImage.save returned False for {filename}")
 
     def on_cut_clicked(self):
         """Handle Cut button click - assign colors based on grid boxes"""

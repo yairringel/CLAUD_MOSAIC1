@@ -25,7 +25,7 @@ import math
 import sys
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import colorchooser, filedialog, messagebox, simpledialog
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -210,6 +210,7 @@ class PolygonViewer:
         self.root.title("Polygon Viewer")
         self.root.geometry("1100x850")
         self.tile_library: TileLibrary | None = None  # chosen on first Create Image
+        self.bg_color: str = "#ffffff"  # applied to preview and exported PNG
 
         # menu
         menubar = tk.Menu(root)
@@ -233,6 +234,8 @@ class PolygonViewer:
         self.invert_y = tk.BooleanVar(value=True)
         viewmenu.add_checkbutton(label="Invert Y axis (image style)", variable=self.invert_y,
                                  command=self._render)
+        viewmenu.add_separator()
+        viewmenu.add_command(label="Background Color...", command=self.choose_bg_color)
         menubar.add_cascade(label="View", menu=viewmenu)
         root.config(menu=menubar)
 
@@ -247,7 +250,7 @@ class PolygonViewer:
         # matplotlib figure
         self.fig, self.ax = plt.subplots(figsize=(10, 8), dpi=100)
         self.ax.set_aspect("equal")
-        self.ax.set_facecolor("#f0f0f0")
+        self.ax.set_facecolor(self.bg_color)
         self.fig.tight_layout()
 
         # canvas + toolbar
@@ -272,15 +275,23 @@ class PolygonViewer:
         self.bbox: tuple | None = None
         self.current_path: Path | None = None
 
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         if initial_csv:
             self.load_and_render(initial_csv)
         else:
             self._initial_message()
 
+    def _on_close(self) -> None:
+        """Cleanly shut down so closing via the window 'X' doesn't hang on the matplotlib figure."""
+        plt.close(self.fig)
+        self.root.quit()
+        self.root.destroy()
+
     def _initial_message(self) -> None:
         self.ax.clear()
         self.ax.set_aspect("equal")
-        self.ax.set_facecolor("#f0f0f0")
+        self.ax.set_facecolor(self.bg_color)
         self.ax.text(0.5, 0.5, "Open a CSV  (File > Open CSV)",
                      transform=self.ax.transAxes, ha="center", va="center",
                      fontsize=14, color="#888")
@@ -326,7 +337,7 @@ class PolygonViewer:
             return
         self.ax.clear()
         self.ax.set_aspect("equal")
-        self.ax.set_facecolor("#f0f0f0")
+        self.ax.set_facecolor(self.bg_color)
 
         edge = "#222" if self.show_outlines.get() else "none"
         lw = 0.5 if self.show_outlines.get() else 0
@@ -411,6 +422,18 @@ class PolygonViewer:
         """Menu command: switch the active tile library."""
         self._pick_tile_library(title="Set tile library folder")
 
+    def choose_bg_color(self) -> None:
+        """Pick a background color applied to the preview and exported PNG."""
+        _, hex_str = colorchooser.askcolor(color=self.bg_color, parent=self.root,
+                                           title="Background color")
+        if not hex_str:
+            return
+        self.bg_color = hex_str
+        if self.coords_list:
+            self._render()
+        else:
+            self._initial_message()
+
     def create_image(self) -> None:
         if not self.coords_list:
             messagebox.showinfo("No data", "Open a CSV first.")
@@ -489,7 +512,8 @@ class PolygonViewer:
         )
         self.root.update()
 
-        canvas_img = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+        bg_rgb = tuple(int(self.bg_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+        canvas_img = Image.new("RGB", (canvas_w, canvas_h), bg_rgb)
         rng = np.random.default_rng(seed=0)  # deterministic rotation angles per run
 
         n = len(self.coords_list)
