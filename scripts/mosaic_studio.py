@@ -1540,7 +1540,22 @@ class ControlPanel(QWidget):
             except ValueError:
                 QMessageBox.warning(self, "Invalid Input", "Please enter a valid number for fillet radius.")
                 return
-        
+
+        # Ask which DXFs to write: per-color split, or just all-polygons + tile shape.
+        dxf_choice = QMessageBox(self)
+        dxf_choice.setWindowTitle("DXF Output")
+        dxf_choice.setText("Save a separate DXF for each color?")
+        dxf_choice.setInformativeText(
+            "Yes — write one DXF per color, plus the all-polygons DXF and the outer tile shape.\n"
+            "No  — write only the all-polygons DXF and the outer tile shape."
+        )
+        dxf_choice.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+        dxf_choice.setDefaultButton(QMessageBox.Yes)
+        result = dxf_choice.exec_()
+        if result == QMessageBox.Cancel:
+            return
+        save_color_dxfs = (result == QMessageBox.Yes)
+
         # Disable Save Boxes button during processing
         self.save_boxes_btn.setEnabled(False)
         self.save_boxes_btn.setText("Saving...")
@@ -1658,28 +1673,29 @@ class ControlPanel(QWidget):
                     self.save_polygons_to_dxf(polygons_data, dxf_filename, box_label, data['box_index'])
                     dxf_files_saved += 1
                     
-                    # Group polygons by original color for color-specific DXF files
-                    color_groups = {}
-                    for poly_data in polygons_data:
-                        original_color = poly_data.get('original_color', poly_data['color'])
-                        color_hex = original_color.name()  # Get hex color like #FF0000
-                        
-                        if color_hex not in color_groups:
-                            color_groups[color_hex] = []
-                        
-                        # Use original color for the DXF file
-                        poly_data_copy = poly_data.copy()
-                        poly_data_copy['color'] = original_color
-                        color_groups[color_hex].append(poly_data_copy)
-                    
-                    # Save separate DXF file for each color
-                    for color_hex, color_polygons in color_groups.items():
-                        color_dxf_filename = os.path.join(box_dir, f"{box_label}_{color_hex}.dxf")
-                        try:
-                            self.save_polygons_to_dxf(color_polygons, color_dxf_filename, f"{box_label} - {color_hex}", data['box_index'])
-                            dxf_files_saved += 1
-                        except Exception as e:
-                            print(f"Failed to save color DXF {color_dxf_filename}: {str(e)}")
+                    if save_color_dxfs:
+                        # Group polygons by original color for color-specific DXF files
+                        color_groups = {}
+                        for poly_data in polygons_data:
+                            original_color = poly_data.get('original_color', poly_data['color'])
+                            color_hex = original_color.name()  # Get hex color like #FF0000
+
+                            if color_hex not in color_groups:
+                                color_groups[color_hex] = []
+
+                            # Use original color for the DXF file
+                            poly_data_copy = poly_data.copy()
+                            poly_data_copy['color'] = original_color
+                            color_groups[color_hex].append(poly_data_copy)
+
+                        # Save separate DXF file for each color
+                        for color_hex, color_polygons in color_groups.items():
+                            color_dxf_filename = os.path.join(box_dir, f"{box_label}_{color_hex}.dxf")
+                            try:
+                                self.save_polygons_to_dxf(color_polygons, color_dxf_filename, f"{box_label} - {color_hex}", data['box_index'])
+                                dxf_files_saved += 1
+                            except Exception as e:
+                                print(f"Failed to save color DXF {color_dxf_filename}: {str(e)}")
                     
                     # Save tile polygon DXF if it exists for this box
                     if hasattr(self.canvas, 'tile_polygons') and data['box_index'] in self.canvas.tile_polygons:
