@@ -1,12 +1,11 @@
 import sys
 import cv2
 import numpy as np
-import copy
 import pickle
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QPushButton, QLabel, QFileDialog, QMessageBox, QScrollArea, QSpinBox, QDoubleSpinBox,
-                             QSlider, QGroupBox, QFormLayout, QColorDialog)
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
+                             QSlider, QGroupBox, QFormLayout, QShortcut)
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont, QKeySequence
 from PyQt5.QtCore import Qt, QPoint, QPointF, QEvent, pyqtSignal, QRectF
 
 class ImageCanvas(QWidget):
@@ -24,7 +23,6 @@ class ImageCanvas(QWidget):
         self.target_width = 300
         self.target_height = 300
         self.polygons = []
-        self.polygon_effects = [] # List of dicts for effects
         self.current_polygon = []
         self.drawing_polygon = False
         self.selected_polygon_index = None
@@ -169,90 +167,6 @@ class ImageCanvas(QWidget):
                                                      borderValue=(0, 0, 0))
         else:
             self.display_image = self.cv_image.copy()
-        
-        for i, poly in enumerate(self.polygons):
-            if i >= len(self.polygon_effects):
-                continue
-                
-            effects = self.polygon_effects[i]
-            
-            # Create mask for polygon
-            mask = np.zeros(self.cv_image.shape[:2], dtype=np.uint8)
-            pts = np.array(poly, dtype=np.int32)
-            cv2.fillPoly(mask, [pts], 255)
-            
-            # Extract ROI
-            # We can optimize by bounding rect, but for now full image masking is easier to implement
-            
-            # 1. Brightness and Contrast
-            # alpha = contrast (1.0 is original), beta = brightness (0 is original)
-            alpha = effects.get('contrast', 1.0)
-            beta = effects.get('brightness', 0)
-            black_point = effects.get('black_point', 0)
-            
-            # 2. Saturation
-            sat_scale = effects.get('saturation', 1.0)
-            
-            # 3. Warmth (Temperature)
-            warmth = effects.get('warmth', 0)
-
-            # 4. Tint
-            tint_color = effects.get('tint_color', (255, 255, 255)) # RGB
-            tint_strength = effects.get('tint_strength', 0) / 100.0 # 0.0 to 1.0
-            
-            # Apply to the whole image (or ROI) then mask copy back
-            # To avoid processing full image, let's crop to bounding rect
-            x, y, w, h = cv2.boundingRect(pts)
-            roi = self.display_image[y:y+h, x:x+w].astype(np.float32)
-            roi_mask = mask[y:y+h, x:x+w]
-            
-            # Only process if mask is not empty
-            if np.sum(roi_mask) > 0:
-                # Black Point - crush blacks
-                if black_point > 0:
-                    roi = np.maximum(0, roi - black_point)
-                
-                # Brightness/Contrast
-                roi = roi * alpha + beta
-                roi = np.clip(roi, 0, 255)
-                
-                # Saturation
-                if sat_scale != 1.0:
-                    roi_hsv = cv2.cvtColor(roi.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-                    roi_hsv[:, :, 1] *= sat_scale
-                    roi_hsv[:, :, 1] = np.clip(roi_hsv[:, :, 1], 0, 255)
-                    roi = cv2.cvtColor(roi_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
-
-                # Warmth (R increases, B decreases)
-                if warmth != 0:
-                    # R channel is 0, B is 2 in RGB
-                    r = roi[:, :, 0]
-                    b = roi[:, :, 2]
-                    
-                    r += warmth
-                    b -= warmth
-                    
-                    roi[:, :, 0] = np.clip(r, 0, 255)
-                    roi[:, :, 2] = np.clip(b, 0, 255)
-
-                # Tint
-                if tint_strength > 0:
-                    # Create a solid color layer
-                    tint_layer = np.full_like(roi, tint_color, dtype=np.float32)
-                    # Blend
-                    roi = cv2.addWeighted(roi, 1.0 - tint_strength, tint_layer, tint_strength, 0)
-
-                # Blend back
-                roi = roi.astype(np.uint8)
-                
-                # Use mask to copy only polygon area
-                # We need 3-channel mask
-                roi_mask_3 = cv2.merge([roi_mask, roi_mask, roi_mask])
-                
-                # Where mask is set, use processed ROI, else use original (which is already in display_image)
-                # Actually we are modifying display_image in place
-                current_roi = self.display_image[y:y+h, x:x+w]
-                np.copyto(current_roi, roi, where=roi_mask_3.astype(bool))
 
         # Apply global sharpness to the entire image
         if self.global_sharpness > 0:
@@ -344,17 +258,6 @@ class ImageCanvas(QWidget):
                     elif event.button() == Qt.RightButton:
                         if len(self.current_polygon) > 2:
                             self.polygons.append(self.current_polygon)
-                            # Add default effects for new polygon
-                            self.polygon_effects.append({
-                                'brightness': 0,
-                                'contrast': 1.0,
-                                'saturation': 1.0,
-                                'warmth': 0,
-                                'tint_color': (255, 255, 255),
-                                'tint_strength': 0,
-                                'black_point': 0,
-                                'sharpness': 0
-                            })
                             self.current_polygon = []
                             # self.drawing_polygon = False # Keep drawing mode active
                             self.update()
@@ -550,7 +453,6 @@ class ImageCanvas(QWidget):
         elif event.key() == Qt.Key_Delete:
             if self.selected_polygon_index is not None:
                 self.polygons.pop(self.selected_polygon_index)
-                self.polygon_effects.pop(self.selected_polygon_index)
                 self.selected_polygon_index = None
                 self.dragging_point_index = None
                 self.selection_changed.emit(-1)
@@ -596,7 +498,6 @@ class ImageCanvas(QWidget):
         self.cv_image = warped
         self.display_image = self.cv_image.copy() # Update display image
         self.polygons = [] # Clear polygons as they don't match the new image
-        self.polygon_effects = [] # Clear effects
         self.selected_polygon_index = None
         self.dragging_point_index = None
         self.selection_changed.emit(-1)
@@ -838,8 +739,6 @@ class MainWindow(QMainWindow):
         # Install event filter to capture wheel events for zooming
         self.scroll_area.viewport().installEventFilter(self)
 
-        self.copied_effects = None
-
         # Layouts
         main_layout = QHBoxLayout()
         
@@ -971,71 +870,54 @@ class MainWindow(QMainWindow):
         tilt_layout.addRow("Sharpness", self._make_sharpness_slider())
         tilt_group.setLayout(tilt_layout)
         sidebar_layout.addWidget(tilt_group)
-        
+
         sidebar_layout.addSpacing(20)
-        
-        # Polygon Effects Group
-        self.effects_group = QGroupBox("Polygon Effects")
-        self.effects_group.setEnabled(False)
-        effects_layout = QFormLayout()
-        
-        self.brightness_slider = QSlider(Qt.Horizontal)
-        self.brightness_slider.setRange(-100, 100)
-        self.brightness_slider.setValue(0)
-        self.brightness_slider.valueChanged.connect(self.update_effects)
-        
-        self.contrast_slider = QSlider(Qt.Horizontal)
-        self.contrast_slider.setRange(0, 200) # 0.0 to 2.0 (div by 100)
-        self.contrast_slider.setValue(100)
-        self.contrast_slider.valueChanged.connect(self.update_effects)
-        
-        self.saturation_slider = QSlider(Qt.Horizontal)
-        self.saturation_slider.setRange(0, 200) # 0.0 to 2.0 (div by 100)
-        self.saturation_slider.setValue(100)
-        self.saturation_slider.valueChanged.connect(self.update_effects)
-        
-        self.warmth_slider = QSlider(Qt.Horizontal)
-        self.warmth_slider.setRange(-100, 100)
-        self.warmth_slider.setValue(0)
-        self.warmth_slider.valueChanged.connect(self.update_effects)
-        
-        self.black_point_slider = QSlider(Qt.Horizontal)
-        self.black_point_slider.setRange(0, 100)
-        self.black_point_slider.setValue(0)
-        self.black_point_slider.valueChanged.connect(self.update_effects)
 
-        self.tint_btn = QPushButton("Select Tint Color")
-        self.tint_btn.clicked.connect(self.select_tint_color)
-        self.tint_btn.setStyleSheet("background-color: white; color: black;")
-        
-        self.tint_strength_slider = QSlider(Qt.Horizontal)
-        self.tint_strength_slider.setRange(0, 100)
-        self.tint_strength_slider.setValue(0)
-        self.tint_strength_slider.valueChanged.connect(self.update_effects)
+        # Cleanup polygons group — bulk-erase polygons matching simple shape/size criteria.
+        cleanup_group = QGroupBox("Cleanup polygons")
+        cleanup_layout = QFormLayout()
 
-        # Copy/Paste Buttons
-        copy_paste_layout = QHBoxLayout()
-        self.copy_btn = QPushButton("Copy Colors")
-        self.copy_btn.clicked.connect(self.copy_colors)
-        self.paste_btn = QPushButton("Paste Colors")
-        self.paste_btn.clicked.connect(self.paste_colors)
-        self.paste_btn.setEnabled(False)
-        
-        copy_paste_layout.addWidget(self.copy_btn)
-        copy_paste_layout.addWidget(self.paste_btn)
+        # Max control points
+        pts_row = QHBoxLayout()
+        self.max_points_spin = QSpinBox()
+        self.max_points_spin.setRange(3, 1000)
+        self.max_points_spin.setValue(8)
+        self.max_points_spin.setToolTip("Polygons with more vertices than this will be erased")
+        pts_row.addWidget(self.max_points_spin)
+        erase_pts_btn = QPushButton("Erase if more")
+        erase_pts_btn.clicked.connect(self.erase_polygons_by_max_points)
+        pts_row.addWidget(erase_pts_btn)
+        cleanup_layout.addRow("Max control points:", pts_row)
 
-        effects_layout.addRow(copy_paste_layout)
-        effects_layout.addRow("Brightness", self.brightness_slider)
-        effects_layout.addRow("Contrast", self.contrast_slider)
-        effects_layout.addRow("Saturation", self.saturation_slider)
-        effects_layout.addRow("Warmth", self.warmth_slider)
-        effects_layout.addRow("Black Point", self.black_point_slider)
-        effects_layout.addRow("Tint Color", self.tint_btn)
-        effects_layout.addRow("Tint Strength", self.tint_strength_slider)
-        
-        self.effects_group.setLayout(effects_layout)
-        sidebar_layout.addWidget(self.effects_group)
-        
+        # Min area
+        min_area_row = QHBoxLayout()
+        self.min_area_clean_spin = QSpinBox()
+        self.min_area_clean_spin.setRange(1, 10_000_000)
+        self.min_area_clean_spin.setValue(100)
+        self.min_area_clean_spin.setSuffix(" px²")
+        self.min_area_clean_spin.setToolTip("Polygons SMALLER than this area will be erased")
+        min_area_row.addWidget(self.min_area_clean_spin)
+        erase_min_btn = QPushButton("Erase if smaller")
+        erase_min_btn.clicked.connect(self.erase_polygons_below_min_area)
+        min_area_row.addWidget(erase_min_btn)
+        cleanup_layout.addRow("Min area:", min_area_row)
+
+        # Max area
+        max_area_row = QHBoxLayout()
+        self.max_area_clean_spin = QSpinBox()
+        self.max_area_clean_spin.setRange(1, 100_000_000)
+        self.max_area_clean_spin.setValue(50_000)
+        self.max_area_clean_spin.setSuffix(" px²")
+        self.max_area_clean_spin.setToolTip("Polygons LARGER than this area will be erased")
+        max_area_row.addWidget(self.max_area_clean_spin)
+        erase_max_btn = QPushButton("Erase if larger")
+        erase_max_btn.clicked.connect(self.erase_polygons_above_max_area)
+        max_area_row.addWidget(erase_max_btn)
+        cleanup_layout.addRow("Max area:", max_area_row)
+
+        cleanup_group.setLayout(cleanup_layout)
+        sidebar_layout.addWidget(cleanup_group)
+
         sidebar_layout.addStretch() # Push items to top
         
         # Right sidebar container
@@ -1190,90 +1072,38 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(main_layout)
         self.setCentralWidget(container)
-        
-        # Connect signals
-        self.canvas.selection_changed.connect(self.on_selection_changed)
 
-    def on_selection_changed(self, index):
-        if index == -1:
-            self.effects_group.setEnabled(False)
-        else:
-            self.effects_group.setEnabled(True)
-            # Load effects for this polygon
-            effects = self.canvas.polygon_effects[index]
-            
-            # Block signals to prevent triggering update_effects loop
-            self.brightness_slider.blockSignals(True)
-            self.contrast_slider.blockSignals(True)
-            self.saturation_slider.blockSignals(True)
-            self.warmth_slider.blockSignals(True)
-            self.black_point_slider.blockSignals(True)
-            self.tint_strength_slider.blockSignals(True)
-            
-            self.brightness_slider.setValue(int(effects.get('brightness', 0)))
-            self.contrast_slider.setValue(int(effects.get('contrast', 1.0) * 100))
-            self.saturation_slider.setValue(int(effects.get('saturation', 1.0) * 100))
-            self.warmth_slider.setValue(int(effects.get('warmth', 0)))
-            self.black_point_slider.setValue(int(effects.get('black_point', 0)))
-            self.tint_strength_slider.setValue(int(effects.get('tint_strength', 0)))
-            
-            # Update tint button color
-            color = effects.get('tint_color', (255, 255, 255))
-            self.tint_btn.setStyleSheet(f"background-color: rgb({color[0]}, {color[1]}, {color[2]}); color: black;")
+        # Keyboard shortcuts: P enters polygon mode, Esc exits drawing modes
+        # (and clears selection when no drawing mode is active).
+        self._shortcut_p = QShortcut(QKeySequence(Qt.Key_P), self)
+        self._shortcut_p.activated.connect(self.shortcut_enter_polygon_mode)
+        self._shortcut_esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        self._shortcut_esc.activated.connect(self.shortcut_escape)
 
-            self.brightness_slider.blockSignals(False)
-            self.contrast_slider.blockSignals(False)
-            self.saturation_slider.blockSignals(False)
-            self.warmth_slider.blockSignals(False)
-            self.black_point_slider.blockSignals(False)
-            self.tint_strength_slider.blockSignals(False)
+    def shortcut_enter_polygon_mode(self):
+        """P key: enter polygon mode (no-op if already in it). Mirrors a click on the Polygon button."""
+        if not self.polygon_btn.isChecked():
+            self.polygon_btn.setChecked(True)
+            self.toggle_polygon_mode()
 
-    def select_tint_color(self):
-        if self.canvas.selected_polygon_index is not None:
-            idx = self.canvas.selected_polygon_index
-            effects = self.canvas.polygon_effects[idx]
-            current_color = effects.get('tint_color', (255, 255, 255))
-            
-            color = QColorDialog.getColor(QColor(current_color[0], current_color[1], current_color[2]), self, "Select Tint Color")
-            
-            if color.isValid():
-                rgb = (color.red(), color.green(), color.blue())
-                effects['tint_color'] = rgb
-                self.tint_btn.setStyleSheet(f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); color: black;")
-                self.canvas.apply_effects()
-
-    def copy_colors(self):
-        if self.canvas.selected_polygon_index is not None:
-            idx = self.canvas.selected_polygon_index
-            self.copied_effects = copy.deepcopy(self.canvas.polygon_effects[idx])
-            self.paste_btn.setEnabled(True)
-            QMessageBox.information(self, "Info", "Colors copied.")
-
-    def paste_colors(self):
-        if self.canvas.selected_polygon_index is not None and self.copied_effects:
-            idx = self.canvas.selected_polygon_index
-            self.canvas.polygon_effects[idx] = copy.deepcopy(self.copied_effects)
-            
-            # Update UI
-            self.on_selection_changed(idx)
-            
-            # Apply effects
-            self.canvas.apply_effects()
-            QMessageBox.information(self, "Info", "Colors pasted.")
-
-    def update_effects(self):
-        if self.canvas.selected_polygon_index is not None:
-            idx = self.canvas.selected_polygon_index
-            effects = self.canvas.polygon_effects[idx]
-            
-            effects['brightness'] = self.brightness_slider.value()
-            effects['contrast'] = self.contrast_slider.value() / 100.0
-            effects['saturation'] = self.saturation_slider.value() / 100.0
-            effects['warmth'] = self.warmth_slider.value()
-            effects['black_point'] = self.black_point_slider.value()
-            effects['tint_strength'] = self.tint_strength_slider.value()
-            
-            self.canvas.apply_effects()
+    def shortcut_escape(self):
+        """Esc key: exit any active drawing mode; otherwise clear selection."""
+        if self.polygon_btn.isChecked():
+            self.polygon_btn.setChecked(False)
+            self.toggle_polygon_mode()
+            return
+        if self.circle_btn.isChecked():
+            self.circle_btn.setChecked(False)
+            self.toggle_circle_mode()
+            return
+        # Not drawing — mirror the canvas's own Esc behavior: clear selection.
+        self.canvas.selected_polygon_index = None
+        self.canvas.selected_circle_index = None
+        self.canvas.dragging_point_index = None
+        self.canvas.dragging_circle_index = None
+        self.canvas.resizing_circle_index = None
+        self.canvas.selection_changed.emit(-1)
+        self.canvas.update()
 
     def _make_sharpness_slider(self):
         self.sharpness_slider = QSlider(Qt.Horizontal)
@@ -1285,6 +1115,68 @@ class MainWindow(QMainWindow):
     def update_global_sharpness(self):
         self.canvas.global_sharpness = self.sharpness_slider.value()
         self.canvas.apply_effects()
+
+    # ---- Cleanup polygons ----------------------------------------------------
+
+    def _erase_polygons_matching(self, predicate, description: str) -> None:
+        """Find polygons satisfying predicate(poly), confirm with user, erase. Resets selection."""
+        if not self.canvas.polygons:
+            QMessageBox.information(self, "No polygons", "There are no polygons to clean up.")
+            return
+        to_remove = [i for i, poly in enumerate(self.canvas.polygons) if predicate(poly)]
+        if not to_remove:
+            QMessageBox.information(self, "No matches",
+                                    f"No polygons match: {description}.")
+            return
+        reply = QMessageBox.question(
+            self,
+            "Confirm erase",
+            f"{len(to_remove)} of {len(self.canvas.polygons)} polygons match:\n"
+            f"  {description}\n\nErase them?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        # Delete from highest index to lowest so earlier indices stay valid.
+        for idx in sorted(to_remove, reverse=True):
+            self.canvas.polygons.pop(idx)
+        self.canvas.selected_polygon_index = None
+        self.canvas.dragging_point_index = None
+        self.canvas.selection_changed.emit(-1)
+        self.canvas.apply_effects()
+        self.canvas.update()
+        QMessageBox.information(self, "Done",
+                                f"Erased {len(to_remove)} polygons. "
+                                f"{len(self.canvas.polygons)} remain.")
+
+    @staticmethod
+    def _polygon_area(poly) -> float:
+        pts = np.array(poly, dtype=np.float32)
+        if len(pts) < 3:
+            return 0.0
+        return float(cv2.contourArea(pts))
+
+    def erase_polygons_by_max_points(self):
+        n = self.max_points_spin.value()
+        self._erase_polygons_matching(
+            predicate=lambda p: len(p) > n,
+            description=f"more than {n} control points",
+        )
+
+    def erase_polygons_below_min_area(self):
+        n = self.min_area_clean_spin.value()
+        self._erase_polygons_matching(
+            predicate=lambda p: self._polygon_area(p) < n,
+            description=f"area smaller than {n} px²",
+        )
+
+    def erase_polygons_above_max_area(self):
+        n = self.max_area_clean_spin.value()
+        self._erase_polygons_matching(
+            predicate=lambda p: self._polygon_area(p) > n,
+            description=f"area larger than {n} px²",
+        )
 
     def update_image_tilt(self):
         self.canvas.image_tilt = self.image_tilt_slider.value()
@@ -1716,19 +1608,28 @@ class MainWindow(QMainWindow):
 
                     coords_json = json.dumps(adjusted_points)
 
-                    # Compute mean color of the image region covered by this polygon
+                    # Compute mean color of the image region covered by this polygon.
+                    # Bbox-restricted mask: avoids allocating a full-image mask per polygon
+                    # (which made 2686-polygon CSVs feel like a hang on a 4096x4096 image).
                     r, g, b, a = 1.0, 1.0, 1.0, 1.0
                     if save_colors and self.canvas.display_image is not None:
                         img = self.canvas.display_image  # RGB uint8
                         h_img, w_img = img.shape[:2]
-                        mask = np.zeros((h_img, w_img), dtype=np.uint8)
                         pts_int = np.array([[int(x), int(y)] for x, y in points], dtype=np.int32)
-                        cv2.fillPoly(mask, [pts_int], 255)
-                        if mask.any():
-                            mean_rgb = img[mask == 255].mean(axis=0)  # [R, G, B]
-                            r = float(mean_rgb[0]) / 255.0
-                            g = float(mean_rgb[1]) / 255.0
-                            b = float(mean_rgb[2]) / 255.0
+                        x_min = max(0, int(pts_int[:, 0].min()))
+                        y_min = max(0, int(pts_int[:, 1].min()))
+                        x_max = min(w_img, int(pts_int[:, 0].max()) + 1)
+                        y_max = min(h_img, int(pts_int[:, 1].max()) + 1)
+                        if x_max > x_min and y_max > y_min:
+                            sub_pts = pts_int - np.array([x_min, y_min], dtype=np.int32)
+                            mask_sub = np.zeros((y_max - y_min, x_max - x_min), dtype=np.uint8)
+                            cv2.fillPoly(mask_sub, [sub_pts], 255)
+                            if mask_sub.any():
+                                region = img[y_min:y_max, x_min:x_max]
+                                mean_rgb = region[mask_sub == 255].mean(axis=0)
+                                r = float(mean_rgb[0]) / 255.0
+                                g = float(mean_rgb[1]) / 255.0
+                                b = float(mean_rgb[2]) / 255.0
 
                     fr, fg, fb, fa = 0.0, 0.0, 0.0, 1.0
                     group_id = ''
@@ -1826,16 +1727,6 @@ class MainWindow(QMainWindow):
                 # Clear existing polygons and load new ones
                 self.canvas.polygons = polygons
                 self._original_polygons = None  # reset scale snapshot
-                # Also clear polygon effects and reset selection
-                self.canvas.polygon_effects = [{
-                    'brightness': 0,
-                    'contrast': 1.0,
-                    'saturation': 1.0,
-                    'warmth': 0,
-                    'tint_color': (255, 255, 255),
-                    'tint_strength': 0,
-                    'black_point': 0
-                } for _ in polygons]
                 self.canvas.selected_polygon_index = None
                 self.canvas.dragging_point_index = None
                 self.canvas.selection_changed.emit(-1)
@@ -1863,7 +1754,6 @@ class MainWindow(QMainWindow):
             data = {
                 'image': self.canvas.cv_image,
                 'polygons': self.canvas.polygons,
-                'effects': self.canvas.polygon_effects,
                 'width': self.canvas.target_width,
                 'height': self.canvas.target_height,
                 'image_tilt': self.canvas.image_tilt,
@@ -1893,7 +1783,6 @@ class MainWindow(QMainWindow):
                 self.canvas.cv_image = data['image']
                 self.canvas.polygons = data['polygons']
                 self._original_polygons = None  # reset scale snapshot
-                self.canvas.polygon_effects = data['effects']
                 self.canvas.target_width = data.get('width', 300)
                 self.canvas.target_height = data.get('height', 300)
                 self.canvas.image_tilt = data.get('image_tilt', 0)
@@ -1927,10 +1816,7 @@ class MainWindow(QMainWindow):
                 # Refresh
                 self.canvas.apply_effects() # This calls update_image_from_cv
                 self.canvas.update()
-                
-                # Update effects panel state
-                self.on_selection_changed(-1)
-                
+
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load project: {str(e)}")
 
