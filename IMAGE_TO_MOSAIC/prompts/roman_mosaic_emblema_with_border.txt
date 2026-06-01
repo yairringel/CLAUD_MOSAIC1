@@ -1,0 +1,28 @@
+Convert the supplied reference image into a Roman floor mosaic composed as a central pictorial *emblema* surrounded by a wide decorative border — the standard high-status composition seen at Pompeii, Antioch, and Piazza Armerina.
+
+Composition (mandatory):
+- Central panel: the reference image rendered in fine *opus vermiculatum* with 2-4 mm tesserae, polychrome, following the contours of the subject. Occupies roughly the central 60-65% of the frame.
+- Surrounding border: a decorative band of classical Roman ornament — choose from Greek key (meander), guilloche (interlaced ribbon), wave-crest, ivy scroll, or alternating squares — laid in straight rows with 8-12 mm tesserae. Border occupies the outer ring.
+- A thin dark frame line of single-tessera width separates the central panel from the border, and another runs along the outermost edge.
+
+Style:
+- Materials: limestone, marble, terracotta, basalt, plus smalti glass for the brightest highlights inside the central panel. Each tessera is filled with a SINGLE SOLID UNIFORM COLOR from edge to edge — no inner texture, no gradient within a single tile.
+- Color palette: full classical Roman range — cream, ivory, ochre, sienna, oxblood, olive, sage, slate blue, charcoal, black. Central panel uses the full polychrome range; border uses a restrained 2-3 color scheme.
+- Grout: a DARK CONTINUOUS line on every side of every tile, throughout BOTH the central panel and the border. Charcoal black (#1a1a1a to #333), at least 3 pixels wide in the output, unbroken, uniform. Not pale, not warm. Adjacent tiles never touch.
+
+Subject simplification — hair, fur, fabric folds, and other fine line-textures (central panel):
+- When the reference image contains hair (especially long flowing hair such as a woman's hair), fur, or similar fine line-textures: DO NOT try to render every strand with extra-tiny tesserae. Simplify these areas into a small number (3-5) of broad color bands — highlight, mid-tone, deep shadow.
+- The tesserae inside hair / fur regions must be the SAME SIZE as the tesserae elsewhere in the central panel. NEVER use smaller tesserae just to capture more strand detail.
+- Tessera row direction in hair follows the overall flow of the locks (curving), but individual strands are NOT rendered as 1-tessera-wide lines.
+
+Camera and lighting:
+- Strict orthographic top-down view, no perspective.
+- Flat, even, diffuse lighting; no directional shadows.
+- The entire composition (central panel + border) fills the frame edge-to-edge.
+
+Surface:
+- Tile interiors are smooth flat fields of one solid color — no patina, no aging inside tiles.
+- Tile-to-grout boundaries are sharp — no anti-aliasing, no blur.
+
+Output:
+- Square 4K (3840 × 3840 px). Clean, sharp, detection-friendly: solid uniform tile colors, dark continuous grout, crisp boundaries. Sharp geometric border, fine figurative central panel.

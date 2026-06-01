@@ -1,0 +1,8 @@
+==== BACKGROUND FILL (final, authoritative) ====
+The source image has had its background removed — you will see the main subject silhouetted against a flat solid color or a transparent / checkerboard area. DO NOT keep that empty background.
+
+Instead, FILL the entire area around the subject with a Roman mosaic background that complements the subject:
+- Use the SAME tessera size and grout gap as the subject (from the SIZE OVERRIDE above).
+- Choose a classical Roman ornamental motif for the field: a geometric tessellation in straight rows (most common), or a subtle pattern such as small repeated squares, scale (squama), or a thin meander / guilloche border just inside the image edges.
+- Background palette: muted classical Roman colors that DO NOT compete with the subject — cream, bone, warm ochre, terracotta, slate gray, charcoal. Use 2-4 colors maximum, noticeably calmer than the subject.
+- The mosaic background must extend EDGE-TO-EDGE in all four directions — no empty area, no transparent pixels, no flat color blocks remain anywhere in the output.

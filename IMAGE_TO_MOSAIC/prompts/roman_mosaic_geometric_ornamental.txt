@@ -1,0 +1,20 @@
+Reinterpret the supplied reference image as a flat, geometric Roman floor mosaic in the *opus tessellatum* tradition used for ornamental pavements — meander (Greek key), guilloche, scale (squama), wave-crest, knot, star, and tessellated grid motifs.
+
+Style:
+- Tesserae roughly 8-12 mm square, laid in tight straight rows aligned to the dominant geometric structure of the image. Each tessera is filled with a SINGLE SOLID UNIFORM COLOR from edge to edge — no inner texture, no gradient, no variation within a single tile.
+- The subject of the reference image is abstracted into geometric ornament: dominant shapes become bordered panels, color regions become ornamental fields, and details become repeating motif bands. No figurative rendering — only geometry.
+- Materials: limestone, marble, travertine, terracotta, basalt. No glass.
+- Color palette: restricted, classical — bone white, cream, warm ochre, terracotta red, deep oxblood, slate gray, charcoal black. Two or three dominant colors with one or two accent colors, as on most Roman ornamental pavements.
+- Grout: a DARK CONTINUOUS line on every side of every tile. Charcoal black (#1a1a1a to #333), at least 4 pixels wide in the output, unbroken, uniform. Not pale, not warm. Adjacent tiles never touch.
+
+Camera and lighting:
+- Orthographic top-down view, perfectly perpendicular.
+- Flat, even, diffuse lighting; no directional shadows or hot spots.
+- Mosaic fills the frame edge-to-edge.
+
+Surface:
+- Tile interiors are smooth flat fields of one solid color — no roughness, no patina inside tiles.
+- Tile-to-grout boundaries are sharp — no anti-aliasing, no blur.
+
+Output:
+- Square 4K (3840 × 3840 px). Clean, sharp, detection-friendly: solid uniform tile colors, dark continuous grout, crisp boundaries.

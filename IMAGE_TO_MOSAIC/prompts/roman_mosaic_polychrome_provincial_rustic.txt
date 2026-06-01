@@ -1,0 +1,28 @@
+Convert the supplied reference image into a coarser, more rustic Roman provincial mosaic in the style of North African (e.g. Bardo, Volubilis, El Djem) and Romano-British (e.g. Bignor, Lullingstone) floor pavements — bold, lively, and unpolished.
+
+Style:
+- Tesserae noticeably larger and less uniform than metropolitan work: 12-18 mm, with visible variation in size and shape (variation BETWEEN tiles is allowed and encouraged). Hand-cut, slightly irregular edges. BUT each individual tile is filled with a SINGLE SOLID UNIFORM COLOR — no inner texture, no chips, no gradient WITHIN a single tile.
+- Laid in straight rows in background areas and looser *vermiculatum* curves around figures, with charming naive proportions rather than refined classical anatomy.
+- Materials: locally quarried limestone, sandstone, terracotta tile, basalt, and a touch of colored marble. No glass.
+- Color palette: warmer and more saturated than metropolitan work — golden ochre, brick red, terracotta, mustard yellow, deep umber, olive green, dusty blue, cream, black. Bolder color contrasts.
+- Grout: a DARK CONTINUOUS line on every side of every tile. Charcoal black (#1a1a1a to #333), at least 4 pixels wide in the output, unbroken, uniform — NOT sandy-beige, NOT warm. Adjacent tiles never touch.
+
+Subject simplification — hair, fur, fabric folds, and other fine line-textures:
+- When the reference image contains hair (especially long flowing hair such as a woman's hair), fur, or similar fine line-textures: DO NOT try to render every strand with extra-tiny tesserae. Simplify these areas into a small number (3-5) of broad color bands — highlight, mid-tone, deep shadow.
+- The tesserae inside hair / fur regions must be the SAME SIZE as the tesserae elsewhere in the mosaic. NEVER use smaller tesserae just to capture more strand detail.
+- Tessera row direction in hair follows the overall flow of the locks (curving), but individual strands are NOT rendered as 1-tessera-wide lines.
+
+Camera and lighting:
+- Orthographic top-down view, no perspective.
+- Flat, even, diffuse lighting; no directional shadows or hot spots.
+- Mosaic fills the frame edge-to-edge.
+
+Surface:
+- Tile interiors are SMOOTH FLAT FIELDS of one solid color — no patina, no aging inside tile interiors. The "rustic" feel comes from tile-size variation and hand-cut shapes, NOT from inner-tile texture.
+- Tile-to-grout boundaries are sharp — no anti-aliasing, no soft blur. All tiles present and intact.
+
+Composition:
+- Preserve the reference image's subject and layout but allow the rustic aesthetic to give proportions a slightly naive, hand-made charm.
+
+Output:
+- Square 4K (3840 × 3840 px). Clean, sharp, detection-friendly: every tile is one solid uniform color, every grout line is dark and continuous, all boundaries are crisp. Not photorealistic-aged.

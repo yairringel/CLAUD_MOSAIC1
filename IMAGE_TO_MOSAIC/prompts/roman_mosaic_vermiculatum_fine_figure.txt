@@ -1,0 +1,28 @@
+Convert the supplied reference image into an extremely fine Roman *opus vermiculatum* mosaic — the technique used for prized figurative emblemata like the Alexander Mosaic from the House of the Faun and the doves of Sosus.
+
+Style:
+- Tiny tesserae, roughly 1-3 mm across, packed so densely that from a distance the surface reads almost like a painting. Up close, every tile is distinct.
+- Tesserae follow the form of the subject in flowing, curving rows (vermiculatum = "worm-like"): hugging facial contours, drapery folds, muscle lines, and the silhouette of every shape.
+- Cut from fine-grained limestone, colored marble, terracotta, and smalti glass for the brightest accents (eyes, highlights, jewelry). Each tessera is filled with a SINGLE SOLID UNIFORM COLOR — no inner texture, no gradient, no variation INSIDE a single tessera.
+- Color palette: full polychrome from the historical Roman range — cream, bone, ivory, warm flesh tones, ochre, sienna, umber, oxblood, deep crimson, olive, sage, slate blue-gray, lapis blue (sparingly), charcoal, jet black. Tonal gradation is built from neighboring tesserae of different solid colors (NOT from inner gradients within a tile).
+- Grout: a DARK, CONTINUOUS line on every side of every tile. Charcoal black (#1a1a1a to #333), uniform throughout. AT LEAST 3 pixels wide in the output (visible up close AND from a distance — NOT hairline). Every pair of adjacent tesserae is separated by grout; no tesserae touch.
+
+Subject simplification — hair, fur, fabric folds, and other fine line-textures:
+- When the reference image contains hair (especially long flowing hair such as a woman's hair), fur, or similar fine line-textures: DO NOT try to render every strand with extra-tiny tesserae. Simplify these areas into a small number (3-5) of broad color bands — highlight, mid-tone, deep shadow.
+- The tesserae inside hair / fur regions must be the SAME SIZE as the tesserae used on the face and the rest of the mosaic. NEVER use smaller tesserae just to capture more strand detail.
+- Tessera row direction in hair follows the overall flow of the locks (curving), but individual strands are NOT rendered as 1-tessera-wide lines.
+
+Camera and lighting:
+- Strict orthographic top-down view, no perspective.
+- Flat, even, diffuse lighting — overcast-daylight quality, no directional shadows.
+- Mosaic fills the frame edge-to-edge.
+
+Surface:
+- Smooth, polished finish — every tile is a flat field of one solid color, no patina, no aging within tile interiors.
+- Tile-to-grout boundaries are sharp — no anti-aliasing, no soft blur.
+
+Composition:
+- Preserve the reference image's subject, pose, and proportions exactly — only the medium changes.
+
+Output:
+- Square 4K (3840 × 3840 px). Clean, sharp, detection-friendly: every tile is one solid uniform color, every grout line is dark and continuous, all boundaries are crisp. Not painterly; not photorealistically aged.

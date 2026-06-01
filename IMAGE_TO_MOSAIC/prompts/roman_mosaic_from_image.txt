@@ -1,0 +1,31 @@
+Convert the supplied reference image into an authentic ancient Roman floor mosaic, rendered as if photographed straight down onto a finished pavement.
+
+Style:
+- Classical Roman / Greco-Roman opus tessellatum and opus vermiculatum traditions (think Pompeii, Herculaneum, Zeugma, Piazza Armerina).
+- Composed entirely of small square stone tesserae (roughly 5-10 mm each), laid by hand with visible grout lines between every tile.
+- Tesserae cut from natural materials: limestone, travertine, marble, terracotta, basalt, and a small amount of smalti glass for highlights. Each individual tessera is filled with a SINGLE SOLID UNIFORM COLOR from edge to edge — NO inner texture, NO inner gradient, NO chips, NO cracks, NO weathering, NO micro-variation WITHIN a tile. Color variation happens BETWEEN tiles, never WITHIN a single tile.
+- Color palette restricted to pigments historically available to Roman mosaicists: cream, bone white, warm ochre, terracotta red, oxblood, burnt sienna, umber, olive green, slate blue-gray, charcoal black. No fluorescent or modern synthetic colors. Map every color in the reference image to the nearest equivalent in this palette.
+- Tessera placement should follow the contours of the original subject (opus vermiculatum around figures and key shapes), and switch to straight rows in background areas.
+- Grout: a clear, DARK, CONTINUOUS line on every side of every tile. Grout color: very dark — charcoal black (#1a1a1a to #333), uniform throughout (NOT pale, NOT beige, NOT warm). Grout width: visible and consistent, at least 4 pixels wide in the output image (NOT thin or hairline). Every pair of adjacent tiles is separated by grout — no two tiles touch. Grout lines are UNBROKEN — no gaps, no fading.
+
+Subject simplification — hair, fur, fabric folds, and other fine line-textures:
+- When the reference image contains hair (especially long flowing hair such as a woman's hair), fur, or similar fine line-textures: DO NOT try to render every strand with extra-tiny tesserae. Simplify these areas into a small number (3-5) of broad color bands — highlight, mid-tone, deep shadow.
+- The tesserae inside hair / fur regions must be the SAME SIZE as the tesserae elsewhere in the mosaic. NEVER use smaller tesserae just to capture more strand detail.
+- Tessera row direction in hair follows the overall flow of the locks (curving), but individual strands are NOT rendered as 1-tessera-wide lines.
+
+Camera and lighting:
+- Strict orthographic top-down view, perfectly perpendicular to the floor surface. No perspective distortion, no tilt.
+- Flat, even, diffuse lighting across the entire surface — as if shot at noon on an overcast day or under a soft studio softbox. No directional shadows, no hot spots, no vignetting.
+- The mosaic fills the frame edge-to-edge; no border, no background, no surrounding floor.
+
+Surface and texture:
+- Every tile is a SMOOTH FLAT FIELD of one solid color. No surface roughness, no patina, no aging effects within tile interiors.
+- Tile-to-grout boundaries are SHARP — no anti-aliasing, no soft blur, no transitional pixels.
+- No missing or cracked tiles, no restoration patches — the mosaic looks complete and intact.
+
+Composition:
+- Preserve the layout, proportions, and subject of the reference image faithfully — only the rendering medium changes.
+
+Output:
+- Square 4K resolution (3840 × 3840 px) at the highest fidelity the model supports.
+- Clean, sharp, detection-friendly: every tile is one solid uniform color, every grout line is dark and continuous, all boundaries are crisp. NOT photorealistic-aged; the goal is a clear graphic mosaic, not a weathered floor.
