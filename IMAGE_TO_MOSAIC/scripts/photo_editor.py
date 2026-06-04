@@ -21,7 +21,7 @@ import traceback
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 from PyQt5.QtCore import QEvent, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtGui import QColor
@@ -450,14 +450,16 @@ class PhotoEditor(QMainWindow):
         bar = QHBoxLayout()
         self.load_btn       = QPushButton("Load Image...")
         self.background_btn = QPushButton("Background...")
+        self.expand_btn     = QPushButton("Expand 15%")
         self.prompt_btn     = QPushButton("Choose Prompt...")
         self.key_btn        = QPushButton("Choose Key File...")
         self.preview_btn    = QPushButton("Preview Prompt")
         self.generate_btn   = QPushButton("Generate →")
         self.save_src_btn   = QPushButton("Save Source...")
         self.save_res_btn   = QPushButton("Save Result...")
-        for b in (self.load_btn, self.background_btn, self.prompt_btn, self.key_btn,
-                  self.preview_btn, self.generate_btn, self.save_src_btn, self.save_res_btn):
+        for b in (self.load_btn, self.background_btn, self.expand_btn, self.prompt_btn,
+                  self.key_btn, self.preview_btn, self.generate_btn,
+                  self.save_src_btn, self.save_res_btn):
             bar.addWidget(b)
         bar.addStretch(1)
 
@@ -516,6 +518,7 @@ class PhotoEditor(QMainWindow):
         # Wire up
         self.load_btn.clicked.connect(self.load_image)
         self.background_btn.clicked.connect(self.edit_background)
+        self.expand_btn.clicked.connect(self.expand_borders)
         self.prompt_btn.clicked.connect(self.choose_prompt)
         self.key_btn.clicked.connect(self.choose_key_file)
         self.preview_btn.clicked.connect(self.preview_prompt)
@@ -578,6 +581,7 @@ class PhotoEditor(QMainWindow):
         has_prompt = bool(self.current_prompt_text)
         running    = self.worker is not None and self.worker.isRunning()
         self.background_btn.setEnabled(has_src and not running)
+        self.expand_btn.setEnabled(has_src and not running)
         self.save_src_btn.setEnabled(has_src and not running)
         self.save_res_btn.setEnabled(has_result and not running)
         self.generate_btn.setEnabled(has_src and has_prompt and not running)
@@ -687,6 +691,126 @@ class PhotoEditor(QMainWindow):
         )
         self.statusBar().showMessage(
             f"Background updated  |  {img.width} × {img.height} px",
+        )
+
+    # ---- Expand borders by 15% on each side (outpainting) -------------------
+
+    EXPAND_FRACTION = 0.15       # added to each side, so final = W * (1 + 2*frac)
+
+    def expand_borders(self) -> None:
+        """Pad the source image by 15% on each side, then ask Gemini to outpaint
+        the new padded area. Original pixels are preserved at full resolution in
+        the deep interior; near the original-rectangle edge they are softly
+        blended into the AI-painted area so the seam is invisible.
+        """
+        if self.source_pane.pil_image is None:
+            return
+        if load_api_key() is None:
+            QMessageBox.critical(
+                self, "API key missing",
+                "No Gemini API key found. Click 'Choose Key File...' first.",
+            )
+            return
+
+        src = self.source_pane.pil_image.convert("RGB")
+        W, H = src.width, src.height
+        pad_x = max(1, int(round(W * self.EXPAND_FRACTION)))
+        pad_y = max(1, int(round(H * self.EXPAND_FRACTION)))
+        new_w = W + 2 * pad_x
+        new_h = H + 2 * pad_y
+
+        # Build the padded canvas: original centred, mid-gray sentinel around it.
+        padded = Image.new("RGB", (new_w, new_h), (128, 128, 128))
+        padded.paste(src, (pad_x, pad_y))
+
+        self._expand_orig = src
+        self._expand_new_size = (new_w, new_h)
+        self._expand_offset = (pad_x, pad_y)
+        # Feather width: ~ 1/3 of the padding. Large enough to dissolve the seam,
+        # small enough that most of the original stays untouched at full resolution.
+        self._expand_feather = max(8, min(pad_x, pad_y) // 3)
+
+        prompt_text = (
+            "You are given a rectangular image whose outer border (about 15% "
+            "on every side) is a SOLID GRAY frame. The central rectangle "
+            "contains a real photograph.\n"
+            "Replace the gray frame with content that continues the "
+            "photograph outward, so the entire output looks like one "
+            "uninterrupted scene.\n"
+            "CRITICAL constraints:\n"
+            "- The central rectangle stays visually identical: do not alter "
+            "content, colors, faces, or composition there.\n"
+            "- The new outer band MUST visually continue what is visible at "
+            "the edge of the central rectangle — same background, same "
+            "textures, same lighting, same perspective, same style. NO hard "
+            "edge or visible seam between the original photograph and the "
+            "new outpainted area: textures, gradients, and shapes that meet "
+            "the boundary must flow smoothly across it.\n"
+            "- Do NOT introduce new subjects, objects, faces, text, or "
+            "decorative elements in the outpainted band. It is a passive "
+            "continuation of the existing scene.\n"
+            "- No gray pixels remain anywhere in the output."
+        )
+
+        self.worker = GenerationWorker(
+            padded, prompt_text, DEFAULT_MODEL,
+            aspect_ratio=closest_aspect_ratio(new_w, new_h),
+            image_size=auto_image_size(new_w, new_h),
+        )
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished_ok.connect(self._on_expanded)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.finished.connect(self._on_worker_done)
+        self.worker.start()
+
+        self.statusBar().showMessage(
+            f"Expanding to {new_w} × {new_h} (+15% per side)...",
+        )
+        self.expand_btn.setText("Expanding...")
+        self._update_button_states()
+
+    def _on_expanded(self, img_bytes: bytes) -> None:
+        """Composite: AI supplies the outer band; the original is feather-blended
+        in over the centre so its rectangular edge dissolves into the new band."""
+        try:
+            ai = Image.open(BytesIO(img_bytes)); ai.load()
+        except Exception as e:
+            QMessageBox.critical(self, "Bad response", f"Could not decode image: {e}")
+            return
+
+        new_w, new_h = self._expand_new_size
+        orig = self._expand_orig
+        ox, oy = self._expand_offset
+        feather = self._expand_feather
+
+        # Bring the AI output up to the target size (LANCZOS for quality).
+        if ai.size != (new_w, new_h):
+            ai = ai.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
+        else:
+            ai = ai.convert("RGB")
+
+        # Build the feathered alpha mask for the ORIGINAL:
+        #   - 255 (fully opaque, use original) in the interior, away from edges
+        #   - 0 (fully transparent, use AI) at the original rectangle's border
+        #   - Gaussian-blurred ramp in between → invisible seam
+        W, H = orig.size
+        mask = Image.new("L", (W, H), 0)
+        draw = ImageDraw.Draw(mask)
+        # Solid white interior, leaving a `feather`-wide transparent ring.
+        draw.rectangle([feather, feather, W - feather, H - feather], fill=255)
+        # Soft-blur the rectangle edge so the transition is smooth.
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather * 0.6))
+
+        ai.paste(orig, (ox, oy), mask=mask)
+
+        self.source_pane.set_pil_image(
+            ai,
+            f"(expanded +15%)  |  {new_w} x {new_h} px  |  "
+            f"original {W} x {H} preserved at centre, {feather}-px feathered edge",
+        )
+        self.statusBar().showMessage(
+            f"Expanded by 15% on each side: {new_w} x {new_h} px  "
+            f"(feather: {feather} px)",
         )
 
     def preview_prompt(self) -> None:
@@ -815,6 +939,7 @@ class PhotoEditor(QMainWindow):
         self.worker = None
         self.generate_btn.setText("Generate →")
         self.background_btn.setText("Background...")
+        self.expand_btn.setText("Expand to Circle")
         self._update_button_states()
 
     def save_pane(self, pane: ImagePane, kind: str) -> None:

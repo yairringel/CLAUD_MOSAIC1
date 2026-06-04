@@ -1,0 +1,20 @@
+==== FILL MISSING / DAMAGED TILES (final, authoritative) ====
+The input mosaic may contain damage AND/OR bare regions: gaps where tiles have fallen out, cracks running through the surface, large missing patches, broken or fragmented tiles, AND flat uniform-colored areas that look like an intentional background, a blank floor, or surrounding empty space. ALL of these must be tiled in the output. There is no such thing as "intentional blank area" — if it's inside the frame, it gets tessellated.
+
+What counts as "needs filling":
+- Visible holes, cracks, missing pieces, broken tiles.
+- Worn or eroded patches.
+- ANY flat region of uniform color larger than about 3 tessera widths across (this is the key signal — large flat areas mean the original is bare or damaged there, REGARDLESS of whether it looks like an intentional design choice).
+- Margins, framing space, "background" around a central figure.
+
+Restoration rules:
+- For every region above: INVENT new tessera tiles that occupy that space.
+- The invented tiles must match the size, shape, and grout spacing of the surrounding undamaged tiles. Do NOT make them noticeably larger or smaller; do NOT change the tessellation rhythm.
+- Color the invented tiles to match the color palette of the surrounding region. Choose colors that continue the existing pattern naturally — never introduce a color that didn't already exist nearby. For a flat-gray background area, pick 2-3 shades of muted neutral close to that gray and lay them as ordinary tesserae.
+- If the damage / blank region falls inside a visible design element (a face, a border motif, a recurring pattern), reconstruct the missing portion of that design as plausibly as possible by extrapolating from the visible context.
+- Apply ALL the same constraints as the rest of the mosaic to every invented tile: solid uniform interior color, dark continuous grout on every side, sharp boundaries, flat lighting.
+
+Final output requirements:
+- The output MUST have NO visible damage, NO gaps, NO cracks, NO broken or fragmented tiles anywhere.
+- The output MUST have NO flat uniform-colored region larger than ~3 tessera widths anywhere. Every part of the frame is either a tile or grout.
+- Self-check: scan the output. Is there a smooth, untiled patch anywhere — even one that looks "designed"? If yes, you've failed; fill it with tiles.

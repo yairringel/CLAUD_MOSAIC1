@@ -1,0 +1,38 @@
+You are given a photograph of a REAL mosaic — likely shot off-axis, with uneven lighting, faint or broken grout lines, slight surface texture inside each tessera, and possibly chips or wear. Transform it into a CLEAN, IDEALIZED mosaic image of the same composition that downstream computer-vision software can easily parse into individual tile polygons.
+
+Geometry — preserve the original layout:
+- Identify every individual tessera that exists in the input and KEEP it in the same approximate position, size, and outline. Do NOT redraw the mosaic from scratch; do NOT relocate, merge, split, add, or remove tiles. The output must be recognizable as the SAME mosaic, just cleaned up.
+- If the input is shot from an angle, straighten the perspective so the mosaic is rendered as if photographed STRICTLY top-down, perpendicular to the surface. No tilt, no foreshortening.
+
+Tile interiors — make each tile a flat solid color:
+- Every tile is filled with a SINGLE SOLID UNIFORM COLOR from edge to edge.
+- ABSOLUTELY NO inner texture, NO inner gradient, NO chips, NO cracks, NO weathering, NO micro-variation, NO highlights, NO shading, NO 3D / bevelled appearance inside a tile. Each tile is a 2D shape of ONE flat color.
+- Color variation happens BETWEEN tiles, never WITHIN a single tile.
+- The chosen color for each tile is the dominant / average color of that tile in the input.
+- Self-check: if you can identify two different colors inside the same tile in the output, you have failed this rule.
+
+Grout — make grout dark, thick, continuous:
+- Render grout as a DARK CONTINUOUS line on every side of every tile.
+- Grout color: very dark — charcoal black (#1a1a1a to #333), uniform across the entire mosaic. NOT pale, NOT warm, NOT beige, NOT mid-gray. Specifically: the grout must be visibly DARKER than EVERY tile color in the mosaic; if there is even one tile that is darker than or equal to the grout, you have failed this rule. When in doubt, push the grout to PURE BLACK (#000).
+- Grout width: visible and consistent, AT LEAST 4 pixels wide in the output. NOT hairline.
+- Every pair of adjacent tiles is separated by grout. Two tiles must never touch.
+- Grout lines are UNBROKEN — no gaps, no fades, no places where the grout disappears into a tile color.
+
+Boundaries and lighting:
+- Tile-to-grout boundaries are SHARP — no anti-aliasing softness, no soft blur, no transitional pixels.
+- Lighting must be perfectly flat and even across the entire image. No directional shadows, no glare, no hot spots, no vignetting. Treat the result as if shot under perfectly diffuse overhead lighting.
+- No surface roughness, no patina, no aging effects.
+
+Composition and complete coverage:
+- The mosaic fills the frame edge-to-edge, the same composition as the input.
+- EVERY pixel of the output must be either tile interior or grout. There is NO bare flat-colored area, NO blank background, NO uniform-color expanse anywhere in the output.
+- If the input has a flat / blank / damaged / missing region (e.g. a uniform gray background, a smooth area where tiles fell off, or a smooth surrounding floor), you MUST tessellate that region too: fill it with regularly-laid tiles, in colors that match what's nearby. A blank wall stays blank in subject matter, but in the output it must still consist of small uniformly-coloured tiles separated by dark grout.
+- Do NOT add borders, captions, watermarks, or new content / objects that weren't already in the input.
+- Self-check: if you can find a region in the output larger than ~3 tessera widths that is one flat color with no grout lines through it, you have failed this rule.
+
+Style:
+- The result should look like a clean, graphic, "engineered" mosaic — closer to a vector illustration than a photograph. The intent is downstream polygon extraction, not photorealistic reproduction.
+
+Output resolution (mandatory):
+- Render the result at 4K (3840 × 3840 px) — the highest resolution the model supports.
+- Do not downscale. The output must be sharp at full 4K so the polygon-detection pipeline has enough pixel detail to extract every tessera as a clean polygon.
