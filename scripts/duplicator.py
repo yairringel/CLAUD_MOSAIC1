@@ -8,6 +8,7 @@ import sys
 import csv
 import json
 import math
+import pickle
 import random
 import numpy as np
 from scipy.interpolate import splprep, splev
@@ -16,7 +17,7 @@ from PyQt5.QtWidgets import (
     QFrame, QLabel, QPushButton, QFileDialog, QCheckBox, QSpinBox, QLineEdit, QInputDialog, QMessageBox,
     QSizePolicy, QSlider, QColorDialog
 )
-from PyQt5.QtCore import Qt, QPoint, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QPoint, QTimer, pyqtSignal, QBuffer, QByteArray
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QBrush, QFont, QPolygon, QCursor, QLinearGradient
 
 class ContinuousButton(QPushButton):
@@ -2746,10 +2747,21 @@ class SidePanel(QFrame):
             save_array_button = QPushButton("Save Array")
             save_array_button.clicked.connect(self.save_array)
             layout.addWidget(save_array_button)
-            
+
             load_array_button = QPushButton("Load Array")
             load_array_button.clicked.connect(self.load_array)
             layout.addWidget(load_array_button)
+
+            # Save/Load Project — captures the full canvas state (grid, image,
+            # polygons + properties, drawing settings) into a single .dup file
+            # so a session can be resumed later.
+            save_project_button = QPushButton("Save Project")
+            save_project_button.clicked.connect(self.save_project)
+            layout.addWidget(save_project_button)
+
+            load_project_button = QPushButton("Load Project")
+            load_project_button.clicked.connect(self.load_project)
+            layout.addWidget(load_project_button)
         
         # Add buttons for right panel
         elif title == "Right Panel" and canvas:
@@ -3719,6 +3731,220 @@ class SidePanel(QFrame):
                 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load array: {str(e)}")
+
+    # ── Project save / load ───────────────────────────────────────────────
+    # Captures the full canvas state into a single .dup file: background image
+    # (as PNG bytes), grid position/size, image position/scale, polygon array
+    # with all properties, and drawing settings. Mirrors the structure used by
+    # image_strech.py's project format but adapted to duplicator's state.
+
+    PROJECT_FORMAT_VERSION = 1
+
+    @staticmethod
+    def _qcolor_to_tuple(c):
+        if c is None:
+            return None
+        return (c.red(), c.green(), c.blue(), c.alpha())
+
+    @staticmethod
+    def _tuple_to_qcolor(t):
+        if t is None:
+            return None
+        return QColor(*t)
+
+    @staticmethod
+    def _pixmap_to_png_bytes(pm):
+        """QPixmap -> PNG byte string (or None if pixmap is empty)."""
+        if pm is None or pm.isNull():
+            return None
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QBuffer.WriteOnly)
+        pm.save(buf, "PNG")
+        buf.close()
+        return bytes(ba)
+
+    @staticmethod
+    def _png_bytes_to_pixmap(data):
+        if not data:
+            return None
+        pm = QPixmap()
+        pm.loadFromData(data, "PNG")
+        return pm if not pm.isNull() else None
+
+    def save_project(self):
+        """Pickle the canvas state to a .dup file."""
+        if not self.canvas:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Project", "project.dup",
+            "Duplicator Project (*.dup);;All files (*)",
+        )
+        if not path:
+            return
+
+        canvas = self.canvas
+
+        # Polygons: convert each QColor to a tuple so the file is portable
+        # across PyQt versions. All other dict keys (points, group_id,
+        # rotation_angle, mandala_clicked, ...) get preserved as-is.
+        polygons_serial = []
+        for p in canvas.polygons:
+            d = dict(p)  # shallow copy so we don't mutate live state
+            if 'color' in d:
+                d['color'] = self._qcolor_to_tuple(d['color'])
+            if 'frame_color' in d:
+                d['frame_color'] = self._qcolor_to_tuple(d['frame_color'])
+            polygons_serial.append(d)
+
+        data = {
+            'format_version': self.PROJECT_FORMAT_VERSION,
+            # ─── Background image (PNG bytes) + transform ───
+            'background_png':           self._pixmap_to_png_bytes(canvas.background_image),
+            'original_background_png':  self._pixmap_to_png_bytes(canvas.original_background_image),
+            'current_x_scale':          canvas.current_x_scale,
+            'current_y_scale':          canvas.current_y_scale,
+            'image_offset_x':           canvas.image_offset_x,
+            'image_offset_y':           canvas.image_offset_y,
+            'show_image':               canvas.show_image,
+            # ─── Grid ───
+            'show_grid':                canvas.show_grid,
+            'grid_size':                canvas.grid_size,
+            'grid_offset_x':            canvas.grid_offset_x,
+            'grid_offset_y':            canvas.grid_offset_y,
+            # ─── Polygons + property bookkeeping ───
+            'polygons':                 polygons_serial,
+            'next_group_id':            canvas.next_group_id,
+            # ─── Drawing settings ───
+            'edge_width':               canvas.edge_width,
+            'line_smoothing_factor':    canvas.line_smoothing_factor,
+            'line_polygon_size':        canvas.line_polygon_size,
+            'num_parallel_lines':       canvas.num_parallel_lines,
+            'line_polygon_gap':         canvas.line_polygon_gap,
+            'parallel_line_gap':        canvas.parallel_line_gap,
+            # ─── View ───
+            'zoom_factor':              canvas.zoom_factor,
+            'pan_offset_x':             canvas.pan_offset_x,
+            'pan_offset_y':             canvas.pan_offset_y,
+        }
+
+        try:
+            with open(path, 'wb') as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save project: {e}")
+            return
+        QMessageBox.information(
+            self, "Success",
+            f"Project saved.\n\nFile: {path}\nPolygons: {len(polygons_serial)}",
+        )
+
+    def load_project(self):
+        """Restore canvas state from a .dup file."""
+        if not self.canvas:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Project", "",
+            "Duplicator Project (*.dup);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load project: {e}")
+            return
+        if not isinstance(data, dict):
+            QMessageBox.critical(self, "Error", "File is not a valid Duplicator project.")
+            return
+
+        canvas = self.canvas
+
+        # Background image
+        canvas.background_image          = self._png_bytes_to_pixmap(data.get('background_png'))
+        canvas.original_background_image = self._png_bytes_to_pixmap(data.get('original_background_png'))
+        canvas.current_x_scale = data.get('current_x_scale', 1.0)
+        canvas.current_y_scale = data.get('current_y_scale', 1.0)
+        canvas.image_offset_x  = data.get('image_offset_x', 0)
+        canvas.image_offset_y  = data.get('image_offset_y', 0)
+        canvas.show_image      = data.get('show_image', True)
+
+        # Grid
+        canvas.show_grid     = data.get('show_grid', False)
+        canvas.grid_size     = data.get('grid_size', 300)
+        canvas.grid_offset_x = data.get('grid_offset_x', 0)
+        canvas.grid_offset_y = data.get('grid_offset_y', 0)
+
+        # Polygons
+        polys = []
+        for d in data.get('polygons', []):
+            p = dict(d)
+            if 'color' in p:
+                p['color'] = self._tuple_to_qcolor(p['color']) if not isinstance(p['color'], QColor) else p['color']
+            if 'frame_color' in p:
+                p['frame_color'] = self._tuple_to_qcolor(p['frame_color']) if not isinstance(p['frame_color'], QColor) else p['frame_color']
+            polys.append(p)
+        canvas.polygons = polys
+        canvas.next_group_id = data.get('next_group_id', 1)
+
+        # Drawing settings
+        canvas.edge_width            = data.get('edge_width', 1.1)
+        canvas.line_smoothing_factor = data.get('line_smoothing_factor', 0.05)
+        canvas.line_polygon_size     = data.get('line_polygon_size', 15)
+        canvas.num_parallel_lines    = data.get('num_parallel_lines', 0)
+        canvas.line_polygon_gap      = data.get('line_polygon_gap', 2)
+        canvas.parallel_line_gap     = data.get('parallel_line_gap', 2)
+
+        # View
+        canvas.zoom_factor   = data.get('zoom_factor', 1.0)
+        canvas.pan_offset_x  = data.get('pan_offset_x', 0.0)
+        canvas.pan_offset_y  = data.get('pan_offset_y', 0.0)
+
+        # Reset transient state — these should never be carried in a project.
+        canvas.selected_polygon_index    = -1
+        canvas.selected_control_point    = -1
+        canvas.is_dragging_polygon       = False
+        canvas.is_dragging_control_point = False
+        canvas.is_dragging_image         = False
+        canvas.is_panning                = False
+        canvas.polygon_points            = []
+        canvas.is_drawing_line           = False
+        canvas.line_points               = []
+        canvas.line_start_point          = None
+        canvas.current_line_end          = None
+        canvas.is_erasing                = False
+        canvas.grid_dragging             = False
+        canvas.overlap_data              = []
+        canvas.showing_overlaps          = False
+        canvas.undo_stack                = []
+
+        # Update right-panel UI inputs to reflect loaded canvas state (best-effort —
+        # only touch attributes that exist).
+        rp = getattr(canvas, 'right_panel', None)
+        if rp is not None:
+            for attr, value, fmt in (
+                ('grid_size_input',      canvas.grid_size,             '{:.0f}'),
+                ('edge_width_input',     canvas.edge_width,            '{:.2f}'),
+                ('smoothing_input',      canvas.line_smoothing_factor, '{:.2f}'),
+                ('polygon_size_input',   canvas.line_polygon_size,     '{:.0f}'),
+                ('parallel_lines_input', canvas.num_parallel_lines,    '{:.0f}'),
+                ('parallel_gap_input',   canvas.parallel_line_gap,     '{:.0f}'),
+                ('gap_input',            canvas.line_polygon_gap,      '{:.0f}'),
+                ('x_scale_input',        canvas.current_x_scale * 100, '{:.1f}'),
+                ('y_scale_input',        canvas.current_y_scale * 100, '{:.1f}'),
+            ):
+                w = getattr(rp, attr, None)
+                if w is not None:
+                    w.blockSignals(True)
+                    w.setText(fmt.format(value))
+                    w.blockSignals(False)
+
+        canvas.update()
+        QMessageBox.information(
+            self, "Success",
+            f"Project loaded.\n\nFile: {path}\nPolygons: {len(canvas.polygons)}",
+        )
 
     def reset_grid_to_origin(self):
         """Reset grid position to origin (0,0) - useful for aligning loaded arrays"""
