@@ -1,0 +1,13 @@
+Look at the supplied mosaic image. Identify every individual mosaic tile (tessera). Output a binary image of the SAME composition and SAME pixel positions, where:
+
+- The BACKGROUND is solid PURE BLACK (#000000).
+- Each individual tile is drawn as ONE SOLID PURE WHITE (#FFFFFF) shape that matches that tile's exact position, size, and outline in the input.
+
+STRICT requirements:
+- Only two colors allowed in the output: #FFFFFF and #000000. No gray, no anti-aliasing, no patterns, no shading.
+- Every pair of adjacent tiles MUST be separated by AT LEAST 3 pixels of BLACK between their white shapes — adjacent shapes must NEVER touch or merge.
+- Fill every tile shape SOLID white from edge to edge.
+- Do NOT skip tiles. Every visible tile in the input must appear as a separate white shape in the output.
+- Preserve the exact pixel-level position of every tile from the input. Do NOT redraw or relocate the mosaic.
+
+Output ONLY the binary image — no text, no border, no caption.

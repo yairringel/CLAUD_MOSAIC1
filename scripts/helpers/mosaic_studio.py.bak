@@ -10,7 +10,6 @@ application:
 """
 
 import sys
-import os
 import csv
 import math
 import random
@@ -19,42 +18,12 @@ import cv2
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QPushButton, QFileDialog, QLabel,
                            QMessageBox, QCheckBox, QLineEdit, QDialog,
-                           QSpinBox, QDoubleSpinBox, QGroupBox, QInputDialog)
+                           QSpinBox, QDoubleSpinBox, QGroupBox)
 from PyQt5.QtCore import Qt, QPointF, QRect
-from PyQt5.QtGui import (QPainter, QPen, QBrush, QColor, QPolygonF, QFont,
-                         QWheelEvent, QImage)
-from shapely.geometry import Polygon, Point
+from PyQt5.QtGui import QPainter, QPen, QBrush, QColor, QPolygonF, QFont, QWheelEvent
+from shapely.geometry import Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# The 36 fixed colors used to mark which grid box each polygon belongs to
-# (one per A1..F6 cell). Cut paints polygons with these; Paint lets the user
-# re-color polygons to a different box's color; Tiles uses an exact-RGB lookup
-# against this table to decide which polygons get unified into which tile.
-# ─────────────────────────────────────────────────────────────────────────────
-BOX_COLORS = [
-    QColor(255,   0,   0), QColor(  0, 255,   0), QColor(  0,   0, 255),
-    QColor(255, 255,   0), QColor(255,   0, 255), QColor(  0, 255, 255),
-    QColor(255, 128,   0), QColor(128,   0, 255), QColor(  0, 128,   0),
-    QColor(128,   0,   0), QColor(  0,   0, 128), QColor(128, 128,   0),
-    QColor(255, 192, 203), QColor(165,  42,  42), QColor(255, 165,   0),
-    QColor( 75,   0, 130), QColor(240, 230, 140), QColor(220,  20,  60),
-    QColor( 32, 178, 170), QColor(255,  20, 147), QColor(  0, 191, 255),
-    QColor(154, 205,  50), QColor(255,  69,   0), QColor(138,  43, 226),
-    QColor( 50, 205,  50), QColor(255, 140,   0), QColor( 72,  61, 139),
-    QColor(255, 215,   0), QColor(199,  21, 133), QColor(  0, 255, 127),
-    QColor(255, 105, 180), QColor( 30, 144, 255), QColor(124, 252,   0),
-    QColor(255,   0, 127), QColor( 64, 224, 208), QColor(218, 165,  32),
-]
-_BOX_COLOR_RGB_TO_INDEX = {(c.red(), c.green(), c.blue()): i for i, c in enumerate(BOX_COLORS)}
-
-
-def color_to_box_index(color: QColor) -> int:
-    """Reverse-lookup a polygon color back to its box index (0..35), or -1 if it
-    doesn't exactly match any of the 36 BOX_COLORS (e.g. unassigned-gray, original-from-CSV)."""
-    return _BOX_COLOR_RGB_TO_INDEX.get((color.red(), color.green(), color.blue()), -1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,39 +172,6 @@ def scale_polygons(polygons, max_downscale_pct):
     return result
 
 
-def rotate_polygons(polygons, max_rotation_deg):
-    """Independently rotate each polygon around its centroid by a random angle
-    in [-max_rotation_deg, +max_rotation_deg].  Run AFTER scale_polygons so
-    rotations happen on the downscaled shapes; that way the small per-polygon
-    gaps left by downscaling absorb most of the rotation overlap that would
-    otherwise occur between neighbouring tiles.
-    """
-    if max_rotation_deg <= 0:
-        return list(polygons)
-    result = []
-    for poly in polygons:
-        if poly is None or not hasattr(poly, 'exterior'):
-            result.append(poly)
-            continue
-        angle_rad = math.radians(random.uniform(-max_rotation_deg, max_rotation_deg))
-        cosA = math.cos(angle_rad)
-        sinA = math.sin(angle_rad)
-        cx, cy = poly.centroid.x, poly.centroid.y
-        rotated = [
-            (
-                cx + (x - cx) * cosA - (y - cy) * sinA,
-                cy + (x - cx) * sinA + (y - cy) * cosA,
-            )
-            for x, y in poly.exterior.coords[:-1]
-        ]
-        try:
-            p = Polygon(rotated)
-            result.append(p if p.is_valid else make_valid(p))
-        except Exception:
-            result.append(poly)
-    return result
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -267,20 +203,13 @@ class CutterCanvas(QWidget):
         self.last_mouse_pos = None
         self.is_panning = False
         
-        # Paint tool — eyedropper + click-to-recolor for re-assigning polygons to a different box.
-        # When paint_mode is on:
-        #   1st click on a polygon: picks up that polygon's color into paint_picked_color
-        #   later clicks: assign paint_picked_color to the clicked polygon
-        self.paint_mode = False
-        self.paint_picked_color: QColor | None = None
-
         # Measure tool
         self.measure_mode = False
         self.measure_points = []  # Up to 2 world-coordinate tuples
         
         # Grid variables
         self.show_grid = False  # Whether to show the grid
-        self.grid_size = 210  # Size of each individual grid box/cell in world coordinates
+        self.grid_size = 300  # Size of each individual grid box/cell in world coordinates
         self.grid_offset_x = 0  # Grid offset in world coordinates
         self.grid_offset_y = 0  # Grid offset in world coordinates
         self.grid_dragging = False  # Whether we're dragging the grid
@@ -703,51 +632,9 @@ class CutterCanvas(QWidget):
             
             self.update()
     
-    def find_polygon_at_world(self, world_x: float, world_y: float) -> int:
-        """Return the index of the smallest-area polygon containing (world_x, world_y),
-        or -1 if no polygon contains the point. Smallest-area resolves overlaps to the
-        most-specific tile (a tessera over a large background tile, for example)."""
-        p = Point(world_x, world_y)
-        best_idx = -1
-        best_area = float("inf")
-        for i, poly in enumerate(self.polygons):
-            if poly is None:
-                continue
-            try:
-                if poly.contains(p):
-                    area = poly.area
-                    if area < best_area:
-                        best_area = area
-                        best_idx = i
-            except Exception:
-                continue
-        return best_idx
-
     def mousePressEvent(self, event):
-        """Handle mouse press for panning, grid dragging, paint, and measure."""
+        """Handle mouse press for panning and grid dragging"""
         if event.button() == Qt.LeftButton:
-            # Paint mode: 1st click = eyedrop, subsequent clicks = recolor that polygon.
-            if self.paint_mode:
-                world_x, world_y = self.screen_to_world(event.x(), event.y())
-                idx = self.find_polygon_at_world(world_x, world_y)
-                if idx < 0:
-                    return
-                if self.paint_picked_color is None:
-                    # Eyedropper pick — grab the polygon's color as the "active brush".
-                    self.paint_picked_color = QColor(self.colors[idx])
-                else:
-                    # Paint — assign the picked color to this polygon.
-                    self.colors[idx] = QColor(self.paint_picked_color)
-                    self.invalidate_cache()
-                self.update()
-                # Let the parent know so the button label / swatch can refresh.
-                parent = self.parent()
-                while parent is not None and not hasattr(parent, "_on_paint_color_changed"):
-                    parent = parent.parent()
-                if parent is not None:
-                    parent._on_paint_color_changed()
-                return
-
             # Measure mode: collect points and show distance
             if self.measure_mode:
                 world_x, world_y = self.screen_to_world(event.x(), event.y())
@@ -928,7 +815,7 @@ class ControlPanel(QWidget):
         layout.addWidget(grid_size_label)
         
         self.grid_size_input = QLineEdit()
-        self.grid_size_input.setText('210')
+        self.grid_size_input.setText('300')
         self.grid_size_input.setPlaceholderText('Enter box size (e.g.,300)')
         self.grid_size_input.textChanged.connect(self.on_grid_size_changed)
         layout.addWidget(self.grid_size_input)
@@ -948,7 +835,7 @@ class ControlPanel(QWidget):
         layout.addWidget(offset_line_label)
         
         self.offset_line_input = QLineEdit()
-        self.offset_line_input.setText('1')
+        self.offset_line_input.setText('5')
         self.offset_line_input.setPlaceholderText('Enter offset % (e.g., 5)')
         self.offset_line_input.textChanged.connect(self.on_offset_line_changed)
         layout.addWidget(self.offset_line_input)
@@ -959,19 +846,6 @@ class ControlPanel(QWidget):
         self.cut_btn.clicked.connect(self.on_cut_clicked)
         layout.addWidget(self.cut_btn)
         
-        # Paint button — eyedropper + recolor to manually reassign polygons to a
-        # different box's color (which Tiles will then respect). Enabled after Cut.
-        self.paint_btn = QPushButton("Paint")
-        self.paint_btn.setCheckable(True)
-        self.paint_btn.setEnabled(False)
-        self.paint_btn.setToolTip(
-            "Toggle paint mode. First click picks up a polygon's box-color (eyedropper); "
-            "subsequent clicks repaint polygons with that color. Tiles will then group "
-            "polygons by color instead of by geometry.",
-        )
-        self.paint_btn.clicked.connect(self.on_paint_clicked)
-        layout.addWidget(self.paint_btn)
-
         # Tiles button
         self.tiles_btn = QPushButton("Tiles")
         self.tiles_btn.setEnabled(False)  # Initially disabled until Cut is performed
@@ -999,7 +873,7 @@ class ControlPanel(QWidget):
         rand_layout.addWidget(QLabel("Max ctrl pts / edge:"))
         self.rand_ctrl_spin = QSpinBox()
         self.rand_ctrl_spin.setRange(0, 30)
-        self.rand_ctrl_spin.setValue(5)
+        self.rand_ctrl_spin.setValue(2)
         self.rand_ctrl_spin.setToolTip(
             "Each edge picks a random number of extra vertices in [0, max].\n"
             "Shared edges always use the same count so polygons can't overlap."
@@ -1009,7 +883,7 @@ class ControlPanel(QWidget):
         rand_layout.addWidget(QLabel("Strength (world units):"))
         self.rand_strength_spin = QDoubleSpinBox()
         self.rand_strength_spin.setRange(0.0, 1_000_000.0)
-        self.rand_strength_spin.setValue(1.0)
+        self.rand_strength_spin.setValue(10.0)
         self.rand_strength_spin.setSingleStep(1.0)
         self.rand_strength_spin.setDecimals(2)
         self.rand_strength_spin.setToolTip(
@@ -1021,7 +895,7 @@ class ControlPanel(QWidget):
         rand_layout.addWidget(QLabel("Max downscale (%):"))
         self.rand_downscale_spin = QDoubleSpinBox()
         self.rand_downscale_spin.setRange(0.0, 99.0)
-        self.rand_downscale_spin.setValue(5.0)
+        self.rand_downscale_spin.setValue(0.0)
         self.rand_downscale_spin.setSingleStep(1.0)
         self.rand_downscale_spin.setDecimals(1)
         self.rand_downscale_spin.setToolTip(
@@ -1029,20 +903,6 @@ class ControlPanel(QWidget):
             "between 0% and this value (toward its centroid). 0 = no scaling."
         )
         rand_layout.addWidget(self.rand_downscale_spin)
-
-        rand_layout.addWidget(QLabel("Max rotation (°):"))
-        self.rand_rotation_spin = QDoubleSpinBox()
-        self.rand_rotation_spin.setRange(0.0, 45.0)
-        self.rand_rotation_spin.setValue(0.0)
-        self.rand_rotation_spin.setSingleStep(1.0)
-        self.rand_rotation_spin.setDecimals(1)
-        self.rand_rotation_spin.setToolTip(
-            "Each polygon is independently rotated around its centroid by a\n"
-            "random angle in [-max, +max] degrees. Rotation is applied AFTER\n"
-            "downscale, so use a small downscale (e.g. 3–8 %) to absorb the\n"
-            "extra overlap that rotation would otherwise create. 0 = no rotation."
-        )
-        rand_layout.addWidget(self.rand_rotation_spin)
 
         self.randomize_btn = QPushButton("Randomize")
         self.randomize_btn.setEnabled(False)
@@ -1061,12 +921,6 @@ class ControlPanel(QWidget):
         self.save_csv_btn.setEnabled(False)
         self.save_csv_btn.clicked.connect(self.on_save_csv_clicked)
         layout.addWidget(self.save_csv_btn)
-
-        # Save PNG button (renders current polygons to a PNG image)
-        self.save_png_btn = QPushButton("Save PNG")
-        self.save_png_btn.setEnabled(False)
-        self.save_png_btn.clicked.connect(self.on_save_png_clicked)
-        layout.addWidget(self.save_png_btn)
 
         # Add stretch to push everything to the top
         layout.addStretch()
@@ -1098,7 +952,6 @@ class ControlPanel(QWidget):
                 self.randomize_btn.setEnabled(True)
                 self.reset_rand_btn.setEnabled(True)
                 self.save_csv_btn.setEnabled(True)
-                self.save_png_btn.setEnabled(True)
             else:
                 QMessageBox.warning(self, "Error", "Failed to load CSV file. Please check the file format.")
     
@@ -1166,11 +1019,9 @@ class ControlPanel(QWidget):
         n_ctrl   = self.rand_ctrl_spin.value()
         strength = self.rand_strength_spin.value()
         ds_pct   = self.rand_downscale_spin.value()
-        rot_deg  = self.rand_rotation_spin.value()
         try:
             result = randomize_polygons(self._polygons_orig, n_ctrl, strength)
             result = scale_polygons(result, ds_pct)
-            result = rotate_polygons(result, rot_deg)
         except Exception as e:
             QMessageBox.critical(self, "Randomization Error", str(e))
             return
@@ -1257,115 +1108,6 @@ class ControlPanel(QWidget):
                         'color_hex':  color.name(),
                     })
 
-    def on_save_png_clicked(self):
-        """Render the current polygon array to a PNG image at a user-chosen resolution."""
-        if not self.canvas or not self.canvas.polygons:
-            return
-
-        text, ok = QInputDialog.getText(
-            self, "Output resolution",
-            "Final resolution (WIDTHxHEIGHT, e.g. 1000x1000):",
-            text="1000x1000",
-        )
-        if not ok or not text.strip():
-            return
-        try:
-            w_str, h_str = text.lower().replace(" ", "").split("x")
-            out_w, out_h = int(w_str), int(h_str)
-            if out_w <= 0 or out_h <= 0:
-                raise ValueError
-        except Exception:
-            QMessageBox.critical(
-                self, "Invalid input",
-                "Please enter resolution as WIDTHxHEIGHT, e.g. 1000x1000.",
-            )
-            return
-
-        # Default to project output/ folder per project convention.
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        out_dir = os.path.join(project_root, "output")
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except Exception:
-            out_dir = ""
-        default_path = os.path.join(out_dir, "mosaic.png") if out_dir else ""
-
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save PNG", default_path, "PNG image (*.png);;All files (*.*)"
-        )
-        if not path:
-            return
-        if not path.lower().endswith(".png"):
-            path += ".png"
-
-        try:
-            self._render_polygons_to_png(path, out_w, out_h)
-            QMessageBox.information(self, "Saved", f"Saved {out_w}x{out_h} PNG.")
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Could not save PNG:\n{e}")
-
-    def _render_polygons_to_png(self, filename, out_w, out_h):
-        """Render canvas polygons into an out_w x out_h PNG with transparent
-        background, preserving aspect ratio and the canvas fill/edge settings."""
-        polygons   = self.canvas.polygons
-        colors     = self.canvas.colors
-        edge_colors = self.canvas.edge_colors
-        transparent_fill = self.canvas.transparent_fill
-
-        min_x = min_y = float('inf')
-        max_x = max_y = float('-inf')
-        for poly in polygons:
-            if poly is None:
-                continue
-            bx0, by0, bx1, by1 = poly.bounds
-            if bx0 < min_x: min_x = bx0
-            if by0 < min_y: min_y = by0
-            if bx1 > max_x: max_x = bx1
-            if by1 > max_y: max_y = by1
-        if not (max_x > min_x and max_y > min_y):
-            raise ValueError("No drawable polygons.")
-
-        world_w = max_x - min_x
-        world_h = max_y - min_y
-        scale = min(out_w / world_w, out_h / world_h)
-        used_w = world_w * scale
-        used_h = world_h * scale
-        off_x = (out_w - used_w) / 2.0
-        off_y = (out_h - used_h) / 2.0
-
-        image = QImage(out_w, out_h, QImage.Format_ARGB32)
-        image.fill(Qt.transparent)
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-
-        edge_pen_width = max(1.0, scale * 0.05)
-
-        for i, polygon in enumerate(polygons):
-            if polygon is None:
-                continue
-            color = colors[i] if i < len(colors) else QColor(100, 100, 100)
-            edge_color = edge_colors[i] if i < len(edge_colors) else QColor(0, 0, 0)
-
-            geoms = list(polygon.geoms) if hasattr(polygon, 'geoms') else [polygon]
-            for g in geoms:
-                if not hasattr(g, 'exterior'):
-                    continue
-                qt_poly = QPolygonF()
-                for x, y in g.exterior.coords:
-                    ix = off_x + (x - min_x) * scale
-                    iy = off_y + (y - min_y) * scale
-                    qt_poly.append(QPointF(ix, iy))
-                if transparent_fill:
-                    painter.setBrush(QBrush(Qt.NoBrush))
-                else:
-                    painter.setBrush(QBrush(color))
-                painter.setPen(QPen(edge_color, edge_pen_width))
-                painter.drawPolygon(qt_poly)
-
-        painter.end()
-        if not image.save(filename, "PNG"):
-            raise IOError(f"QImage.save returned False for {filename}")
-
     def on_cut_clicked(self):
         """Handle Cut button click - assign colors based on grid boxes"""
         if not self.canvas or not self.canvas.polygons:
@@ -1382,20 +1124,63 @@ class ControlPanel(QWidget):
         grid_x = self.canvas.grid_offset_x
         grid_y = self.canvas.grid_offset_y
         
+        # Define 36 rainbow colors with maximum distinction and better contrast
+        grid_colors = [
+            QColor(255, 0, 0),     # Bright Red
+            QColor(0, 255, 0),     # Bright Green  
+            QColor(0, 0, 255),     # Bright Blue
+            QColor(255, 255, 0),   # Bright Yellow
+            QColor(255, 0, 255),   # Bright Magenta
+            QColor(0, 255, 255),   # Bright Cyan
+            QColor(255, 128, 0),   # Orange
+            QColor(128, 0, 255),   # Purple
+            QColor(0, 128, 0),     # Forest Green
+            QColor(128, 0, 0),     # Maroon
+            QColor(0, 0, 128),     # Navy Blue
+            QColor(128, 128, 0),   # Olive
+            QColor(255, 192, 203), # Pink
+            QColor(165, 42, 42),   # Brown
+            QColor(255, 165, 0),   # Dark Orange
+            QColor(75, 0, 130),    # Indigo
+            QColor(240, 230, 140), # Khaki
+            QColor(220, 20, 60),   # Crimson
+            QColor(32, 178, 170),  # Light Sea Green
+            QColor(255, 20, 147),  # Deep Pink
+            QColor(0, 191, 255),   # Deep Sky Blue
+            QColor(154, 205, 50),  # Yellow Green
+            QColor(255, 69, 0),    # Red Orange
+            QColor(138, 43, 226),  # Blue Violet
+            QColor(50, 205, 50),   # Lime Green
+            QColor(255, 140, 0),   # Dark Orange 2
+            QColor(72, 61, 139),   # Dark Slate Blue
+            QColor(255, 215, 0),   # Gold
+            QColor(199, 21, 133),  # Medium Violet Red
+            QColor(0, 255, 127),   # Spring Green
+            QColor(255, 105, 180), # Hot Pink
+            QColor(30, 144, 255),  # Dodger Blue
+            QColor(124, 252, 0),   # Lawn Green
+            QColor(255, 0, 127),   # Rose
+            QColor(64, 224, 208),  # Turquoise
+            QColor(218, 165, 32)   # Goldenrod
+        ]
+        
         # Track which boxes contain polygons
         boxes_with_polygons = set()
-
-        # Process each polygon and assign color based on dominant grid box.
-        # Colors come from the module-level BOX_COLORS list so the Paint and Tiles
-        # tools can do an exact-RGB reverse lookup back to a box index.
+        
+        # Process each polygon and assign color based on dominant grid box
         new_colors = []
         for i, polygon in enumerate(self.canvas.polygons):
+            # Calculate the dominant grid box for this polygon
             box_index = self.canvas.calculate_dominant_grid_box(polygon, grid_x, grid_y, cell_size)
-            if 0 <= box_index < 36:
-                color = QColor(BOX_COLORS[box_index])     # copy to keep per-polygon mutability
+            
+            if box_index >= 0 and box_index < 36:
+                # Use the color corresponding to the grid box
+                color = grid_colors[box_index]
                 boxes_with_polygons.add(box_index)
             else:
-                color = QColor(128, 128, 128)            # gray = outside grid
+                # Fallback color for polygons that don't fit in any box
+                color = QColor(128, 128, 128)  # Gray
+            
             new_colors.append(color)
         
         # Update canvas with new colors
@@ -1415,61 +1200,12 @@ class ControlPanel(QWidget):
         # Re-enable Cut button after operation is complete
         self.cut_btn.setEnabled(True)
         self.cut_btn.setText("Cut")
-        # Enable Save Boxes, Tiles, and Paint buttons after Cut operation
+        # Enable Save Boxes and Tiles buttons after Cut operation
         self.save_boxes_btn.setEnabled(True)
         self.tiles_btn.setEnabled(True)
-        self.paint_btn.setEnabled(True)
         # Force UI update to show the re-enabled state
         QApplication.processEvents()
     
-    # ── Paint mode (eyedropper + click-to-recolor) ───────────────────────────
-
-    def on_paint_clicked(self):
-        """Toggle paint mode. Painting only makes sense after Cut has run, so the
-        button starts disabled and is enabled by on_cut_clicked()."""
-        if not self.canvas:
-            return
-        enabled = self.paint_btn.isChecked()
-        self.canvas.paint_mode = enabled
-        # Reset the picked color every time we enter paint mode so the user always
-        # starts with the eyedropper.
-        self.canvas.paint_picked_color = None
-        if enabled:
-            self.canvas.setCursor(Qt.CrossCursor)
-        else:
-            self.canvas.setCursor(Qt.ArrowCursor)
-        self._refresh_paint_button_label()
-
-    def _on_paint_color_changed(self):
-        """Called by the canvas after each paint-mode click so the button label/swatch
-        can reflect 'pick a color' vs 'painting with #RRGGBB'."""
-        self._refresh_paint_button_label()
-
-    def _refresh_paint_button_label(self):
-        """Show paint state on the button: 'Paint' / 'Paint: pick color' /
-        'Paint: <swatch>' once a color is loaded."""
-        if not self.paint_btn.isChecked():
-            self.paint_btn.setText("Paint")
-            self.paint_btn.setStyleSheet("")
-            return
-        picked = self.canvas.paint_picked_color if self.canvas else None
-        if picked is None:
-            self.paint_btn.setText("Paint: pick color (click a polygon)")
-            self.paint_btn.setStyleSheet("")
-        else:
-            box_idx = color_to_box_index(picked)
-            if 0 <= box_idx < 36:
-                label = f"{chr(ord('A') + box_idx // 6)}{(box_idx % 6) + 1}"
-            else:
-                label = "custom"
-            hex_str = f"#{picked.red():02x}{picked.green():02x}{picked.blue():02x}"
-            self.paint_btn.setText(f"Paint: {label} ({hex_str})")
-            # Tint the button with the picked color so it's visually obvious.
-            text_color = "#fff" if (picked.red() + picked.green() + picked.blue()) < 380 else "#000"
-            self.paint_btn.setStyleSheet(
-                f"background-color: {hex_str}; color: {text_color};",
-            )
-
     def on_tiles_clicked(self):
         """Handle Tiles button click - create polygons for all grid boxes with content"""
         if not self.canvas or not self.canvas.polygons:
@@ -1502,31 +1238,6 @@ class ControlPanel(QWidget):
         total_unified = 0
         total_subtracted = 0
         
-        # Snapshot the input polygons — Tiles appends each newly-created tile back
-        # into self.canvas.polygons as it processes boxes, so iterating the live list
-        # would let tile polygons slip into the union/subtract logic for later boxes.
-        source_polygons = list(self.canvas.polygons)
-
-        # Pre-compute each input polygon's assigned-box-index using its CURRENT color.
-        # This makes Paint-mode recoloring effective: a polygon repainted with box
-        # A's color now joins A's tile even if it geometrically lives in B's cell.
-        # Polygons whose color doesn't match any of the 36 BOX_COLORS (e.g. the
-        # gray "outside grid" fallback, or a custom color) drop back to the
-        # original geometric assignment.
-        polygon_box_assignment = []
-        for i, polygon in enumerate(source_polygons):
-            col = self.canvas.colors[i] if i < len(self.canvas.colors) else None
-            assigned = color_to_box_index(col) if col is not None else -1
-            if assigned < 0:
-                assigned = self.canvas.calculate_dominant_grid_box(polygon, grid_x, grid_y, cell_size)
-            polygon_box_assignment.append(assigned)
-
-        # Refresh boxes_with_polygons from the color-based assignment so that any
-        # box that became newly-populated by Paint mode gets a tile too, and any
-        # box that became empty gets dropped.
-        active_boxes = {b for b in polygon_box_assignment if 0 <= b < 36}
-        self.canvas.boxes_with_polygons = active_boxes
-
         # Process each box that has polygons
         for box_index in self.canvas.boxes_with_polygons:
             # Convert 1D box index to 2D coordinates (row, col)
@@ -1555,19 +1266,17 @@ class ControlPanel(QWidget):
             box_assigned_polygons = []
             intersecting_other_polygons = []
             
-            # Iterate the snapshot, not self.canvas.polygons (which grows during
-            # the outer loop as we append tile polygons).
-            for i, polygon in enumerate(source_polygons):
-                # Color-based assignment (overridable by Paint) instead of geometry.
-                polygon_box_index = polygon_box_assignment[i]
-
+            for i, polygon in enumerate(self.canvas.polygons):
+                # Get the box assignment for this polygon from Cut results
+                polygon_box_index = self.canvas.calculate_dominant_grid_box(polygon, grid_x, grid_y, cell_size)
+                
                 # Check if polygon intersects or touches this box boundary
                 if polygon.intersects(box_polygon) or polygon.touches(box_polygon):
                     if polygon_box_index == box_index:
-                        # This polygon was assigned to this box (by Cut or by Paint).
+                        # This polygon was assigned to this box by Cut function
                         box_assigned_polygons.append(polygon)
                     else:
-                        # Polygon overlaps this box's rect but belongs to another box.
+                        # This polygon intersects this box but was assigned to another box
                         intersecting_other_polygons.append(polygon)
             
             # Start with the original box polygon
@@ -1713,22 +1422,7 @@ class ControlPanel(QWidget):
             except ValueError:
                 QMessageBox.warning(self, "Invalid Input", "Please enter a valid number for fillet radius.")
                 return
-
-        # Ask which DXFs to write: per-color split, or just all-polygons + tile shape.
-        dxf_choice = QMessageBox(self)
-        dxf_choice.setWindowTitle("DXF Output")
-        dxf_choice.setText("Save a separate DXF for each color?")
-        dxf_choice.setInformativeText(
-            "Yes — write one DXF per color, plus the all-polygons DXF and the outer tile shape.\n"
-            "No  — write only the all-polygons DXF and the outer tile shape."
-        )
-        dxf_choice.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
-        dxf_choice.setDefaultButton(QMessageBox.Yes)
-        result = dxf_choice.exec_()
-        if result == QMessageBox.Cancel:
-            return
-        save_color_dxfs = (result == QMessageBox.Yes)
-
+        
         # Disable Save Boxes button during processing
         self.save_boxes_btn.setEnabled(False)
         self.save_boxes_btn.setText("Saving...")
@@ -1755,56 +1449,47 @@ class ControlPanel(QWidget):
                     col_number = col + 1  # 1, 2, 3, 4, 5, 6
                     box_labels.append(f"{row_letter}{col_number}")
             
-            # Assign polygons to boxes (excluding tile polygons).
-            # Box ownership uses color-based assignment (so Paint overrides take
-            # effect in the DXF/CSV output, matching what Tiles does), with the
-            # geometric calculate_dominant_grid_box as a fallback for polygons
-            # whose color isn't one of the 36 BOX_COLORS (e.g. the gray
-            # "outside grid" fallback). boxes_data is built dynamically so
-            # boxes that became active only through Paint still get their
-            # files written, even if Tiles wasn't re-run before Save Boxes.
+            # Group polygons by box
+            boxes_data = {}
+            for box_index in self.canvas.boxes_with_polygons:
+                if 0 <= box_index < 36:
+                    box_label = box_labels[box_index]
+                    boxes_data[box_label] = {
+                        'polygons': [],
+                        'colors': [],
+                        'original_colors': [],  # Store original colors separately
+                        'box_index': box_index
+                    }
+            
+            # Assign polygons to boxes (excluding tile polygons)
             tile_polygons_set = set()
             if hasattr(self.canvas, 'tile_polygons'):
                 tile_polygons_set = set(self.canvas.tile_polygons.values())
-
-            boxes_data = {}
+            
             for i, polygon in enumerate(self.canvas.polygons):
                 # Skip tile polygons - they will be saved separately
                 if polygon in tile_polygons_set:
                     continue
-
-                col = self.canvas.colors[i] if i < len(self.canvas.colors) else None
-                box_index = color_to_box_index(col) if col is not None else -1
-                if box_index < 0:
-                    box_index = self.canvas.calculate_dominant_grid_box(
-                        polygon, grid_x, grid_y, cell_size,
-                    )
-                if not (0 <= box_index < 36):
-                    continue
-
-                box_label = box_labels[box_index]
-                if box_label not in boxes_data:
-                    boxes_data[box_label] = {
-                        'polygons': [],
-                        'colors': [],
-                        'original_colors': [],
-                        'box_index': box_index,
-                        'original_indices': [],
-                    }
-
-                boxes_data[box_label]['polygons'].append(polygon)
-                boxes_data[box_label]['colors'].append(self.canvas.colors[i])
-
-                original_color = self.canvas.colors[i]
-                if (hasattr(self.canvas, 'original_colors')
-                        and i < len(self.canvas.original_colors)):
-                    original_color = self.canvas.original_colors[i]
-                boxes_data[box_label]['original_colors'].append(original_color)
-                boxes_data[box_label]['original_indices'].append(i)
-
-            # Sync the canvas's set so downstream consumers (Tiles button enable,
-            # subsequent operations) see the freshly-recomputed active boxes.
-            self.canvas.boxes_with_polygons = {d['box_index'] for d in boxes_data.values()}
+                    
+                box_index = self.canvas.calculate_dominant_grid_box(polygon, grid_x, grid_y, cell_size)
+                if 0 <= box_index < 36:
+                    box_label = box_labels[box_index]
+                    if box_label in boxes_data:
+                        boxes_data[box_label]['polygons'].append(polygon)
+                        boxes_data[box_label]['colors'].append(self.canvas.colors[i])
+                        
+                        # Get original color for this polygon
+                        original_color = self.canvas.colors[i]  # Default to current color
+                        if (hasattr(self.canvas, 'original_colors') and 
+                            i < len(self.canvas.original_colors)):
+                            original_color = self.canvas.original_colors[i]
+                        
+                        boxes_data[box_label]['original_colors'].append(original_color)
+                        
+                        # Store the original polygon index to retrieve original color later
+                        if 'original_indices' not in boxes_data[box_label]:
+                            boxes_data[box_label]['original_indices'] = []
+                        boxes_data[box_label]['original_indices'].append(i)
             
             # Save each box as a separate CSV file
             saved_files = []
@@ -1855,29 +1540,28 @@ class ControlPanel(QWidget):
                     self.save_polygons_to_dxf(polygons_data, dxf_filename, box_label, data['box_index'])
                     dxf_files_saved += 1
                     
-                    if save_color_dxfs:
-                        # Group polygons by original color for color-specific DXF files
-                        color_groups = {}
-                        for poly_data in polygons_data:
-                            original_color = poly_data.get('original_color', poly_data['color'])
-                            color_hex = original_color.name()  # Get hex color like #FF0000
-
-                            if color_hex not in color_groups:
-                                color_groups[color_hex] = []
-
-                            # Use original color for the DXF file
-                            poly_data_copy = poly_data.copy()
-                            poly_data_copy['color'] = original_color
-                            color_groups[color_hex].append(poly_data_copy)
-
-                        # Save separate DXF file for each color
-                        for color_hex, color_polygons in color_groups.items():
-                            color_dxf_filename = os.path.join(box_dir, f"{box_label}_{color_hex}.dxf")
-                            try:
-                                self.save_polygons_to_dxf(color_polygons, color_dxf_filename, f"{box_label} - {color_hex}", data['box_index'])
-                                dxf_files_saved += 1
-                            except Exception as e:
-                                print(f"Failed to save color DXF {color_dxf_filename}: {str(e)}")
+                    # Group polygons by original color for color-specific DXF files
+                    color_groups = {}
+                    for poly_data in polygons_data:
+                        original_color = poly_data.get('original_color', poly_data['color'])
+                        color_hex = original_color.name()  # Get hex color like #FF0000
+                        
+                        if color_hex not in color_groups:
+                            color_groups[color_hex] = []
+                        
+                        # Use original color for the DXF file
+                        poly_data_copy = poly_data.copy()
+                        poly_data_copy['color'] = original_color
+                        color_groups[color_hex].append(poly_data_copy)
+                    
+                    # Save separate DXF file for each color
+                    for color_hex, color_polygons in color_groups.items():
+                        color_dxf_filename = os.path.join(box_dir, f"{box_label}_{color_hex}.dxf")
+                        try:
+                            self.save_polygons_to_dxf(color_polygons, color_dxf_filename, f"{box_label} - {color_hex}", data['box_index'])
+                            dxf_files_saved += 1
+                        except Exception as e:
+                            print(f"Failed to save color DXF {color_dxf_filename}: {str(e)}")
                     
                     # Save tile polygon DXF if it exists for this box
                     if hasattr(self.canvas, 'tile_polygons') and data['box_index'] in self.canvas.tile_polygons:

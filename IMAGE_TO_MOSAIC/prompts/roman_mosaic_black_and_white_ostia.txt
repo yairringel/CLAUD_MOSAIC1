@@ -2,7 +2,7 @@ Convert the supplied reference image into a black-and-white Roman mosaic in the 
 
 Style:
 - Only two tessera colors: jet black basalt and bone-white limestone. Each tessera is filled with a SINGLE SOLID UNIFORM COLOR (pure black or pure white) — no inner texture, no gradient, no gray pixels inside a tile.
-- Tesserae roughly 8-10 mm square, laid in tight straight rows in background fields and in curving *vermiculatum* lines around the silhouettes of figures and shapes.
+- Tesserae roughly 8-10 mm square, laid in tight straight rows in background fields and in curving *vermiculatum* lines around the silhouettes of figures and shapes. The TILE SIZE (8-10 mm) is the SAME in background fields and in figure silhouettes — only the layout direction changes (straight rows vs curving lines). Background tesserae must NOT be larger or coarser than figure tesserae. Self-check: if a background tile is visibly larger than a figure tile, you have failed.
 - Form is rendered as bold black silhouette against a white field (or the inverse), with internal detail picked out as fine black lines of single-tessera width.
 - Materials: black basalt + cream limestone only. No glass, no terracotta.
 - Grout: a clearly visible CONTINUOUS line on every side of every tile, at least 4 pixels wide in the output, unbroken. Since the tiles themselves are black and white, use a MID-GRAY grout (#666 to #888) so it stays visible against both tile colors — NOT pale lime, NOT hairline. Adjacent tiles never touch.

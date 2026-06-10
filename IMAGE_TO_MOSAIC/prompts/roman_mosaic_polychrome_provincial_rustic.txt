@@ -2,7 +2,7 @@ Convert the supplied reference image into a coarser, more rustic Roman provincia
 
 Style:
 - Tesserae noticeably larger and less uniform than metropolitan work: 12-18 mm, with visible variation in size and shape (variation BETWEEN tiles is allowed and encouraged). Hand-cut, slightly irregular edges. BUT each individual tile is filled with a SINGLE SOLID UNIFORM COLOR — no inner texture, no chips, no gradient WITHIN a single tile.
-- Laid in straight rows in background areas and looser *vermiculatum* curves around figures, with charming naive proportions rather than refined classical anatomy.
+- Laid in straight rows in background areas and looser *vermiculatum* curves around figures, with charming naive proportions rather than refined classical anatomy. The TILE SIZE never changes between subject and background — only the layout DIRECTION changes. Background tesserae must use the SAME size range (12-18 mm) as the subject's tesserae, NOT larger or coarser. Self-check: if a background tile is visibly larger than the subject's tiles, you have failed.
 - Materials: locally quarried limestone, sandstone, terracotta tile, basalt, and a touch of colored marble. No glass.
 - Color palette: warmer and more saturated than metropolitan work — golden ochre, brick red, terracotta, mustard yellow, deep umber, olive green, dusty blue, cream, black. Bolder color contrasts.
 - Grout: a DARK CONTINUOUS line on every side of every tile. Charcoal black (#1a1a1a to #333), at least 4 pixels wide in the output, unbroken, uniform — NOT sandy-beige, NOT warm. Adjacent tiles never touch.

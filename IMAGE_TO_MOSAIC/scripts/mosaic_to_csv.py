@@ -18,23 +18,158 @@ Usage:
 from __future__ import annotations
 
 import csv
+import os
 import sys
+import traceback
+from io import BytesIO
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image
-from PyQt5.QtCore import QEvent, Qt
+from PyQt5.QtCore import QEvent, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 ROOT = Path(__file__).resolve().parent.parent       # IMAGE_TO_MOSAIC/
+PROJECT_ROOT = ROOT.parent
 OUTPUT_DIR = ROOT / "output"
 INPUT_DIR = ROOT / "input"
+PROMPTS_DIR = ROOT / "prompts"
+SOLID_WHITE_PROMPT_FILE = PROMPTS_DIR / "solid_white_mask.txt"
+KEY_PATH_MEMO = ROOT / ".key_path"
+
+GEMINI_MODEL = "gemini-3-pro-image-preview"   # Nano Banana Pro
+
+
+# ---------------------------------------------------------------------------
+# API key loading — same scheme as photo_editor.py / mosaic_cleaner.py
+# ---------------------------------------------------------------------------
+
+def read_key_from_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("GEMINI_API_KEY"):
+            _, _, value = line.partition("=")
+            return value.strip().strip('"').strip("'") or None
+        if "=" not in line:
+            return line.strip('"').strip("'")
+    return None
+
+
+def load_api_key() -> str | None:
+    if KEY_PATH_MEMO.is_file():
+        memo = Path(KEY_PATH_MEMO.read_text(encoding="utf-8").strip())
+        key = read_key_from_file(memo)
+        if key:
+            return key
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key:
+        return env_key.strip()
+    for p in (ROOT / ".env", PROJECT_ROOT / ".env", ROOT / "gemini.key"):
+        key = read_key_from_file(p)
+        if key:
+            return key
+    return None
+
+
+def closest_aspect_ratio(w: int, h: int) -> str:
+    target = w / h
+    candidates = {
+        "1:1": 1.0, "16:9": 16 / 9, "9:16": 9 / 16,
+        "4:3": 4 / 3, "3:4": 3 / 4, "2:1": 2.0, "1:2": 0.5,
+    }
+    return min(candidates.items(), key=lambda kv: abs(kv[1] - target))[0]
+
+
+# ---------------------------------------------------------------------------
+# Solid-white-transform worker — sends the source image to Gemini and gets
+# back a black/white image where each tile is a separate solid white shape.
+# The classical adaptive_threshold pipeline then has a very high-contrast
+# input to detect from, while polygon mean-colors are sampled from the
+# ORIGINAL image (never from the white-tile transform).
+# ---------------------------------------------------------------------------
+
+class SolidWhiteWorker(QThread):
+    finished_ok = pyqtSignal(bytes)        # raw PNG bytes from the model
+    failed      = pyqtSignal(str)
+    progress    = pyqtSignal(str)
+
+    def __init__(self, source_rgb: np.ndarray, prompt_text: str):
+        super().__init__()
+        self.source_rgb = source_rgb
+        self.prompt_text = prompt_text
+
+    def run(self) -> None:
+        try:
+            api_key = load_api_key()
+            if not api_key:
+                self.failed.emit(
+                    "No Gemini API key found.\n\n"
+                    "Click 'Choose Key File...' to pick one, or set the "
+                    "GEMINI_API_KEY env var.",
+                )
+                return
+
+            self.progress.emit("Preparing image...")
+            h, w = self.source_rgb.shape[:2]
+            buf = BytesIO()
+            Image.fromarray(self.source_rgb, mode="RGB").save(buf, "PNG")
+            img_bytes = buf.getvalue()
+
+            self.progress.emit(f"Calling {GEMINI_MODEL} ({w} × {h})...")
+            from google import genai
+            from google.genai import types
+
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    self.prompt_text,
+                ],
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                    image_config=types.ImageConfig(
+                        aspect_ratio=closest_aspect_ratio(w, h),
+                        image_size="4K",
+                    ),
+                ),
+            )
+            for candidate in response.candidates or []:
+                for part in (candidate.content.parts if candidate.content else []) or []:
+                    inline = getattr(part, "inline_data", None)
+                    if inline is not None and getattr(inline, "data", None):
+                        self.finished_ok.emit(inline.data)
+                        return
+            self.failed.emit("No image returned (safety filter or empty response).")
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
+
+
+def ai_bytes_to_binary_mask(png_bytes: bytes, target_w: int, target_h: int) -> np.ndarray:
+    """Decode the AI's binary PNG and resize to match the original image dims.
+
+    Returns an HxWx3 uint8 RGB array (because detect_tiles expects RGB) where
+    the AI's white tiles → (255,255,255) and the black grout/background → (0,0,0).
+    Using nearest-neighbor preserves the binary nature when resizing.
+    """
+    pil = Image.open(BytesIO(png_bytes)).convert("L")
+    if pil.size != (target_w, target_h):
+        pil = pil.resize((target_w, target_h), Image.NEAREST)
+    arr = np.array(pil)
+    # Re-binarize in case the model returned any gray AA pixels.
+    arr = ((arr >= 128).astype(np.uint8)) * 255
+    # Stack to 3 channels so cv2.cvtColor + adaptiveThreshold get the inputs they expect.
+    return np.stack([arr, arr, arr], axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +284,15 @@ class ImagePane(QFrame):
 # ---------------------------------------------------------------------------
 
 def detect_tiles(rgb: np.ndarray, block_size: int, C: int,
-                 min_area: int, epsilon_ratio: float):
-    """Returns list of (polygon_points (N x 2 float), mean_rgb_float_0_1)."""
+                 min_area: int, epsilon_ratio: float,
+                 color_source_rgb: np.ndarray | None = None):
+    """Returns list of (polygon_points (N x 2 float), mean_rgb_float_0_1).
+
+    If ``color_source_rgb`` is provided, the threshold + CC + contour extraction
+    runs on ``rgb`` (typically the AI-produced black/white image) but mean
+    colors are sampled from ``color_source_rgb`` (the original photograph).
+    Must be the same HxW as ``rgb``.
+    """
     h, w = rgb.shape[:2]
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
@@ -165,6 +307,10 @@ def detect_tiles(rgb: np.ndarray, block_size: int, C: int,
     )
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(tile_mask, connectivity=4)
+
+    # Sample mean color from the original image when supplied, otherwise from
+    # the same image we detected on.
+    color_src = color_source_rgb if color_source_rgb is not None else rgb
 
     tiles = []
     for lid in range(1, num_labels):
@@ -196,7 +342,7 @@ def detect_tiles(rgb: np.ndarray, block_size: int, C: int,
         pts[:, 0] += x0
         pts[:, 1] += y0
 
-        mean_rgb = (rgb[labels == lid].mean(axis=0) / 255.0).tolist()
+        mean_rgb = (color_src[labels == lid].mean(axis=0) / 255.0).tolist()
         tiles.append((pts, tuple(mean_rgb)))
 
     return tiles
@@ -236,6 +382,12 @@ class MosaicToCsv(QMainWindow):
 
         self.source_path: Path | None = None
         self.source_rgb: np.ndarray | None = None
+        # Cached AI-produced binary mask (HxWx3 uint8, same dims as source). Set
+        # on first Detect with the "Use solid white transform" checkbox on; reused
+        # for subsequent Detects with the same source so changing block-size/C/etc.
+        # doesn't re-spend API calls. Cleared whenever a new image is loaded.
+        self.solid_white_rgb: np.ndarray | None = None
+        self.worker: SolidWhiteWorker | None = None
         self.tiles: list = []
 
         central = QWidget()
@@ -244,10 +396,11 @@ class MosaicToCsv(QMainWindow):
 
         # Toolbar
         bar = QHBoxLayout()
-        self.load_btn   = QPushButton("Load Image...")
-        self.detect_btn = QPushButton("Detect")
-        self.save_btn   = QPushButton("Save CSV...")
-        for b in (self.load_btn, self.detect_btn, self.save_btn):
+        self.load_btn    = QPushButton("Load Image...")
+        self.key_btn     = QPushButton("Choose Key File...")
+        self.detect_btn  = QPushButton("Detect")
+        self.save_btn    = QPushButton("Save CSV...")
+        for b in (self.load_btn, self.key_btn, self.detect_btn, self.save_btn):
             bar.addWidget(b)
         bar.addStretch(1)
         self.tile_count_label = QLabel("Tiles: —")
@@ -256,6 +409,17 @@ class MosaicToCsv(QMainWindow):
 
         # Parameters — defaults from csv_experiments attempt 07.
         params = QHBoxLayout()
+        self.solid_white_chk = QCheckBox("Use solid white transform")
+        self.solid_white_chk.setToolTip(
+            "When checked, Detect first asks Gemini to convert the source into a "
+            "black/white image (every tile a separate white shape on black). The "
+            "adaptive-threshold pipeline runs on that high-contrast image; each "
+            "polygon's mean color is sampled from the ORIGINAL image, so colors "
+            "stay accurate. The AI image is cached per source — re-running Detect "
+            "with different parameters does NOT spend another API call.",
+        )
+        params.addWidget(self.solid_white_chk)
+
         self.block_size_spin = QSpinBox()
         self.block_size_spin.setRange(3, 501); self.block_size_spin.setSingleStep(2)
         self.block_size_spin.setValue(51)
@@ -290,13 +454,39 @@ class MosaicToCsv(QMainWindow):
         self.statusBar().showMessage("Ready.")
 
         self.load_btn.clicked.connect(self.load_image)
+        self.key_btn.clicked.connect(self.choose_key_file)
         self.detect_btn.clicked.connect(self.detect)
         self.save_btn.clicked.connect(self.save_csv)
         self._update_buttons()
 
     def _update_buttons(self) -> None:
-        self.detect_btn.setEnabled(self.source_rgb is not None)
-        self.save_btn.setEnabled(bool(self.tiles))
+        running = self.worker is not None and self.worker.isRunning()
+        self.detect_btn.setEnabled(self.source_rgb is not None and not running)
+        self.save_btn.setEnabled(bool(self.tiles) and not running)
+        self.load_btn.setEnabled(not running)
+        self.key_btn.setEnabled(not running)
+        self.solid_white_chk.setEnabled(not running)
+
+    def choose_key_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose Gemini API key file", str(ROOT),
+            "Key files (*.key *.txt *.env);;All files (*.*)",
+        )
+        if not path:
+            return
+        key = read_key_from_file(Path(path))
+        if not key:
+            QMessageBox.warning(
+                self, "No key found",
+                f"Could not read a key from {path}.\n"
+                "Expected: a plain key on its own line, or 'GEMINI_API_KEY=...'.",
+            )
+            return
+        try:
+            KEY_PATH_MEMO.write_text(str(Path(path).resolve()), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.warning(self, "Could not save key path", f"{type(e).__name__}: {e}")
+        self.statusBar().showMessage(f"Key file set: {Path(path).name}")
 
     def load_image(self) -> None:
         start_dir = str(INPUT_DIR) if INPUT_DIR.exists() else ""
@@ -319,23 +509,96 @@ class MosaicToCsv(QMainWindow):
             f"{Path(path).name}  |  {rgb_pil.width} × {rgb_pil.height} px",
         )
         self.tiles = []
+        self.solid_white_rgb = None    # new source → old AI cache is no longer valid
         self.result_pane.clear()
         self.tile_count_label.setText("Tiles: —")
         self.statusBar().showMessage(f"Loaded {Path(path).name}")
         self._update_buttons()
 
+    # ----- Detect dispatch -------------------------------------------------
+
     def detect(self) -> None:
+        """Runs synchronously when the solid-white checkbox is off; dispatches
+        through the API worker (then back into _run_classical_detect) when on.
+        """
         if self.source_rgb is None:
             return
+        if not self.solid_white_chk.isChecked():
+            self._run_classical_detect(detection_rgb=self.source_rgb,
+                                       color_source_rgb=None)
+            return
+
+        # Solid-white path — use cache if we already have it.
+        if self.solid_white_rgb is not None:
+            self._run_classical_detect(detection_rgb=self.solid_white_rgb,
+                                       color_source_rgb=self.source_rgb)
+            return
+
+        # No cache yet — need an API call.
+        if load_api_key() is None:
+            QMessageBox.critical(
+                self, "API key missing",
+                "No Gemini API key found. Click 'Choose Key File...' first.",
+            )
+            return
+        try:
+            prompt_text = SOLID_WHITE_PROMPT_FILE.read_text(encoding="utf-8")
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Prompt file missing",
+                f"Could not read {SOLID_WHITE_PROMPT_FILE}\n\n{type(e).__name__}: {e}",
+            )
+            return
+
+        self.worker = SolidWhiteWorker(self.source_rgb, prompt_text)
+        self.worker.progress.connect(lambda m: self.statusBar().showMessage(m))
+        self.worker.finished_ok.connect(self._on_solid_white_ready)
+        self.worker.failed.connect(self._on_solid_white_failed)
+        self.worker.finished.connect(self._on_worker_done)
+        self.detect_btn.setText("Calling AI...")
+        self.statusBar().showMessage("Requesting solid-white transform from Gemini...")
+        self.worker.start()
+        self._update_buttons()
+
+    def _on_solid_white_ready(self, png_bytes: bytes) -> None:
+        h, w = self.source_rgb.shape[:2]
+        try:
+            self.solid_white_rgb = ai_bytes_to_binary_mask(png_bytes, w, h)
+        except Exception as e:
+            QMessageBox.critical(self, "Decode failed", f"{type(e).__name__}: {e}")
+            return
+        self.statusBar().showMessage(
+            "AI transform ready — running adaptive-threshold pipeline...",
+        )
+        QApplication.processEvents()
+        self._run_classical_detect(detection_rgb=self.solid_white_rgb,
+                                   color_source_rgb=self.source_rgb)
+
+    def _on_solid_white_failed(self, msg: str) -> None:
+        QMessageBox.critical(self, "Solid-white transform failed", msg)
+        self.statusBar().showMessage("Solid-white transform failed.")
+
+    def _on_worker_done(self) -> None:
+        self.worker = None
+        self.detect_btn.setText("Detect")
+        self._update_buttons()
+
+    def _run_classical_detect(
+        self,
+        detection_rgb: np.ndarray,
+        color_source_rgb: np.ndarray | None,
+    ) -> None:
+        """Common terminal step: run detect_tiles + render + update UI."""
         self.statusBar().showMessage("Detecting tiles...")
         QApplication.processEvents()
         try:
             tiles = detect_tiles(
-                self.source_rgb,
+                detection_rgb,
                 block_size=self.block_size_spin.value(),
                 C=self.C_spin.value(),
                 min_area=self.min_area_spin.value(),
                 epsilon_ratio=self.eps_spin.value(),
+                color_source_rgb=color_source_rgb,
             )
         except Exception as e:
             QMessageBox.critical(self, "Detect failed", f"{type(e).__name__}: {e}")
@@ -343,11 +606,14 @@ class MosaicToCsv(QMainWindow):
             return
 
         self.tiles = tiles
-        h, w = self.source_rgb.shape[:2]
+        h, w = detection_rgb.shape[:2]
         preview = render_polygons(tiles, w, h)
-        self.result_pane.set_pil_image(preview, f"{len(tiles)} polygons  |  {w} × {h} px")
+        suffix = "  (solid-white transform)" if color_source_rgb is not None else ""
+        self.result_pane.set_pil_image(
+            preview, f"{len(tiles)} polygons  |  {w} × {h} px{suffix}",
+        )
         self.tile_count_label.setText(f"Tiles: {len(tiles)}")
-        self.statusBar().showMessage(f"Detected {len(tiles)} tiles.")
+        self.statusBar().showMessage(f"Detected {len(tiles)} tiles{suffix}.")
         self._update_buttons()
 
     def save_csv(self) -> None:
