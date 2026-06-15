@@ -27,13 +27,29 @@ class ImageCanvas(QWidget):
         self.drawing_polygon = False
         self.selected_polygon_index = None
         self.dragging_point_index = None
+        # Indices of polygons flagged as overlapping by Find Overlaps. Drawn
+        # in red until the button is re-clicked.
+        self.overlapping_indices: set[int] = set()
+        # Fill-polygon multi-select mode: click polygons to toggle into the
+        # selection; on exit, MainWindow computes a new polygon filling the
+        # gap region between them.
+        self.fill_mode: bool = False
+        self.fill_selection: set[int] = set()
         self.image_tilt = 0  # Tilt angle for the entire image (horizontal)
         self.vertical_tilt = 0  # Tilt angle for vertical middle axis
         self.global_sharpness = 0  # Sharpness applied to entire image
         self.stretch_drag_start = None  # Starting point for stretch rectangle drag
         self.stretch_drag_current = None  # Current point during stretch rectangle drag
         self.show_grid = False  # Whether to display grid
-        self.grid_size_percent = 10  # Grid cell size as percentage of image size
+        # Grid cell WIDTH as a percentage of the image's width. Previously this
+        # percentage was applied to the smaller image dimension and cells were
+        # square; now it is always interpreted as cell width relative to image width.
+        self.grid_size_percent = 10
+        # Grid cell aspect ratio = width / height. 1.0 = square cells, 2.0 = wide
+        # rectangles (width is 2× height), 0.5 = tall rectangles. cell_height is
+        # always derived as cell_width / aspect_ratio so the user's percentage
+        # input directly controls the cell width.
+        self.grid_aspect_ratio = 1.0
         self.grid_offset_x = 0  # Grid horizontal offset in pixels
         self.grid_offset_y = 0  # Grid vertical offset in pixels
         self.grid_line_thickness = 2  # Grid line thickness in pixels
@@ -238,7 +254,14 @@ class ImageCanvas(QWidget):
             # Ensure point is within image bounds (allow slightly outside for editing handles)
             if 0 <= img_x < self.image.width() and 0 <= img_y < self.image.height() or (not self.selecting_mode and not self.drawing_polygon and not self.drawing_circle):
                 
-                if self.selecting_mode:
+                if self.fill_mode:
+                    # Toggle the clicked polygon's membership in the fill
+                    # selection. Only left-clicks count; right-click is a
+                    # no-op in this mode.
+                    if event.button() == Qt.LeftButton:
+                        self.handle_fill_click(img_x, img_y)
+
+                elif self.selecting_mode:
                     # Start rectangle drag
                     self.stretch_drag_start = (img_x, img_y)
                     self.stretch_drag_current = (img_x, img_y)
@@ -267,6 +290,22 @@ class ImageCanvas(QWidget):
                 else:
                     # Edit mode
                     self.handle_edit_click(img_x, img_y)
+
+    def handle_fill_click(self, img_x, img_y):
+        """In fill mode: left-click on a polygon toggles its membership in
+        the fill_selection set. Clicking empty space does nothing (so users
+        can re-click to deselect without losing the rest of the group)."""
+        for p_idx, poly in enumerate(self.polygons):
+            if len(poly) < 3:
+                continue
+            pts_np = np.array(poly, dtype=np.int32)
+            if cv2.pointPolygonTest(pts_np, (img_x, img_y), False) >= 0:
+                if p_idx in self.fill_selection:
+                    self.fill_selection.discard(p_idx)
+                else:
+                    self.fill_selection.add(p_idx)
+                self.update()
+                return
 
     def handle_edit_click(self, img_x, img_y):
         hit_radius = 10 / self.scale_factor
@@ -598,63 +637,70 @@ class ImageCanvas(QWidget):
         # Draw grid if enabled
         if self.show_grid and self.image and self.grid_size_percent > 0:
             painter.setPen(QPen(QColor(173, 216, 230), self.grid_line_thickness))  # Light blue
-            
+
             # Get image dimensions
             img_width = self.image.width()
             img_height = self.image.height()
-            
-            # Calculate grid cell size from percentage (use smaller dimension for square cells)
-            smaller_dimension = min(img_width, img_height)
-            grid_cell_size = smaller_dimension * (self.grid_size_percent / 100.0)
-            
+
+            # Percentage applies to cell WIDTH (relative to image width);
+            # height is derived from the aspect ratio so the user's percentage
+            # input directly controls cell width regardless of image shape.
+            cell_w = img_width * (self.grid_size_percent / 100.0)
+            cell_h = cell_w / max(0.01, self.grid_aspect_ratio)
+
             # Grid origin is always fixed at (0,0) — image pans underneath
             # Draw vertical lines
             x = 0.0
             while x <= img_width:
                 painter.drawLine(QPointF(x, 0), QPointF(x, img_height))
-                x += grid_cell_size
-            
+                x += cell_w
+
             # Draw horizontal lines
             y = 0.0
             while y <= img_height:
                 painter.drawLine(QPointF(0, y), QPointF(img_width, y))
-                y += grid_cell_size
-            
+                y += cell_h
+
             # Draw grid labels
             painter.setPen(QPen(QColor(0, 0, 255), 1))  # Blue text
             font = QFont()
-            font.setPixelSize(max(14, int(grid_cell_size / 6)))  # Scale font with grid size
+            # Scale font with the smaller of the two cell dimensions so labels fit.
+            font.setPixelSize(max(14, int(min(cell_w, cell_h) / 6)))
             painter.setFont(font)
-            
+
             # Calculate font metrics for better positioning
             font_height = painter.fontMetrics().height()
-            
+
             # Draw column numbers at the top
             x = 0.0
             col_num = 1
             while x < img_width:
-                center_x = x + grid_cell_size / 2
+                center_x = x + cell_w / 2
                 text = str(col_num)
                 text_width = painter.fontMetrics().horizontalAdvance(text)
                 painter.drawText(int(center_x - text_width / 2), int(-5), text)
-                x += grid_cell_size
+                x += cell_w
                 col_num += 1
 
             # Draw row letters on the left
             y = 0.0
             row_num = 0
             while y < img_height:
-                center_y = y + grid_cell_size / 2
+                center_y = y + cell_h / 2
                 text = chr(ord('A') + row_num)
                 painter.drawText(int(-15), int(center_y + font_height / 3), text)
-                y += grid_cell_size
+                y += cell_h
                 row_num += 1
 
         # Draw completed polygons
         if self.polygons:
             for idx, poly in enumerate(self.polygons):
-                # Highlight selected polygon
-                if idx == self.selected_polygon_index:
+                # Marked-overlapping > fill-selected > selected > normal
+                if idx in self.overlapping_indices:
+                    painter.setPen(QPen(Qt.red, max(2, self.polygon_line_thickness * 2)))
+                elif idx in self.fill_selection:
+                    painter.setPen(QPen(Qt.blue, max(2, self.polygon_line_thickness * 2)))
+                elif idx == self.selected_polygon_index:
                     painter.setPen(QPen(Qt.magenta, self.polygon_line_thickness))
                 else:
                     painter.setPen(QPen(Qt.green, self.polygon_line_thickness))
@@ -761,6 +807,46 @@ class MainWindow(QMainWindow):
         self.polygon_btn.clicked.connect(self.toggle_polygon_mode)
         self.polygon_btn.setToolTip("Left click to add points, Right click to finish polygon")
 
+        self.find_overlaps_btn = QPushButton("Find Overlaps")
+        self.find_overlaps_btn.clicked.connect(self.find_overlapping_polygons)
+        self.find_overlaps_btn.setToolTip(
+            "Mark all polygons that share area with another polygon (red, "
+            "thicker line). Sharing a single edge or corner is NOT flagged — "
+            "only true overlap (non-zero intersection area). Re-click to refresh."
+        )
+
+        self.fill_polygon_btn = QPushButton("Fill Polygon")
+        self.fill_polygon_btn.setCheckable(True)
+        self.fill_polygon_btn.clicked.connect(self.toggle_fill_polygon_mode)
+        self.fill_polygon_btn.setToolTip(
+            "Click to enter Fill mode. Then click a group of polygons "
+            "(they turn blue) and click 'Fill Polygon' again to create a "
+            "new polygon that fills the gap region(s) between them, set "
+            "back by the chosen Gap distance from each surrounding edge."
+        )
+
+        self.fill_gap_spin = QDoubleSpinBox()
+        self.fill_gap_spin.setRange(0.0, 1000.0)
+        self.fill_gap_spin.setDecimals(2)
+        self.fill_gap_spin.setSingleStep(0.5)
+        self.fill_gap_spin.setValue(5.0)
+        self.fill_gap_spin.setSuffix(" px")
+        self.fill_gap_spin.setToolTip(
+            "Gap distance (image pixels). Used by both Fill Polygon (distance "
+            "from surrounding edges to the new fill) and Fix Gap (target "
+            "spacing between every pair of touching polygons)."
+        )
+
+        self.fix_gap_btn = QPushButton("Fix Gap")
+        self.fix_gap_btn.clicked.connect(self.apply_fix_gap)
+        self.fix_gap_btn.setToolTip(
+            "Set the gap between every pair of neighbouring polygons to "
+            "exactly Gap pixels — polygons GROW into empty space if the "
+            "current gap is larger than Gap, and SHRINK if it's smaller. "
+            "Outer envelope of the whole arrangement is preserved. "
+            "Voronoi-based: each polygon claims its territory among neighbours."
+        )
+
         self.circle_btn = QPushButton("Circle")
         self.circle_btn.setCheckable(True)
         self.circle_btn.clicked.connect(self.toggle_circle_mode)
@@ -804,6 +890,13 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(load_btn)
         sidebar_layout.addWidget(self.stretch_btn)
         sidebar_layout.addWidget(self.polygon_btn)
+        sidebar_layout.addWidget(self.find_overlaps_btn)
+        fill_row = QHBoxLayout()
+        fill_row.addWidget(self.fill_polygon_btn)
+        fill_row.addWidget(QLabel("Gap:"))
+        fill_row.addWidget(self.fill_gap_spin)
+        fill_row.addWidget(self.fix_gap_btn)
+        sidebar_layout.addLayout(fill_row)
         sidebar_layout.addWidget(self.circle_btn)
         sidebar_layout.addWidget(save_btn)
         sidebar_layout.addWidget(save_circle_btn)
@@ -937,17 +1030,34 @@ class MainWindow(QMainWindow):
         right_sidebar_layout.addWidget(self.grid_btn)
         
         right_sidebar_layout.addSpacing(10)
-        right_sidebar_layout.addWidget(QLabel("Grid Size:"))
-        
+        right_sidebar_layout.addWidget(QLabel("Grid Width (% of image):"))
+
         self.grid_size_spin = QDoubleSpinBox()
         self.grid_size_spin.setRange(0.1, 100.0)
         self.grid_size_spin.setDecimals(1)
         self.grid_size_spin.setSingleStep(0.1)
         self.grid_size_spin.setValue(10.0)
         self.grid_size_spin.setSuffix(" %")
-        self.grid_size_spin.setToolTip("Grid cell size as percentage of image size")
+        self.grid_size_spin.setToolTip("Grid cell WIDTH as percentage of image width.\n"
+                                       "Cell height is derived from the W:H ratio below.")
         self.grid_size_spin.valueChanged.connect(self.update_grid_size)
         right_sidebar_layout.addWidget(self.grid_size_spin)
+
+        right_sidebar_layout.addSpacing(4)
+        right_sidebar_layout.addWidget(QLabel("Grid W:H ratio:"))
+        self.grid_aspect_spin = QDoubleSpinBox()
+        self.grid_aspect_spin.setRange(0.05, 20.0)
+        self.grid_aspect_spin.setDecimals(2)
+        self.grid_aspect_spin.setSingleStep(0.1)
+        self.grid_aspect_spin.setValue(1.0)
+        self.grid_aspect_spin.setToolTip(
+            "Grid cell aspect ratio = width / height.\n"
+            "1.0 = square cells. 2.0 = width is twice the height (wide).\n"
+            "0.5 = width is half the height (tall). The percentage above\n"
+            "always controls the WIDTH; height is computed from this ratio.",
+        )
+        self.grid_aspect_spin.valueChanged.connect(self.update_grid_aspect_ratio)
+        right_sidebar_layout.addWidget(self.grid_aspect_spin)
 
         right_sidebar_layout.addSpacing(6)
         right_sidebar_layout.addWidget(QLabel("Grid Line Thickness:"))
@@ -1228,6 +1338,12 @@ class MainWindow(QMainWindow):
         self.canvas.update_canvas_size()
         self.canvas.update()
 
+    def update_grid_aspect_ratio(self):
+        """Set the grid cell width:height ratio. width stays driven by the % spinbox."""
+        self.canvas.grid_aspect_ratio = max(0.01, self.grid_aspect_spin.value())
+        self.canvas.update_canvas_size()
+        self.canvas.update()
+
     def update_grid_line_thickness(self):
         self.canvas.grid_line_thickness = self.grid_thickness_spin.value()
         self.canvas.update()
@@ -1300,15 +1416,17 @@ class MainWindow(QMainWindow):
             return
 
         img_height, img_width = self.canvas.cv_image.shape[:2]
-        smaller_dimension = min(img_width, img_height)
-        grid_cell_size = int(smaller_dimension * (self.canvas.grid_size_percent / 100.0))
+        # Cell width comes directly from the % spinbox (relative to image width);
+        # cell height is derived from the W:H aspect ratio.
+        cell_w = int(img_width * (self.canvas.grid_size_percent / 100.0))
+        cell_h = int(cell_w / max(0.01, self.canvas.grid_aspect_ratio))
 
-        if grid_cell_size == 0:
+        if cell_w == 0 or cell_h == 0:
             QMessageBox.warning(self, "Warning", "Grid size is too small. Please increase grid size percentage.")
             return
 
-        num_cols = max(1, int(np.ceil(img_width  / grid_cell_size)))
-        num_rows = max(1, int(np.ceil(img_height / grid_cell_size)))
+        num_cols = max(1, int(np.ceil(img_width  / cell_w)))
+        num_rows = max(1, int(np.ceil(img_height / cell_h)))
 
         # ── Grid-selection dialog ──────────────────────────────────────────
         from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QCheckBox,
@@ -1319,7 +1437,7 @@ class MainWindow(QMainWindow):
         dlg_layout = QVBoxLayout(dlg)
 
         info = QLabel(f"Grid: {num_rows} rows × {num_cols} columns  "
-                      f"(cell size {grid_cell_size} px)")
+                      f"(cell {cell_w} × {cell_h} px)")
         dlg_layout.addWidget(info)
 
         # Select-all / deselect-all buttons
@@ -1385,7 +1503,10 @@ class MainWindow(QMainWindow):
         # ── Export selected tiles ──────────────────────────────────────────
         tile_size_mm = self.tile_size_spin.value()
         dpi          = self.dpi_spin.value()
-        target_pixels = int((tile_size_mm / 25.4) * dpi)
+        # tile_size_mm is interpreted as the WIDTH; the export's pixel height
+        # follows the same grid aspect ratio as the on-screen cell.
+        target_w = int((tile_size_mm / 25.4) * dpi)
+        target_h = max(1, int(target_w / max(0.01, self.canvas.grid_aspect_ratio)))
         source_image  = (self.canvas.display_image
                          if self.canvas.display_image is not None
                          else self.canvas.cv_image)
@@ -1396,10 +1517,10 @@ class MainWindow(QMainWindow):
             row_letter = chr(ord('A') + row_index) if row_index < 26 else f"R{row_index+1}"
             tile_name  = f"{row_letter}{col_index + 1}"
 
-            x_start = int(col_index * grid_cell_size - self.canvas.grid_offset_x)
-            y_start = int(row_index * grid_cell_size - self.canvas.grid_offset_y)
-            x_end   = x_start + grid_cell_size
-            y_end   = y_start + grid_cell_size
+            x_start = int(col_index * cell_w - self.canvas.grid_offset_x)
+            y_start = int(row_index * cell_h - self.canvas.grid_offset_y)
+            x_end   = x_start + cell_w
+            y_end   = y_start + cell_h
 
             # Skip tiles fully outside image
             if x_start >= img_width or y_start >= img_height or x_end <= 0 or y_end <= 0:
@@ -1412,7 +1533,7 @@ class MainWindow(QMainWindow):
             y_end_c   = min(y_end, img_height)
 
             tile_image  = source_image[y_start_c:y_end_c, x_start_c:x_end_c]
-            tile_resized = cv2.resize(tile_image, (target_pixels, target_pixels),
+            tile_resized = cv2.resize(tile_image, (target_w, target_h),
                                       interpolation=cv2.INTER_LANCZOS4)
             tile_bgr = cv2.cvtColor(tile_resized, cv2.COLOR_RGB2BGR)
 
@@ -1538,12 +1659,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "No polygons to save.")
             return
 
-        # Compute the current grid cell size in pixels
+        # Compute the current grid cell WIDTH in pixels (the % is always for width).
+        # Save Array calibrates polygon coords against a single grid-cell length,
+        # so we use the cell width as that reference dimension.
         original_cell_px = 1.0
         if self.canvas.cv_image is not None:
-            img_h, img_w = self.canvas.cv_image.shape[:2]
-            smaller = min(img_w, img_h)
-            original_cell_px = max(1.0, smaller * (self.canvas.grid_size_percent / 100.0))
+            img_w = self.canvas.cv_image.shape[1]
+            original_cell_px = max(1.0, img_w * (self.canvas.grid_size_percent / 100.0))
 
         from PyQt5.QtWidgets import QInputDialog
         new_cell_px, ok = QInputDialog.getDouble(
@@ -1744,6 +1866,385 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load array: {str(e)}")
 
+    def toggle_fill_polygon_mode(self):
+        """Two-step workflow:
+          - First click: enter Fill mode. Canvas clicks toggle polygons into
+            the blue-highlighted selection set.
+          - Second click: leave Fill mode. If ≥2 polygons are selected,
+            compute the gap region between them (each polygon buffered
+            outward by `Gap` and unioned; the union's interior holes are
+            the gap regions) and add each one as a new polygon. Otherwise
+            just exit without creating anything.
+        """
+        if self.fill_polygon_btn.isChecked():
+            # Entering fill mode.
+            # Exit other modes so the click handler doesn't fight them.
+            if self.canvas.drawing_polygon:
+                self.canvas.drawing_polygon = False
+                self.polygon_btn.setChecked(False)
+            if self.canvas.drawing_circle:
+                self.canvas.drawing_circle = False
+                self.circle_btn.setChecked(False)
+            self.canvas.selecting_mode = False
+            self.canvas.fill_mode = True
+            self.canvas.fill_selection = set()
+            self.canvas.selected_polygon_index = None
+            self.canvas.update()
+            self.statusBar().showMessage(
+                "Fill mode: click polygons to add to the group (they turn blue), "
+                "then click 'Fill Polygon' again to create the fill."
+            ) if hasattr(self, "statusBar") else None
+            return
+
+        # Leaving fill mode — compute the fill from the current selection.
+        self.canvas.fill_mode = False
+        selected_indices = sorted(self.canvas.fill_selection)
+        self.canvas.fill_selection = set()
+        self.canvas.update()
+        if len(selected_indices) < 2:
+            QMessageBox.information(
+                self, "Fill cancelled",
+                f"Need at least 2 polygons selected (you had "
+                f"{len(selected_indices)}). Nothing created.",
+            )
+            return
+
+        try:
+            from shapely.geometry import Polygon as ShapelyPolygon
+            from shapely.ops import unary_union
+            from shapely.validation import make_valid
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "Shapely required",
+                f"This feature needs the 'shapely' package.\n\n{e}",
+            )
+            return
+
+        def to_shapely(poly):
+            if len(poly) < 3:
+                return None
+            try:
+                sp = ShapelyPolygon(poly)
+                if not sp.is_valid:
+                    sp = make_valid(sp)
+                if sp.geom_type == "Polygon":
+                    return sp
+                if hasattr(sp, "geoms"):
+                    parts = [g for g in sp.geoms if g.geom_type == "Polygon"]
+                    if parts:
+                        return max(parts, key=lambda g: g.area)
+            except Exception:
+                return None
+            return None
+
+        gap = float(self.fill_gap_spin.value())
+        shapes = [to_shapely(self.canvas.polygons[i]) for i in selected_indices]
+        shapes = [s for s in shapes if s is not None]
+        if len(shapes) < 2:
+            QMessageBox.warning(
+                self, "Fill failed",
+                "Could not build valid polygons from the selection.",
+            )
+            return
+
+        try:
+            buffered = [s.buffer(gap) for s in shapes]
+            combined = unary_union(buffered)
+        except Exception as e:
+            QMessageBox.critical(self, "Fill failed", f"{type(e).__name__}: {e}")
+            return
+
+        # Each interior ring of `combined` is a gap region — boundary already
+        # `gap` away from the original polygons.
+        geoms = (
+            [combined] if combined.geom_type == "Polygon"
+            else (list(combined.geoms) if hasattr(combined, "geoms") else [])
+        )
+        new_polys = []
+        for g in geoms:
+            if g.geom_type != "Polygon":
+                continue
+            for ring in g.interiors:
+                coords = list(ring.coords)
+                if len(coords) >= 4 and coords[0] == coords[-1]:
+                    coords = coords[:-1]
+                if len(coords) >= 3:
+                    new_polys.append([(float(x), float(y)) for x, y in coords])
+
+        if not new_polys:
+            QMessageBox.information(
+                self, "No gap region",
+                f"With gap={gap:g} px the selected polygons don't enclose any "
+                f"interior gap. Try a smaller gap, or pick polygons that "
+                f"actually surround an empty area.",
+            )
+            return
+
+        first_new_idx = len(self.canvas.polygons)
+        self.canvas.polygons.extend(new_polys)
+        # Highlight the first new fill polygon so the user sees what was added.
+        self.canvas.selected_polygon_index = first_new_idx
+        self.canvas.update()
+        QMessageBox.information(
+            self, "Fill created",
+            f"Added {len(new_polys)} fill polygon"
+            f"{'s' if len(new_polys) != 1 else ''} "
+            f"({gap:g} px from surrounding edges).",
+        )
+
+    def apply_fix_gap(self):
+        """Set the gap between every pair of neighbouring polygons to exactly
+        Gap pixels — enlarging or shrinking polygons as needed. Algorithm:
+
+          1. Compute the bounding rectangle of all polygons, expanded by Gap/2
+             so the outer envelope of the arrangement is preserved.
+          2. Compute Voronoi cells of polygon centroids — each cell is the
+             region of the plane closest to that polygon's centroid.
+          3. Each polygon's new shape = (Voronoi cell ∩ expanded bounding
+             rect), shrunk inward by Gap/2.
+
+        Effect: polygons claim their Voronoi territory and the gap between
+        every pair of neighbours becomes exactly Gap. Polygons that were too
+        close together shrink on their facing sides; polygons that were too
+        far apart grow into the empty space.
+        """
+        polys = self.canvas.polygons
+        if not polys:
+            QMessageBox.information(self, "No polygons", "Nothing to fix.")
+            return
+
+        gap = float(self.fill_gap_spin.value())
+        if gap <= 0:
+            QMessageBox.information(
+                self, "Gap must be positive",
+                "Set Gap > 0 to apply Fix Gap.",
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self, "Fix Gap",
+            f"Set the gap between every pair of neighbouring polygons to "
+            f"exactly {gap:g} px. Polygons will grow or shrink as needed; "
+            f"the outer envelope of the arrangement is preserved. "
+            f"This operation is NOT undoable. Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        try:
+            from shapely.geometry import (
+                Polygon as ShapelyPolygon, MultiPoint, Point, box,
+            )
+            from shapely.ops import voronoi_diagram, unary_union
+            from shapely.validation import make_valid
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "Shapely required",
+                f"This feature needs the 'shapely' package (>= 2.0 for "
+                f"voronoi_diagram).\n\n{e}",
+            )
+            return
+
+        def to_shapely(poly):
+            if len(poly) < 3:
+                return None
+            try:
+                sp = ShapelyPolygon(poly)
+                if not sp.is_valid:
+                    sp = make_valid(sp)
+                if sp.geom_type == "Polygon":
+                    return sp
+                if hasattr(sp, "geoms"):
+                    parts = [g for g in sp.geoms if g.geom_type == "Polygon"]
+                    if parts:
+                        return max(parts, key=lambda g: g.area)
+            except Exception:
+                return None
+            return None
+
+        shapes = [to_shapely(p) for p in polys]
+        valid_idxs = [i for i, s in enumerate(shapes) if s is not None]
+        if len(valid_idxs) < 2:
+            QMessageBox.information(
+                self, "Need at least 2 polygons",
+                "Fix Gap needs at least 2 valid polygons.",
+            )
+            return
+
+        half = gap / 2.0
+        union = unary_union([shapes[i] for i in valid_idxs])
+        minx, miny, maxx, maxy = union.bounds
+        # Active region: bounding rect expanded by gap/2 so the outer envelope
+        # is preserved after the buffer(-gap/2) shrink at the end.
+        active = box(minx - half, miny - half, maxx + half, maxy + half)
+
+        # Voronoi seeds: representative points (always inside the polygon,
+        # even for concave shapes whose centroid may fall outside).
+        seed_coords = []
+        for i in valid_idxs:
+            rp = shapes[i].representative_point()
+            seed_coords.append((rp.x, rp.y))
+
+        # Envelope for Voronoi: must comfortably enclose all cells.
+        pad = max(maxx - minx, maxy - miny, gap * 4) * 5
+        env = box(minx - pad, miny - pad, maxx + pad, maxy + pad)
+
+        try:
+            vor = voronoi_diagram(MultiPoint(seed_coords), envelope=env)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Voronoi failed",
+                f"Could not build Voronoi diagram: {type(e).__name__}: {e}",
+            )
+            return
+        cells = list(vor.geoms)
+
+        # Map each Voronoi cell back to its seed (= polygon index).
+        cell_for = {}
+        for k, polygon_idx in enumerate(valid_idxs):
+            seed_pt = Point(seed_coords[k])
+            for cell in cells:
+                if cell.contains(seed_pt):
+                    cell_for[polygon_idx] = cell
+                    break
+
+        new_polys = []
+        dropped = 0
+        split = 0
+        for i, sp in enumerate(shapes):
+            if sp is None:
+                dropped += 1
+                continue
+            cell = cell_for.get(i)
+            if cell is None:
+                # Fallback: keep original polygon
+                coords = list(sp.exterior.coords)
+                if len(coords) >= 4 and coords[0] == coords[-1]:
+                    coords = coords[:-1]
+                new_polys.append([(float(x), float(y)) for x, y in coords])
+                continue
+            try:
+                clipped = cell.intersection(active)
+                shrunk = clipped.buffer(-half) if not clipped.is_empty else clipped
+            except Exception:
+                dropped += 1
+                continue
+            if shrunk.is_empty:
+                dropped += 1
+                continue
+            geoms = (
+                [shrunk] if shrunk.geom_type == "Polygon"
+                else (list(shrunk.geoms) if hasattr(shrunk, "geoms") else [])
+            )
+            kept_here = 0
+            for g in geoms:
+                if g.geom_type != "Polygon":
+                    continue
+                coords = list(g.exterior.coords)
+                if len(coords) >= 4 and coords[0] == coords[-1]:
+                    coords = coords[:-1]
+                if len(coords) < 3:
+                    continue
+                new_polys.append([(float(x), float(y)) for x, y in coords])
+                kept_here += 1
+            if kept_here == 0:
+                dropped += 1
+            elif kept_here > 1:
+                split += 1
+
+        self.canvas.polygons = new_polys
+        self.canvas.selected_polygon_index = None
+        self.canvas.dragging_point_index = None
+        self.canvas.overlapping_indices = set()
+        self.canvas.fill_selection = set()
+        self.canvas.selection_changed.emit(-1)
+        self.canvas.update()
+
+        msg = (
+            f"Set gap to {gap:g} px between every pair of polygons. "
+            f"{len(new_polys)} polygon{'s' if len(new_polys) != 1 else ''} remain."
+        )
+        if dropped:
+            msg += f" Dropped {dropped}."
+        if split:
+            msg += f" {split} polygon{'s' if split != 1 else ''} pinched into multiple pieces."
+        QMessageBox.information(self, "Fix Gap done", msg)
+
+    def find_overlapping_polygons(self):
+        """Mark all polygons whose interior shares non-zero area with another
+        polygon. Shared edges / corners alone are not flagged. Marked polygons
+        are drawn in red until this button is clicked again."""
+        polys = self.canvas.polygons
+        if not polys or len(polys) < 2:
+            QMessageBox.information(
+                self, "Not enough polygons",
+                "Need at least 2 polygons to check for overlaps.",
+            )
+            self.canvas.overlapping_indices = set()
+            self.canvas.update()
+            return
+
+        try:
+            from shapely.geometry import Polygon as ShapelyPolygon
+            from shapely.validation import make_valid
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "Shapely required",
+                f"This feature needs the 'shapely' package.\n\n{e}",
+            )
+            return
+
+        def to_shapely(poly):
+            if len(poly) < 3:
+                return None
+            try:
+                sp = ShapelyPolygon(poly)
+                if not sp.is_valid:
+                    sp = make_valid(sp)
+                if sp.geom_type == "Polygon":
+                    return sp
+                if hasattr(sp, "geoms"):
+                    parts = [g for g in sp.geoms if g.geom_type == "Polygon"]
+                    if parts:
+                        return max(parts, key=lambda g: g.area)
+            except Exception:
+                return None
+            return None
+
+        shapes = [to_shapely(p) for p in polys]
+        overlapping = set()
+        n_pairs = 0
+        AREA_EPS = 1e-6
+        for i in range(len(shapes)):
+            if shapes[i] is None:
+                continue
+            for j in range(i + 1, len(shapes)):
+                if shapes[j] is None:
+                    continue
+                try:
+                    inter = shapes[i].intersection(shapes[j])
+                except Exception:
+                    continue
+                if not inter.is_empty and inter.area > AREA_EPS:
+                    overlapping.add(i)
+                    overlapping.add(j)
+                    n_pairs += 1
+
+        self.canvas.overlapping_indices = overlapping
+        self.canvas.update()
+        if not overlapping:
+            QMessageBox.information(
+                self, "No overlaps",
+                f"Checked {len(polys)} polygons — no overlapping pairs found.",
+            )
+        else:
+            QMessageBox.information(
+                self, "Overlaps found",
+                f"Marked {len(overlapping)} polygons as overlapping "
+                f"(in {n_pairs} overlapping pair{'s' if n_pairs != 1 else ''}).",
+            )
+
     def save_project(self):
         if self.canvas.cv_image is None:
             QMessageBox.warning(self, "Warning", "No project to save.")
@@ -1760,6 +2261,7 @@ class MainWindow(QMainWindow):
                 'vertical_tilt': self.canvas.vertical_tilt,
                 'show_grid': self.canvas.show_grid,
                 'grid_size_percent': self.canvas.grid_size_percent,
+                'grid_aspect_ratio': self.canvas.grid_aspect_ratio,
                 'grid_offset_x': self.canvas.grid_offset_x,
                 'grid_offset_y': self.canvas.grid_offset_y,
                 'circles': self.canvas.circles,
@@ -1782,6 +2284,7 @@ class MainWindow(QMainWindow):
                 
                 self.canvas.cv_image = data['image']
                 self.canvas.polygons = data['polygons']
+                self.canvas.overlapping_indices = set()  # stale: indices belong to previous polygon list
                 self._original_polygons = None  # reset scale snapshot
                 self.canvas.target_width = data.get('width', 300)
                 self.canvas.target_height = data.get('height', 300)
@@ -1789,6 +2292,7 @@ class MainWindow(QMainWindow):
                 self.canvas.vertical_tilt = data.get('vertical_tilt', 0)
                 self.canvas.show_grid = data.get('show_grid', False)
                 self.canvas.grid_size_percent = data.get('grid_size_percent', 10)
+                self.canvas.grid_aspect_ratio = data.get('grid_aspect_ratio', 1.0)
                 self.canvas.grid_offset_x = data.get('grid_offset_x', 0)
                 self.canvas.grid_offset_y = data.get('grid_offset_y', 0)
                 self.canvas.circles = data.get('circles', [])
@@ -1800,6 +2304,7 @@ class MainWindow(QMainWindow):
                 self.vertical_tilt_slider.setValue(self.canvas.vertical_tilt)
                 self.grid_btn.setChecked(self.canvas.show_grid)
                 self.grid_size_spin.setValue(self.canvas.grid_size_percent)
+                self.grid_aspect_spin.setValue(self.canvas.grid_aspect_ratio)
                 self.tile_size_spin.setValue(data.get('tile_size_mm', self.tile_size_spin.value()))
                 self.dpi_spin.setValue(data.get('dpi', self.dpi_spin.value()))
                 

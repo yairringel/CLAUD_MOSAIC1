@@ -22,12 +22,12 @@ from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
-from PyQt5.QtCore import QEvent, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtGui import QColor
+import math as _math
+from PyQt5.QtCore import QEvent, QPointF, Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
     QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
     QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
@@ -309,6 +309,188 @@ class BackgroundDialog(QDialog):
 # Image pane (used twice: Source + Result)
 # ---------------------------------------------------------------------------
 
+class SquareOverlayLabel(QLabel):
+    """QLabel with a movable + rotatable BLACK square overlay drawn on top of
+    its pixmap. Square state lives in IMAGE pixel coordinates so it survives
+    zoom changes.
+
+    Mouse behavior:
+      - Press inside the square + drag → moves the square.
+      - Wheel while hovering inside the square → rotates the square ±5° per click
+        (event is consumed, so wheel-zoom does NOT fire).
+      - Wheel outside the square → event is ignored, propagates to the scroll
+        area's viewport so the existing wheel-zoom still works.
+    """
+
+    ROTATE_STEP_DEG = 5.0
+
+    def __init__(self, pane, placeholder: str):
+        super().__init__(placeholder)
+        self._pane = pane
+        # Square state in image-pixel coords. sq_size = 0 hides the overlay
+        # and makes this label behave like a plain QLabel.
+        self.sq_size = 0
+        self.sq_cx = 0.0          # square CENTER in image coords
+        self.sq_cy = 0.0
+        self.sq_rotation = 0.0    # degrees clockwise
+        self._dragging = False
+        self._drag_start_mouse_img = None
+        self._drag_start_center = None
+        self.setMouseTracking(True)
+
+    # ----- public API ------------------------------------------------------
+
+    def set_square_size(self, size: int) -> None:
+        """Set side length in image pixels; 0 hides the overlay."""
+        new_size = max(0, int(size))
+        # On first appearance (size goes 0 → >0), park the square at the
+        # top-left so the user has something to grab onto.
+        if self.sq_size <= 0 and new_size > 0:
+            self.sq_cx = new_size / 2
+            self.sq_cy = new_size / 2
+            self.sq_rotation = 0.0
+        self.sq_size = new_size
+        self.update()
+
+    def reset_square_for_new_image(self) -> None:
+        """Recenter to top-left on image load so the square doesn't stay where
+        it was on the previous (possibly differently-sized) image."""
+        if self.sq_size > 0:
+            self.sq_cx = self.sq_size / 2
+            self.sq_cy = self.sq_size / 2
+            self.sq_rotation = 0.0
+        self.update()
+
+    def get_square_state(self):
+        """Return (size, cx, cy, rotation_deg) — used by Generate to burn the
+        square into the PIL image at the right position/rotation/size."""
+        return (self.sq_size, self.sq_cx, self.sq_cy, self.sq_rotation)
+
+    # ----- geometry helpers -----------------------------------------------
+
+    def _z(self) -> float:
+        return max(0.0001, self._pane.zoom)
+
+    def _pixmap_offset(self):
+        """Where the pixmap's (0,0) lands inside this QLabel.
+
+        ImagePane forces the label's alignment to top-left, so the pixmap is
+        always at (0, 0) of the label widget. We keep this helper (returning
+        a constant) so the math below stays explicit about the assumption.
+        """
+        return (0, 0)
+
+    def _square_corners_img(self):
+        """Return [(x, y), ...] of the four corners in image coords."""
+        s = self.sq_size / 2.0
+        cosA = _math.cos(_math.radians(self.sq_rotation))
+        sinA = _math.sin(_math.radians(self.sq_rotation))
+        corners = []
+        for dx, dy in ((-s, -s), (s, -s), (s, s), (-s, s)):
+            rx = dx * cosA - dy * sinA
+            ry = dx * sinA + dy * cosA
+            corners.append((self.sq_cx + rx, self.sq_cy + ry))
+        return corners
+
+    def _is_point_in_square(self, img_x: float, img_y: float) -> bool:
+        if self.sq_size <= 0:
+            return False
+        s = self.sq_size / 2.0
+        cosA = _math.cos(_math.radians(-self.sq_rotation))
+        sinA = _math.sin(_math.radians(-self.sq_rotation))
+        rx = (img_x - self.sq_cx) * cosA - (img_y - self.sq_cy) * sinA
+        ry = (img_x - self.sq_cx) * sinA + (img_y - self.sq_cy) * cosA
+        return abs(rx) <= s and abs(ry) <= s
+
+    def _label_to_img(self, lx: float, ly: float):
+        z = self._z()
+        ox, oy = self._pixmap_offset()
+        return ((lx - ox) / z, (ly - oy) / z)
+
+    # ----- paint -----------------------------------------------------------
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.sq_size <= 0 or self._pane._base_qimg is None:
+            return
+        z = self._z()
+        ox, oy = self._pixmap_offset()
+        polygon = QPolygonF(
+            [QPointF(ox + ix * z, oy + iy * z) for ix, iy in self._square_corners_img()],
+        )
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        # Hollow black frame only — image content inside the frame stays visible
+        # so the user can see exactly what region the square is covering.
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(0, 0, 0), 3))
+        painter.drawPolygon(polygon)
+
+    # ----- mouse: drag to move --------------------------------------------
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton or self.sq_size <= 0:
+            super().mousePressEvent(event); return
+        ix, iy = self._label_to_img(event.pos().x(), event.pos().y())
+        if not self._is_point_in_square(ix, iy):
+            super().mousePressEvent(event); return
+        self._dragging = True
+        self._drag_start_mouse_img = (ix, iy)
+        self._drag_start_center = (self.sq_cx, self.sq_cy)
+        self.setCursor(Qt.ClosedHandCursor)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._pane._base_qimg is not None:
+            ix, iy = self._label_to_img(event.pos().x(), event.pos().y())
+            dx = ix - self._drag_start_mouse_img[0]
+            dy = iy - self._drag_start_mouse_img[1]
+            new_cx = self._drag_start_center[0] + dx
+            new_cy = self._drag_start_center[1] + dy
+            # Soft clamp so the centre stays inside the image (the square's
+            # half-size can spill off-frame).
+            W = self._pane._base_qimg.width()
+            H = self._pane._base_qimg.height()
+            self.sq_cx = max(0, min(W, new_cx))
+            self.sq_cy = max(0, min(H, new_cy))
+            self.update()
+            event.accept()
+            return
+        # Hover cursor hint when over the square
+        if self.sq_size > 0:
+            ix, iy = self._label_to_img(event.pos().x(), event.pos().y())
+            if self._is_point_in_square(ix, iy):
+                self.setCursor(Qt.OpenHandCursor)
+            else:
+                self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging and event.button() == Qt.LeftButton:
+            self._dragging = False
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    # ----- wheel: rotate when hovering over the square --------------------
+
+    def wheelEvent(self, event):
+        if self.sq_size > 0:
+            pos = event.position() if hasattr(event, "position") else event.posF()
+            ix, iy = self._label_to_img(pos.x(), pos.y())
+            if self._is_point_in_square(ix, iy):
+                delta = event.angleDelta().y()
+                step = self.ROTATE_STEP_DEG if delta > 0 else -self.ROTATE_STEP_DEG
+                self.sq_rotation = (self.sq_rotation + step) % 360
+                self.update()
+                event.accept()
+                return
+        # Not over the square — let the wheel event propagate so the scroll
+        # area's existing wheel-zoom path fires.
+        event.ignore()
+
+
 class ImagePane(QFrame):
     """Image viewer with mouse-wheel zoom centered on the cursor.
 
@@ -335,8 +517,17 @@ class ImagePane(QFrame):
         self.title_label.setStyleSheet("font-weight:bold; padding:2px;")
         layout.addWidget(self.title_label)
 
-        self.image_label = QLabel(placeholder)
-        self.image_label.setAlignment(Qt.AlignCenter)
+        # Custom label that draws + manipulates the black tile-size square on
+        # top of its pixmap. Behaves like a plain QLabel when sq_size == 0,
+        # so the result pane (where set_reference_square_size is never called)
+        # is unaffected.
+        self.image_label = SquareOverlayLabel(self, placeholder)
+        # Pin the pixmap to the label's top-left so its position is always (0, 0).
+        # With Qt.AlignCenter, when the scroll area's setWidgetResizable(True)
+        # made the label bigger than the pixmap (zoom out / small image), Qt
+        # centered the pixmap and our overlay math drifted as zoom changed.
+        # Top-left removes the drift entirely.
+        self.image_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.image_label.setStyleSheet("background:#222; color:#bbb;")
         self.image_label.setMinimumSize(300, 300)
 
@@ -360,6 +551,9 @@ class ImagePane(QFrame):
             QImage.Format_RGBA8888,
         ).copy()
         self.zoom = 1.0
+        # New image → recenter the reference square so it's not stranded at
+        # coordinates that made sense for the previous image.
+        self.image_label.reset_square_for_new_image()
         self._apply_zoom()
         self.info_label.setText(
             info or f"{img.width} × {img.height} px  |  mode {img.mode}  |  zoom 100%",
@@ -373,6 +567,17 @@ class ImagePane(QFrame):
         self.image_label.setText(self.placeholder_text)
         self.info_label.setText("—")
 
+    def set_reference_square_size(self, size: int) -> None:
+        """Show / resize / hide the black tile-size reference square on this
+        pane. 0 hides it. The square is movable (drag) and rotatable (wheel
+        while hovering over it) once visible."""
+        self.image_label.set_square_size(int(size))
+
+    def get_reference_square_state(self):
+        """Return (size, cx, cy, rotation_deg) of the on-screen square. Used by
+        Generate to burn the same square into the image sent to Gemini."""
+        return self.image_label.get_square_state()
+
     def _apply_zoom(self) -> None:
         if self._base_qimg is None:
             return
@@ -381,6 +586,8 @@ class ImagePane(QFrame):
         scaled = self._base_qimg.scaled(
             new_w, new_h, Qt.KeepAspectRatio, Qt.SmoothTransformation,
         )
+        # No square overlay painted here — SquareOverlayLabel.paintEvent draws
+        # the square on top of the pixmap so drag/rotate are zero-cost.
         self.image_label.setPixmap(QPixmap.fromImage(scaled))
         self.image_label.resize(scaled.size())
         if self.pil_image is not None:
@@ -469,21 +676,61 @@ class PhotoEditor(QMainWindow):
 
         # Second row: AI parameters (injected into the prompt)
         bar2 = QHBoxLayout()
-        bar2.addWidget(QLabel("Tile size (mm):"))
-        self.tile_size_spin = QDoubleSpinBox()
-        self.tile_size_spin.setRange(0.5, 200.0)
-        self.tile_size_spin.setSingleStep(0.5)
-        self.tile_size_spin.setDecimals(1)
-        self.tile_size_spin.setValue(8.0)
-        bar2.addWidget(self.tile_size_spin)
+        bar2.addWidget(QLabel("Red square (px):"))
+        self.square_size_input = QSpinBox()
+        self.square_size_input.setRange(0, 5000)
+        self.square_size_input.setValue(60)
+        self.square_size_input.setSingleStep(2)
+        self.square_size_input.setToolTip(
+            "Side length of the red reference square drawn on the source's "
+            "top-left, in SOURCE-image pixels. 0 hides it.",
+        )
+        self.square_size_input.valueChanged.connect(self._on_square_size_changed)
+        bar2.addWidget(self.square_size_input)
 
-        bar2.addWidget(QLabel("Gap size (mm):"))
-        self.gap_size_spin = QDoubleSpinBox()
-        self.gap_size_spin.setRange(0.1, 50.0)
-        self.gap_size_spin.setSingleStep(0.1)
-        self.gap_size_spin.setDecimals(1)
-        self.gap_size_spin.setValue(1.0)
-        bar2.addWidget(self.gap_size_spin)
+        self.use_red_square_chk = QCheckBox("Use red square as tile size")
+        self.use_red_square_chk.setToolTip(
+            "When checked: Generate burns the red square into the image it sends "
+            "to Gemini and adds a prompt clause telling the model 'every tessera "
+            "should be approximately the size of the red square'.",
+        )
+        bar2.addWidget(self.use_red_square_chk)
+
+        self.keep_aspect_chk = QCheckBox("Keep original image ratio")
+        self.keep_aspect_chk.setToolTip(
+            "If checked, Generate sends the request with the source image's "
+            "aspect ratio (snapped to the nearest one Nano Banana supports — "
+            "1:1, 4:3, 3:4, 16:9, 9:16, 2:1, 1:2). "
+            "If unchecked, output is forced to 1:1 square (default).",
+        )
+        bar2.addWidget(self.keep_aspect_chk)
+
+        bar2.addWidget(QLabel("Max tiles across:"))
+        self.max_tiles_input = QSpinBox()
+        self.max_tiles_input.setRange(0, 500)
+        self.max_tiles_input.setValue(0)
+        self.max_tiles_input.setSingleStep(1)
+        self.max_tiles_input.setToolTip(
+            "Hard upper bound on the number of tiles across the output image "
+            "width. 0 = no ceiling (don't add the clause). When > 0, a 'MAX N "
+            "TILES ACROSS — make tiles bigger if you'd exceed this' clause is "
+            "appended to the prompt. Use this when the model keeps producing "
+            "tiles smaller than you want."
+        )
+        bar2.addWidget(self.max_tiles_input)
+
+        self.enlarge_mosaic_chk = QCheckBox("Enlarge mosaic")
+        self.enlarge_mosaic_chk.setToolTip(
+            "When checked: the input is treated as an EXISTING mosaic. The "
+            "selected prompt file is IGNORED — the request becomes a simple "
+            "'re-render this same mosaic with bigger stones' instruction. "
+            "The red-square option still works (it defines the new stone "
+            "size). Keep-aspect still works. Background-fill, mm-tile-size, "
+            "and per-feature rules are skipped (not relevant when the input "
+            "is already a mosaic)."
+        )
+        self.enlarge_mosaic_chk.toggled.connect(lambda _=False: self._update_button_states())
+        bar2.addWidget(self.enlarge_mosaic_chk)
 
         self.fill_bg_chk = QCheckBox("Fill empty background with matching Roman mosaic")
         self.fill_bg_chk.setToolTip(
@@ -518,6 +765,8 @@ class PhotoEditor(QMainWindow):
         # Wire up
         self.load_btn.clicked.connect(self.load_image)
         self.background_btn.clicked.connect(self.edit_background)
+        # Hook so the overlay refreshes the moment the spin value changes.
+        # (Already connected above; this line is a no-op intentionally left for clarity.)
         self.expand_btn.clicked.connect(self.expand_borders)
         self.prompt_btn.clicked.connect(self.choose_prompt)
         self.key_btn.clicked.connect(self.choose_key_file)
@@ -578,7 +827,7 @@ class PhotoEditor(QMainWindow):
     def _update_button_states(self) -> None:
         has_src    = self.source_pane.pil_image is not None
         has_result = self.result_pane.pil_image is not None
-        has_prompt = bool(self.current_prompt_text)
+        has_prompt = bool(self.current_prompt_text) or self.enlarge_mosaic_chk.isChecked()
         running    = self.worker is not None and self.worker.isRunning()
         self.background_btn.setEnabled(has_src and not running)
         self.expand_btn.setEnabled(has_src and not running)
@@ -605,8 +854,17 @@ class PhotoEditor(QMainWindow):
         self.source_pane.set_pil_image(
             img, f"{Path(path).name}  |  {img.width} × {img.height} px  |  mode {img.mode}",
         )
+        # Re-apply the current spin value so the red square shows up immediately
+        # on the newly loaded image (set_pil_image preserves reference_square_size
+        # but it was the previous load's value — re-set so the user sees the
+        # correct rectangle on the new dimensions).
+        self.source_pane.set_reference_square_size(self.square_size_input.value())
         self.statusBar().showMessage(f"Loaded {Path(path).name}")
         self._update_button_states()
+
+    def _on_square_size_changed(self, value: int) -> None:
+        """Spin-box callback: update the red overlay on the source pane."""
+        self.source_pane.set_reference_square_size(value)
 
     def choose_prompt(self) -> None:
         start_dir = str(PROMPTS_DIR) if PROMPTS_DIR.exists() else ""
@@ -815,10 +1073,10 @@ class PhotoEditor(QMainWindow):
 
     def preview_prompt(self) -> None:
         """Show the exact text that would be sent to Gemini if you clicked Generate now."""
-        if not self.current_prompt_text:
+        if not self.enlarge_mosaic_chk.isChecked() and not self.current_prompt_text:
             QMessageBox.information(self, "No prompt", "Pick a prompt file first (Choose Prompt...).")
             return
-        final_text = self._inject_size_overrides(self.current_prompt_text)
+        final_text = self._build_final_prompt()
         dlg = QDialog(self)
         dlg.setWindowTitle("Preview — final prompt sent to Gemini")
         dlg.resize(900, 700)
@@ -834,37 +1092,165 @@ class PhotoEditor(QMainWindow):
         layout.addWidget(buttons)
         dlg.exec_()
 
-    def _inject_size_overrides(self, prompt_text: str) -> str:
-        """Append authoritative override blocks: tile/gap size, plus optional background fill.
+    def _build_final_prompt(self) -> str:
+        """Compose the final prompt text sent to Gemini.
 
-        The mm values are also translated into a tile-count-across-image ratio
-        (assuming the generated image represents a 300 mm physical tile) so the
-        model has a concrete spatial target it can actually act on — image
-        generators don't have physical-unit awareness, but they CAN count
-        tesserae across a frame.
+        Two paths:
+        - Enlarge mode (checkbox on): use the built-in 'rebuild this mosaic
+          with bigger stones' prompt, plus red-square addendum if applicable,
+          plus aspect-rewrite if keep-aspect is on. Skip mm-size block,
+          background fill, and per-feature rules.
+        - Normal mode: use the loaded prompt file with the usual injections.
         """
-        tile_mm = self.tile_size_spin.value()
-        gap_mm = self.gap_size_spin.value()
-        # Assumed physical size of the generated mosaic. Lets us convert mm -> count.
-        assumed_canvas_mm = 300.0
-        tiles_across = max(2, int(round(assumed_canvas_mm / (tile_mm + gap_mm))))
-        size_override = (
+        if self.enlarge_mosaic_chk.isChecked():
+            text = self._enlarge_prompt_base()
+            if self.keep_aspect_chk.isChecked():
+                text = self._rewrite_square_output_clause(text)
+            if self.use_red_square_chk.isChecked() and self.square_size_input.value() > 0:
+                text = text + self._red_square_addendum(self.square_size_input.value())
+        else:
+            text = self._inject_size_overrides(self.current_prompt_text or "")
+            if self.use_red_square_chk.isChecked() and self.square_size_input.value() > 0:
+                text = text + self._red_square_addendum(self.square_size_input.value())
+
+        if self.max_tiles_input.value() > 0:
+            text = text + self._max_tiles_addendum(self.max_tiles_input.value())
+        return text
+
+    @staticmethod
+    def _max_tiles_addendum(max_n: int) -> str:
+        """Hard-ceiling clause: cap the number of tiles across the output."""
+        return (
             "\n\n"
-            "==== SIZE OVERRIDE (final, authoritative) ====\n"
-            f"Target tessera size: {tile_mm:g} mm across.\n"
-            f"Target grout gap:    {gap_mm:g} mm between adjacent tesserae.\n"
-            f"Concrete spatial target: the generated image represents a "
-            f"{assumed_canvas_mm:g} mm × {assumed_canvas_mm:g} mm physical "
-            f"mosaic, so EXACTLY ABOUT {tiles_across} tesserae must fit "
-            f"across the image width, and the same count across the height.\n"
-            f"Apply this size UNIFORMLY to every tile in the output. If any "
-            f"prior instruction in this prompt mentions a different tile or "
-            f"grout size (e.g. '5-10 mm' or '1-3 mm'), IGNORE those numbers "
-            f"and use {tile_mm:g} mm / {gap_mm:g} mm with the {tiles_across}-"
-            f"across-image count as the authoritative scale."
+            "==== HARD TILE-COUNT CEILING ====\n"
+            f"The output mosaic must contain NO MORE THAN {max_n} tiles "
+            f"across the image width, and NO MORE THAN {max_n} tiles across "
+            f"the image height. This is a HARD UPPER BOUND, not a target — "
+            f"fewer is fine, more is a failure.\n"
+            f"If your default rendering would exceed {max_n} tiles across, "
+            f"MAKE EACH TILE BIGGER until the count drops to {max_n} or "
+            f"fewer. Apply uniformly across the whole image — subject, "
+            f"background, hair, everything — do not shrink tiles in detailed "
+            f"areas just to stay under the ceiling.\n"
+            f"Self-check: count one row of tiles across the widest part of "
+            f"the output. If that count exceeds {max_n}, you have failed and "
+            f"must regenerate with bigger tiles."
         )
 
-        bg_fill = ""
+    @staticmethod
+    def _enlarge_prompt_base() -> str:
+        """Minimal prompt for the 'enlarge mosaic' mode — the input image is
+        treated as an EXISTING mosaic to be rebuilt with larger stones."""
+        return (
+            "The supplied input image IS ALREADY A MOSAIC made of many small "
+            "tesserae (stone tiles). Your task: RE-RENDER the same picture as "
+            "a mosaic that uses LARGER STONES — fewer, bigger tiles across "
+            "the image — while keeping subject, pose, composition, palette, "
+            "framing, and orientation faithful to the input.\n"
+            "\n"
+            "Tile interiors:\n"
+            "- Every tessera is filled with a SINGLE SOLID UNIFORM COLOR from "
+            "edge to edge. No inner texture, no veining, no gradient, no "
+            "highlights, no 3D shine. Color variation happens BETWEEN tiles, "
+            "never within one.\n"
+            "- Pick each tile's color as the dominant / average color of the "
+            "corresponding region in the input.\n"
+            "\n"
+            "Grout (the dark separator between tiles):\n"
+            "- A DARK CONTINUOUS line on every side of every tile (charcoal "
+            "to pure black, #000–#222). Visibly DARKER than every tile in "
+            "the mosaic.\n"
+            "- AT LEAST 4 pixels wide in the output. Unbroken — no gaps, no "
+            "fades. No two tiles touch.\n"
+            "\n"
+            "Boundaries and lighting:\n"
+            "- Tile-to-grout edges are SHARP. No anti-aliasing softness, no "
+            "glow.\n"
+            "- Lighting is perfectly flat and even. No directional shadows, "
+            "glare, or specular hot spots.\n"
+            "\n"
+            "Coverage:\n"
+            "- The mosaic fills the frame edge-to-edge. Every output pixel "
+            "is either tile interior or grout — no blank background.\n"
+            "\n"
+            "Camera:\n"
+            "- Strict orthographic top-down view, perpendicular to the "
+            "surface. No perspective, no tilt.\n"
+            "\n"
+            "Output resolution:\n"
+            "- Render at 4K (3840 × 3840 px). Do not downscale.\n"
+        )
+
+    @staticmethod
+    def _pil_with_black_square(img: Image.Image, side_px: int,
+                                cx: float, cy: float, rotation_deg: float) -> Image.Image:
+        """Return a copy of `img` with a HOLLOW BLACK FRAME burned in (3-px line,
+        no fill). cx/cy are the frame's CENTER in input-image coordinates;
+        rotation_deg rotates clockwise around that center. The image content
+        inside the frame stays visible so the model can see which region the
+        user is marking.
+        """
+        from PIL import Image as _PILImage
+        from PIL import ImageDraw as _ImageDraw
+        side_px = max(1, int(side_px))
+        frame_width = 3
+        # Build a transparent sprite the size of the frame's bounding box (the
+        # diagonal of the square in worst case, when rotated 45°). Then draw
+        # the hollow square inside the sprite and rotate the whole sprite.
+        diag = int(_math.ceil(side_px * _math.sqrt(2))) + 4
+        sprite = _PILImage.new("RGBA", (diag, diag), (0, 0, 0, 0))
+        sd = _ImageDraw.Draw(sprite)
+        # Center the unrotated square inside the sprite.
+        s_off = (diag - side_px) // 2
+        sd.rectangle(
+            [s_off, s_off, s_off + side_px, s_off + side_px],
+            outline=(0, 0, 0, 255),
+            width=frame_width,
+        )
+        if rotation_deg:
+            # PIL's positive angle is COUNTERCLOCKWISE, so negate to match the
+            # clockwise convention used by SquareOverlayLabel + Qt.
+            sprite = sprite.rotate(-rotation_deg, resample=_PILImage.BICUBIC, expand=False)
+        out = img.convert("RGBA").copy()
+        paste_x = int(round(cx - diag / 2))
+        paste_y = int(round(cy - diag / 2))
+        out.alpha_composite(sprite, dest=(paste_x, paste_y))
+        return out.convert("RGB")
+
+    @staticmethod
+    def _red_square_addendum(side_px: int) -> str:
+        """Prompt clause for the hollow black frame burned into the input image.
+
+        (Legacy method name kept; the marker is now a hollow black frame that
+        the model treats as the bounding outline of a single mosaic tile.)
+        """
+        return (
+            "\n\n"
+            "==== BLACK FRAME = TILE SIZE REFERENCE + TILE OUTLINE ====\n"
+            f"A HOLLOW BLACK SQUARE FRAME (thin black outline only, no fill) has been drawn on the supplied input image. The frame is {side_px} × {side_px} pixels in size, it MAY be rotated to any angle, and it may sit anywhere in the picture (not necessarily a corner). The image content INSIDE the frame is visible — that visible content is the part of the picture the frame is marking.\n"
+            "This black frame serves TWO purposes simultaneously:\n"
+            "1. SIZE REFERENCE: the side length of the frame defines the target size of each individual mosaic tile (tessera) in the output. Every tessera in the output should be approximately the SAME size as the frame (give or take ~10%), applied uniformly across subject, background, hair, everything.\n"
+            "2. TILE OUTLINE: the frame marks the EXACT outline of ONE single mosaic tile in the output. In the output mosaic, include a single tessera at the same position, rotation, and size as the frame. The tile's COLOR is the dominant / average color of what's visible inside the frame in the input image (NOT black — black is only the frame line, not the tile color).\n"
+            "Do NOT split this tile across multiple smaller tiles. Do NOT render the black frame line itself in the output (the frame is a marker, not content). Do NOT omit the marked tile.\n"
+            "Self-check: in the output, can you find ONE tessera at the same location and orientation as the input's frame, sized like the frame, with the color of the image content that was visible inside the frame? AND is every other tessera in the mosaic roughly the same size as that one? If either is no, you have failed."
+        )
+
+    def _inject_size_overrides(self, prompt_text: str) -> str:
+        """Build the final prompt by appending the size block and optional
+        background-fill block. When the red-square checkbox is on, the size
+        block is skipped (the red square is the sole size signal). When the
+        keep-aspect checkbox is on, any 'Square 4K (3840 × 3840 px)' clause
+        in the base prompt is rewritten to aspect-preserving language.
+        """
+        text = prompt_text
+
+        # Strip / rewrite the hardcoded "Square 4K" line when the user wants
+        # to keep the source aspect ratio. The model is told 4K total quality
+        # without the square dimension constraint.
+        if self.keep_aspect_chk.isChecked():
+            text = self._rewrite_square_output_clause(text)
+
+        # Background fill addon (still useful regardless of which size signal is in play).
         if self.fill_bg_chk.isChecked():
             try:
                 file_text = BG_FILL_PROMPT_FILE.read_text(encoding="utf-8").strip()
@@ -883,11 +1269,51 @@ class PhotoEditor(QMainWindow):
                 )
                 file_text = ""
             if file_text:
-                bg_fill = "\n\n" + file_text
-        return prompt_text + size_override + bg_fill
+                text = text + "\n\n" + file_text
+
+        # Subject rendering rules — always appended. Handles small per-feature
+        # cases where the model otherwise produces poor mosaic output on
+        # portraits (e.g. teeth get split into multiple stones with random
+        # colors). Add new per-feature rules to this list as they come up.
+        text = text + (
+            "\n\n"
+            "==== SUBJECT RENDERING RULES ====\n"
+            "- TEETH: each visible human tooth in the input must be rendered as "
+            "exactly ONE single mosaic tile (one stone), and that stone is "
+            "SOLID WHITE. Do not split a tooth across multiple tiles. Do not "
+            "use yellow, gray, or any non-white color for teeth. A row of "
+            "visible teeth becomes a row of separate white stones, one per tooth."
+        )
+        return text
+
+    @staticmethod
+    def _rewrite_square_output_clause(text: str) -> str:
+        """Replace 'Square 4K (3840 × 3840 px)' style phrases in the user
+        prompt with aspect-preserving language so the model isn't told to
+        produce a square when the user has asked to keep the source ratio."""
+        import re
+        replacement = (
+            "4K resolution (longest side 3840 px), preserving the input "
+            "image's aspect ratio (not square)"
+        )
+        # Match the common phrasings the prompt files use: "Square 4K", optional
+        # " resolution", optional parenthetical "(3840 × 3840 px)".
+        pattern = re.compile(
+            r"Square\s+4K(?:\s+resolution)?(?:\s*\(\s*3840\s*[×x]\s*3840\s*px\s*\))?",
+            re.IGNORECASE,
+        )
+        text = pattern.sub(replacement, text)
+        # Also strip standalone "Square (3840 × 3840 px)" if it appears.
+        pattern2 = re.compile(
+            r"Square\s*\(\s*3840\s*[×x]\s*3840\s*px\s*\)", re.IGNORECASE,
+        )
+        text = pattern2.sub(replacement, text)
+        return text
 
     def generate(self) -> None:
-        if self.source_pane.pil_image is None or not self.current_prompt_text:
+        if self.source_pane.pil_image is None:
+            return
+        if not self.enlarge_mosaic_chk.isChecked() and not self.current_prompt_text:
             return
         if load_api_key() is None:
             QMessageBox.critical(
@@ -903,9 +1329,39 @@ class PhotoEditor(QMainWindow):
             )
             return
 
-        prompt_with_sizes = self._inject_size_overrides(self.current_prompt_text)
+        prompt_with_sizes = self._build_final_prompt()
+        src_for_aspect = self.source_pane.pil_image
+
+        # If the "Use red square as tile size" checkbox is on, burn the BLACK
+        # square (now movable + rotatable on the source pane) into the image we
+        # send to Gemini. The square is the user's tile-size reference AND it
+        # becomes a real mosaic stone in the output — see _red_square_addendum.
+        # (The addendum text itself is already in prompt_with_sizes via
+        # _build_final_prompt; here we only bake the marker into the image.)
+        if self.use_red_square_chk.isChecked() and self.square_size_input.value() > 0:
+            sq_size, sq_cx, sq_cy, sq_rot = self.source_pane.get_reference_square_state()
+            if sq_size > 0:
+                src_for_aspect = self._pil_with_black_square(
+                    src_for_aspect, sq_size, sq_cx, sq_cy, sq_rot,
+                )
+                try:
+                    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                    debug_path = OUTPUT_DIR / "_last_generate_input.png"
+                    src_for_aspect.save(debug_path, "PNG")
+                    self.statusBar().showMessage(
+                        f"Black square baked in (size={sq_size}, rot={sq_rot:.0f}°) — "
+                        f"image sent saved at {debug_path.name}",
+                    )
+                except Exception:
+                    pass    # debug-save is non-critical
+
+        if self.keep_aspect_chk.isChecked():
+            aspect = closest_aspect_ratio(src_for_aspect.width, src_for_aspect.height)
+        else:
+            aspect = GENERATION_ASPECT
         self.worker = GenerationWorker(
-            self.source_pane.pil_image, prompt_with_sizes, DEFAULT_MODEL,
+            src_for_aspect, prompt_with_sizes, DEFAULT_MODEL,
+            aspect_ratio=aspect,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_ok.connect(self._on_generated)
