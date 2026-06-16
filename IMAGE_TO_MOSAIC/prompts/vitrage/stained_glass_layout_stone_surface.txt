@@ -1,0 +1,42 @@
+Convert the supplied reference image into a hybrid piece: the SHAPE LAYOUT of a leaded stained-glass panel, but the SURFACE of each piece is opaque natural mosaic stone (limestone, marble, terracotta, basalt). Think "stained-glass cartoon executed in stone slabs" — not glass, not Roman tesserae, but the large flowing piece-shapes of stained glass cut from stone.
+
+Composition — stained-glass-style geometry:
+- The image is divided into a moderate number of LARGE pieces (not tiny tesserae) shaped by the smooth curves typical of stained-glass cuts. About 50-150 contiguous pieces across the entire image. Pieces follow the contours of the subject (face, hair flow, drapery, key shapes); the background is broken into a small number of large flowing pieces.
+
+Piece interiors — stone, but flat:
+- Every piece is filled with a SINGLE SOLID UNIFORM COLOR from edge to edge — the dominant / average color of a real polished stone slab.
+- ABSOLUTELY NO inner texture, NO veining, NO speckle, NO inner gradient, NO highlights, NO 3D / shiny appearance inside a piece. The "stone" character comes ONLY from the PALETTE (muted natural mineral tones), not from drawn-in stone texture.
+- Color variation happens BETWEEN pieces, never WITHIN a single piece.
+- Self-check: if you can identify two different colors inside the same piece in the output, you have failed this rule.
+
+Color palette — natural mosaic stone:
+- Muted, earthy mineral tones: cream limestone, bone white, warm travertine, ochre, sienna, oxblood, brick red, terracotta, umber, olive, sage, slate blue-gray, charcoal, jet black. NO neon, NO saturated jewel tones (this is what distinguishes it from real stained glass).
+- Choose for each piece the dominant stone color of the matching region in the reference image.
+
+Grout / lead came — the THIN PURE-BLACK separator between pieces (cut lines):
+- Render the separator between pieces as a THIN PURE BLACK line on every side of every piece. This line marks where the panel will be CUT to separate the pieces, so it must be minimal — a clean black centerline, not a thick ribbon.
+- Color: PURE BLACK (#000000) and ONLY pure black. Solid, uniform, no transparency, no gradient, no anti-aliasing softness around the edges. Every separator pixel is #000000; every adjacent stone pixel is non-black.
+- Width: THIN — between 2 and 4 pixels wide in the output. Just thick enough to be a continuous detectable line. NEVER more than 5 pixels. NOT hairline (<2 px) and NOT a thick band (>5 px).
+- Every pair of adjacent pieces is separated by this dark line. Two pieces must never touch.
+- Lines are UNBROKEN and SHARP — no gaps, no fades. Hard transition from black separator pixel to colored stone pixel.
+
+Boundaries and lighting:
+- Piece-to-separator boundaries are SHARP — no anti-aliasing softness, no soft blur, no glow.
+- Lighting is perfectly flat and even across the entire panel. No directional shadows, no glare, no specular hot spots, no vignetting. Treat it as if shot under a perfectly diffuse studio softbox.
+
+Subject simplification — hair, fur, fabric folds, fine textures:
+- For long hair, fur, drapery folds, or similar fine line-textures: simplify into a SMALL NUMBER (3-5) of large flowing pieces — highlight, mid-tone, shadow — NEVER into many tiny pieces or strand-by-strand.
+- Hair pieces use the SAME large-piece scale as the rest of the panel.
+
+Composition and complete coverage:
+- The mosaic fills the frame edge-to-edge.
+- EVERY pixel of the output must be either piece interior or dark separator. There is NO bare flat-colored area, NO blank background, NO uniform-color expanse anywhere larger than ~3 pieces in size that doesn't have separator lines through it.
+- If the input has flat background or empty regions, tessellate them too with a few large background-stone pieces and separator lines.
+
+Camera:
+- Strict orthographic top-down view, perpendicular to the surface. No perspective, no tilt.
+- The mosaic fills the frame; no surrounding wall, no frame, no caption.
+
+Output resolution (mandatory):
+- Render the result at 4K (3840 × 3840 px). Do not downscale.
+- Output must be sharp at full 4K so the polygon-detection pipeline can extract every stone piece as a clean polygon.

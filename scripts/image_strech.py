@@ -841,10 +841,10 @@ class MainWindow(QMainWindow):
         self.fix_gap_btn.clicked.connect(self.apply_fix_gap)
         self.fix_gap_btn.setToolTip(
             "Set the gap between every pair of neighbouring polygons to "
-            "exactly Gap pixels — polygons GROW into empty space if the "
-            "current gap is larger than Gap, and SHRINK if it's smaller. "
-            "Outer envelope of the whole arrangement is preserved. "
-            "Voronoi-based: each polygon claims its territory among neighbours."
+            "exactly Gap pixels. For each polygon: erase it, buffer all "
+            "other polygons by Gap, take the empty region around the "
+            "original polygon's location — that becomes the new polygon. "
+            "Same logic as Fill Polygon, applied to every polygon one by one."
         )
 
         self.circle_btn = QPushButton("Circle")
@@ -1994,19 +1994,20 @@ class MainWindow(QMainWindow):
 
     def apply_fix_gap(self):
         """Set the gap between every pair of neighbouring polygons to exactly
-        Gap pixels — enlarging or shrinking polygons as needed. Algorithm:
+        Gap pixels. For each polygon, in order:
 
-          1. Compute the bounding rectangle of all polygons, expanded by Gap/2
-             so the outer envelope of the arrangement is preserved.
-          2. Compute Voronoi cells of polygon centroids — each cell is the
-             region of the plane closest to that polygon's centroid.
-          3. Each polygon's new shape = (Voronoi cell ∩ expanded bounding
-             rect), shrunk inward by Gap/2.
+          1. Erase the polygon from the working set.
+          2. Buffer all other polygons outward by Gap (same buffer used by
+             Fill Polygon's interior-hole detection).
+          3. Subtract that union from the bounding rectangle of all polygons.
+          4. Take the connected component containing the original polygon's
+             representative point — that becomes the new polygon.
 
-        Effect: polygons claim their Voronoi territory and the gap between
-        every pair of neighbours becomes exactly Gap. Polygons that were too
-        close together shrink on their facing sides; polygons that were too
-        far apart grow into the empty space.
+        Polygons grow when the previous gap was larger than Gap, shrink when
+        it was smaller. The outer envelope of the arrangement (the bounding
+        rectangle) is preserved because it bounds the allowed region. Two
+        passes are run so later polygons see the updated shapes of earlier
+        ones — stabilises after the second pass.
         """
         polys = self.canvas.polygons
         if not polys:
@@ -2024,7 +2025,8 @@ class MainWindow(QMainWindow):
         confirm = QMessageBox.question(
             self, "Fix Gap",
             f"Set the gap between every pair of neighbouring polygons to "
-            f"exactly {gap:g} px. Polygons will grow or shrink as needed; "
+            f"exactly {gap:g} px. Each polygon is redrawn using the same "
+            f"buffer logic as Fill Polygon. Polygons grow or shrink slightly; "
             f"the outer envelope of the arrangement is preserved. "
             f"This operation is NOT undoable. Continue?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
@@ -2033,16 +2035,13 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            from shapely.geometry import (
-                Polygon as ShapelyPolygon, MultiPoint, Point, box,
-            )
-            from shapely.ops import voronoi_diagram, unary_union
+            from shapely.geometry import Polygon as ShapelyPolygon, box
+            from shapely.ops import unary_union
             from shapely.validation import make_valid
         except ImportError as e:
             QMessageBox.critical(
                 self, "Shapely required",
-                f"This feature needs the 'shapely' package (>= 2.0 for "
-                f"voronoi_diagram).\n\n{e}",
+                f"This feature needs the 'shapely' package.\n\n{e}",
             )
             return
 
@@ -2072,86 +2071,93 @@ class MainWindow(QMainWindow):
             )
             return
 
-        half = gap / 2.0
-        union = unary_union([shapes[i] for i in valid_idxs])
-        minx, miny, maxx, maxy = union.bounds
-        # Active region: bounding rect expanded by gap/2 so the outer envelope
-        # is preserved after the buffer(-gap/2) shrink at the end.
-        active = box(minx - half, miny - half, maxx + half, maxy + half)
+        # Active region = bounding rectangle of all polygons. The polygons'
+        # new shapes are constrained to lie inside this rectangle, which
+        # preserves the outer envelope of the arrangement.
+        union_all = unary_union([shapes[i] for i in valid_idxs])
+        minx, miny, maxx, maxy = union_all.bounds
+        active = box(minx, miny, maxx, maxy)
 
-        # Voronoi seeds: representative points (always inside the polygon,
-        # even for concave shapes whose centroid may fall outside).
-        seed_coords = []
+        # Stash original representative points — the seed for "which connected
+        # component is this polygon's new shape" — before we start mutating.
+        seeds = {}
         for i in valid_idxs:
-            rp = shapes[i].representative_point()
-            seed_coords.append((rp.x, rp.y))
+            seeds[i] = shapes[i].representative_point()
 
-        # Envelope for Voronoi: must comfortably enclose all cells.
-        pad = max(maxx - minx, maxy - miny, gap * 4) * 5
-        env = box(minx - pad, miny - pad, maxx + pad, maxy + pad)
-
-        try:
-            vor = voronoi_diagram(MultiPoint(seed_coords), envelope=env)
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Voronoi failed",
-                f"Could not build Voronoi diagram: {type(e).__name__}: {e}",
-            )
-            return
-        cells = list(vor.geoms)
-
-        # Map each Voronoi cell back to its seed (= polygon index).
-        cell_for = {}
-        for k, polygon_idx in enumerate(valid_idxs):
-            seed_pt = Point(seed_coords[k])
-            for cell in cells:
-                if cell.contains(seed_pt):
-                    cell_for[polygon_idx] = cell
-                    break
-
-        new_polys = []
+        # Two passes: pass 1 grows/shrinks each polygon based on the original
+        # arrangement; pass 2 lets each polygon see the updated neighbours.
+        # Most cases converge after the first pass; the second is a safety net.
+        modified = 0
         dropped = 0
         split = 0
-        for i, sp in enumerate(shapes):
-            if sp is None:
-                dropped += 1
-                continue
-            cell = cell_for.get(i)
-            if cell is None:
-                # Fallback: keep original polygon
-                coords = list(sp.exterior.coords)
-                if len(coords) >= 4 and coords[0] == coords[-1]:
-                    coords = coords[:-1]
-                new_polys.append([(float(x), float(y)) for x, y in coords])
-                continue
-            try:
-                clipped = cell.intersection(active)
-                shrunk = clipped.buffer(-half) if not clipped.is_empty else clipped
-            except Exception:
-                dropped += 1
-                continue
-            if shrunk.is_empty:
-                dropped += 1
-                continue
-            geoms = (
-                [shrunk] if shrunk.geom_type == "Polygon"
-                else (list(shrunk.geoms) if hasattr(shrunk, "geoms") else [])
-            )
-            kept_here = 0
-            for g in geoms:
-                if g.geom_type != "Polygon":
+        for iteration in range(2):
+            for i in valid_idxs:
+                if shapes[i] is None:
                     continue
-                coords = list(g.exterior.coords)
-                if len(coords) >= 4 and coords[0] == coords[-1]:
-                    coords = coords[:-1]
-                if len(coords) < 3:
+                others = [
+                    shapes[j] for j in valid_idxs
+                    if j != i and shapes[j] is not None
+                ]
+                if not others:
                     continue
-                new_polys.append([(float(x), float(y)) for x, y in coords])
-                kept_here += 1
-            if kept_here == 0:
+                try:
+                    buffered = unary_union([o.buffer(gap) for o in others])
+                    allowed = active.difference(buffered)
+                except Exception:
+                    continue
+                if allowed.is_empty:
+                    continue
+                seed = seeds[i]
+                geoms = (
+                    [allowed] if allowed.geom_type == "Polygon"
+                    else (list(allowed.geoms) if hasattr(allowed, "geoms") else [])
+                )
+                new_shape = None
+                for g in geoms:
+                    if g.geom_type != "Polygon":
+                        continue
+                    if g.contains(seed) or g.touches(seed):
+                        new_shape = g
+                        break
+                if new_shape is None:
+                    # Seed didn't land in any allowed component (rare). Skip
+                    # this polygon — leave it at its current shape.
+                    continue
+                shapes[i] = new_shape
+
+        # Convert back to polygon coordinate lists, count outcomes by comparing
+        # final shape area to the (re-built) original shape area.
+        new_polys = []
+        for orig_i, orig_poly in enumerate(polys):
+            sp = shapes[orig_i] if orig_i < len(shapes) else None
+            if sp is None or sp.is_empty:
                 dropped += 1
-            elif kept_here > 1:
-                split += 1
+                continue
+            if sp.geom_type != "Polygon":
+                if hasattr(sp, "geoms"):
+                    parts = [g for g in sp.geoms if g.geom_type == "Polygon"]
+                    if parts:
+                        for g in parts:
+                            coords = list(g.exterior.coords)
+                            if len(coords) >= 4 and coords[0] == coords[-1]:
+                                coords = coords[:-1]
+                            if len(coords) >= 3:
+                                new_polys.append([(float(x), float(y)) for x, y in coords])
+                        if len(parts) > 1:
+                            split += 1
+                        modified += 1
+                        continue
+                dropped += 1
+                continue
+            coords = list(sp.exterior.coords)
+            if len(coords) >= 4 and coords[0] == coords[-1]:
+                coords = coords[:-1]
+            if len(coords) >= 3:
+                new_polys.append([(float(x), float(y)) for x, y in coords])
+                # Treat any non-identical reshape as "modified" for the count.
+                orig_shape = to_shapely(orig_poly)
+                if orig_shape is None or not sp.equals(orig_shape):
+                    modified += 1
 
         self.canvas.polygons = new_polys
         self.canvas.selected_polygon_index = None
@@ -2162,8 +2168,8 @@ class MainWindow(QMainWindow):
         self.canvas.update()
 
         msg = (
-            f"Set gap to {gap:g} px between every pair of polygons. "
-            f"{len(new_polys)} polygon{'s' if len(new_polys) != 1 else ''} remain."
+            f"Set gap to {gap:g} px. {len(new_polys)} polygon"
+            f"{'s' if len(new_polys) != 1 else ''} remain ({modified} modified)."
         )
         if dropped:
             msg += f" Dropped {dropped}."

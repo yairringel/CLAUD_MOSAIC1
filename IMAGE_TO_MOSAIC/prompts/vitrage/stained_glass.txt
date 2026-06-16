@@ -1,0 +1,45 @@
+Convert the supplied reference image into a leaded STAINED-GLASS panel, rendered as if photographed straight-on through clear backlight onto a flat lightbox. The output is a graphic, detection-ready stained-glass window — not a photograph.
+
+Composition:
+- The image is divided into a moderate number of LARGE glass pieces (not tiny tesserae) shaped by smooth curves, classical stained-glass cuts. Most pieces are noticeably larger than they would be in a Roman mosaic — think 50-150 contiguous pieces across the entire image, not thousands.
+- Piece outlines follow the contours of the subject (face, hair flow, drapery, key shapes) and the background is broken into a small number of large flowing background pieces.
+
+Piece interiors — one hue per piece, preserving the original image's tonal detail:
+- Each glass piece is dominantly ONE hue, but it CARRIES the tonal detail of the corresponding region of the INPUT IMAGE inside it — the lights and darks that already exist in the photograph (the volume of a cheek, the fold of drapery, the highlight on a lip, the shadow under a chin). Do NOT invent generic painted-glass / grisaille brushstrokes; copy the actual shading from the source.
+- The within-piece variation is SUBTLE and stays within ONE hue: only lightness / saturation variation of the same hue is allowed. No two distinct hues inside one piece (e.g. red AND blue is a failure). Keep lightness variation within a piece BELOW ~30% so the piece still reads as one continuous color region and the polygon-detection pipeline still segments it as a single shape.
+- NO sharp inner edges, NO bubbles, swirls, specular highlights, glassy shine, or 3D effects. The shading is smooth and follows the photo, not the stained-glass medium.
+- Most color variation still happens BETWEEN pieces (different hues from different photo regions). Within-piece shading is faithful to the source, not an ornamental accent the AI invents.
+- Self-check: each piece is one hue with at most gentle photo-faithful shading; you should still be able to outline it as one continuous polygon. If a single piece contains two distinct hues, you have failed.
+
+Color palette — faithful to the input image:
+- Pull each piece's color from the actual region of the input image. STAY CLOSE TO THE ORIGINAL COLORS — match the input's hue, saturation, and lightness rather than imposing a generic ecclesiastical / Tiffany palette over it.
+- If the input is muted, the output is muted; if vivid, the output is vivid. Do not push every piece toward cobalt / ruby / emerald defaults unless the input already has those hues.
+- Pieces still read as backlit colored glass (translucent feel), but the HUES come from the photograph.
+
+Lead came — the THIN PURE-BLACK separator between pieces (cut lines):
+- Render the lead came as a THIN PURE BLACK line on every side of every piece. This line marks where the panel will be CUT to separate the pieces, so it must be minimal — just a clean black centerline, not a thick ribbon.
+- Color: PURE BLACK (#000000) and ONLY pure black. Solid, uniform, no transparency, no gradient, no anti-aliasing softness around the edges. Every lead-came pixel is #000000; every adjacent glass pixel is non-black.
+- Width: THIN — between 2 and 4 pixels wide in the output. Just thick enough to be a continuous detectable line. NEVER more than 5 pixels. NOT hairline (<2 px) and NOT a thick band (>5 px).
+- Every pair of adjacent pieces is separated by lead. Two pieces must never touch.
+- Lead lines are UNBROKEN and SHARP — no gaps, no fades. Hard transition from black lead pixel to colored glass pixel.
+
+Boundaries and lighting:
+- Piece-to-lead boundaries are SHARP — no anti-aliasing softness, no glow, no transitional pixels.
+- Lighting is perfectly flat — even backlight across the entire panel. No directional shadows, no glare, no specular hot spots, no caustics. Treat the output as if a perfectly diffuse light source sits directly behind the panel.
+
+Subject simplification — hair, fur, fabric folds, and other fine line-textures:
+- When the reference image contains hair (especially long flowing hair such as a woman's hair) or other fine line-textures: simplify these areas into a SMALL NUMBER (3-5) of large flowing stained-glass pieces — highlight, mid-tone, shadow — NEVER into many tiny pieces. Long hair is typically 3-6 sweeping pieces total, not strand-by-strand.
+- Hair pieces use the SAME large-piece scale as the rest of the panel.
+
+Composition and complete coverage:
+- The stained-glass panel fills the frame edge-to-edge.
+- EVERY pixel of the output must be either piece interior or lead came. There is NO bare flat-colored area, NO blank background, NO uniform-color expanse anywhere larger than ~3 pieces in size that doesn't have lead lines through it.
+- If the input has flat background or empty regions, tessellate them too with a few large background-colored pieces and lead lines.
+
+Camera:
+- Strict orthographic head-on view, perpendicular to the panel surface. No perspective, no tilt.
+- The panel fills the frame; no surrounding wall, no frame, no caption.
+
+Output resolution (mandatory):
+- Render the result at 4K (3840 × 3840 px). Do not downscale.
+- Output must be sharp at full 4K so the polygon-detection pipeline can extract every glass piece as a clean polygon.

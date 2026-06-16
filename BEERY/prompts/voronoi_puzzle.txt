@@ -1,0 +1,58 @@
+Convert the supplied reference image into a SINGLE LARGE CERAMIC TILE — one continuous slab of fired, glazed ceramic with the picture rendered onto its glaze, and 30-60 thin black lines drawn DIRECTLY ON the glaze marking where the picture is conceptually subdivided into Voronoi-like regions.
+
+THIS IS NOT A PUZZLE OR MOSAIC. There are NO separate pieces, NO gaps, NO grout, NO physical cuts. The output is ONE big ceramic tile carrying both the photograph and a thin black network of decorative SURFACE LINES that mark the shape boundaries — like ink drawn on the glaze, or a fine etching, sitting on top of an unbroken surface.
+
+The line layout is a HYBRID between Voronoi cells and the image's natural contours: where a strong feature line runs (face outline, jawline, eye, lip, nostril, hairline, hair-flow lock, neck, drapery fold, hand silhouette), a surface line follows that feature; in flatter, featureless regions (cheek, forehead, background, sky), the layout falls back to Voronoi-like polygonal boundaries.
+
+Composition — feature-following line layout (LARGE regions):
+- The surface lines divide the picture into 30-60 contiguous regions ONLY. Each region is LARGE — comparable to the size of a fist on the picture's scale, not a fingernail. Do NOT subdivide into many small regions.
+- Each region is bounded by Voronoi-like irregular polygonal boundaries with 4-8 mostly-straight line segments (slight gentle curves allowed where they trace a feature).
+- Regions are sized roughly evenly across the panel — no region dramatically larger or smaller than its neighbours. The whole image is covered by only a few dozen chunky regions.
+- Self-check: count the regions along one row across the widest part of the image. If that count exceeds 8-10, you have made the regions too small and must redo with fewer, bigger regions.
+- WHERE A FEATURE LINE EXISTS, ALIGN A SURFACE LINE TO IT. Specifically, surface lines should run along: the outline of the face, the jawline and chin, each eye's outline, each lip's outline, the line of the nostrils, the hairline, individual locks / waves of hair, the neck and collarbone, the shoulders, fabric folds. A region must never STRADDLE a strong feature — if a feature crosses, place a surface line ON that feature instead.
+- EYES AND EYEBROWS MUST EACH BE A SINGLE INTACT REGION. Each eye (eye-white + iris + pupil + eyelid + lash line, taken together) is ONE region — do NOT subdivide it. Each eyebrow is ONE region — do NOT subdivide it. No surface line ever runs through the inside of an eye or eyebrow; surface lines only run AROUND them. Two eyes → exactly two eye regions (one each). Two eyebrows → exactly two eyebrow regions (one each).
+- WHERE NO STRONG FEATURE EXISTS (flat cheek, background, sky, plain fabric), the layout reverts to Voronoi-like irregular polygons of similar size.
+- The result reads as part-Voronoi, part-feature-aware: the major lines of the subject ARE visible as surface lines, but the in-between areas look like a Voronoi pattern.
+
+Surface content — the picture rendered on the ceramic glaze:
+- The full original image content is preserved on the ceramic surface — colours, shading, gradients, fine details, edges of subjects — readable as a continuous photograph, NOT broken into separate pieces. The picture flows across the surface lines as if the lines were drawn on TOP of a single underlying image.
+- Do NOT flatten regions to a single solid colour. Do NOT posterise, cartoonise, or repaint the picture. The subject must still be recognisable.
+- The whole image sits on ONE single glazed ceramic surface, rendered FLAT — like a photograph of a perfectly even ceramic slab lit by perfectly diffuse light. NO highlights of any kind:
+    * NO gloss reflections, NO satin sheen, NO specular hot spots
+    * NO surface reflectivity variation, NO catch-lights, NO glare
+    * NO bevel, NO edge rounding (the black lines are flat marks ON the surface)
+    * NO craquelure, NO crack lines, NO fake "tile" stencilling
+    * NO indication that the surface is shiny or has any reflective quality at all
+- The image content sits flat on the ceramic, like a printed photograph on matte stock. Treat the surface as MATTE for the purpose of avoiding highlights, but keep the cell-content colours faithful to the input image.
+- Don't add overall colour grading, vignetting, or any post-processing — keep the image's original tone and lighting, just rendered as a flat picture on a flat ceramic.
+- COLOURS MUST STAY UNIFIED AND COHERENT across the panel. Every region's colour must come faithfully from the underlying image — no region may jump out as an OUTLIER with a colour that doesn't belong (no random bright magenta region in a stretch of warm skin tones, no rogue blue region in a brown background). Neighbouring regions must have related colours that flow into each other; the only colour breaks allowed are the ones the input image itself has.
+- Self-check: scan the output for any single region whose colour clearly doesn't match what's in the same area of the input. If you can find one, you have failed this rule.
+
+Material — one single ceramic tile, FLAT and FRAMELESS:
+- The whole panel reads as ONE big physical object: a single ceramic slab with a continuous surface.
+- The tile FILLS THE OUTPUT FRAME ENTIRELY, edge-to-edge. ZERO visible tile edge, ZERO bezel, ZERO border around the tile, ZERO surrounding background, ZERO drop shadow under the tile, ZERO indication of where the tile ends. The output is a CLOSE-UP of the tile surface only — as if the camera is touching the surface — so no edges of the physical tile are in frame.
+- The surface is FLAT and MATTE-looking. No highlights, no glossy reflections, no specular hot spots. No directional lighting, no shadows. Treat as perfectly diffuse, perfectly even illumination.
+- ABSOLUTELY NOT a mosaic of separate tiles. NO grout, NO gaps, NO physical separation between regions. Just one continuous ceramic surface with thin black surface lines drawn ON IT.
+
+Surface lines — the THIN PURE-BLACK shape markings:
+- Draw thin pure-black lines DIRECTLY ON THE CERAMIC SURFACE, marking the Voronoi-like shape divisions of the picture. These are decorative SURFACE MARKINGS, like ink or a fine glaze etching — NOT physical cuts, NOT gaps between pieces, NOT grout.
+- Color: PURE BLACK (#000000) and ONLY pure black. Solid, uniform, no transparency, no gradient, no anti-aliasing softness. Every line pixel is #000000; every adjacent ceramic-surface pixel is non-black.
+- Width: AS THIN AS POSSIBLE — ideally 1 pixel wide, never more than 2 pixels. The thinner the better. A single-pixel clean line is the goal.
+- THE BLACK LINES MUST BE SOLID AND CONTINUOUS — NEVER BROKEN, NEVER INTERRUPTED, NEVER DASHED, NEVER FADED. Every region is fully outlined by an unbroken closed loop of pure-black pixels. From any point on a line you must be able to trace it to its neighbours without a single non-black pixel interrupting the path. No dashes, no dots, no gaps, no breaks, no fades, no thin spots that fall below 1 px, no places where the line is interrupted by an underlying image feature (e.g. when crossing an eye outline the line keeps going as pure black — it does NOT yield to the underlying photo). Self-check: a single connected pure-black skeleton across the whole panel.
+- Hard transition from black line pixel to ceramic-surface pixel — no AA, no soft edges.
+
+Line edges:
+- Line-to-surface transitions are SHARP — no anti-aliasing softness around the black lines, no blur, no glow. The hard pixel transition from ceramic-surface pixel to pure-black-line pixel must be crisp so the detection pipeline can extract the lines cleanly.
+- The black lines are FLAT MARKS ON THE SURFACE — no bevel, no edge rounding, no implication of physical separation between regions. They lie ON the ceramic, not IN it.
+
+Composition and complete coverage:
+- The single ceramic tile fills the frame edge-to-edge with NO visible tile border, NO bezel, NO surrounding wall/table/background showing. The viewer cannot tell where the tile ends — it appears to extend beyond the frame in every direction.
+- EVERY pixel of the output is either the photographic ceramic-glaze surface or a pure-black surface-line pixel. NO pixel shows the edge of the tile, drop shadow, frame, or anything outside the tile.
+- Regions along the image border are clipped by the frame — their outer line boundaries align with the frame. The line at the very edge of the frame is itself solid and unbroken, like the inner lines.
+
+Camera:
+- Match the input image's framing, perspective, and orientation EXACTLY. Do not change crop, rotate, or change perspective. The output is the input image rendered on a single ceramic tile with the surface lines overlaid.
+
+Output resolution (mandatory):
+- Render the result at 4K (3840 × 3840 px). Do not downscale.
+- Output must be sharp at full 4K so the polygon-detection pipeline can extract every region as a clean polygon.

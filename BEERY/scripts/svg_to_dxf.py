@@ -516,6 +516,15 @@ class SvgToDxf(QMainWindow):
         self.convert_white_btn = QPushButton("Convert white")
         bar.addWidget(self.convert_white_btn)
 
+        self.shapes_csv_btn = QPushButton("Shapes → CSV...")
+        self.shapes_csv_btn.setToolTip(
+            "One-click: parse every closed shape in the SVG (rect, circle, "
+            "ellipse, polygon, closed path), preview them on the right, and "
+            "save directly to the project's CSV polygon format. Open paths "
+            "are skipped. No shrinking or gap applied."
+        )
+        bar.addWidget(self.shapes_csv_btn)
+
         self.save_btn = QPushButton("Save DXF...")
         bar.addWidget(self.save_btn)
         self.save_csv_btn = QPushButton("Save CSV...")
@@ -581,6 +590,7 @@ class SvgToDxf(QMainWindow):
         self.convert_btn.clicked.connect(self.convert_1to1)
         self.convert_gap_btn.clicked.connect(self.convert_with_gap)
         self.convert_white_btn.clicked.connect(self.convert_white)
+        self.shapes_csv_btn.clicked.connect(self.shapes_to_csv)
         self.save_btn.clicked.connect(self.save_dxf)
         self.save_csv_btn.clicked.connect(self.save_csv)
         self._update_buttons()
@@ -591,6 +601,7 @@ class SvgToDxf(QMainWindow):
         self.convert_btn.setEnabled(has_svg)
         self.convert_gap_btn.setEnabled(has_svg)
         self.convert_white_btn.setEnabled(has_svg)
+        self.shapes_csv_btn.setEnabled(has_svg)
         self.save_btn.setEnabled(has_polys)
         self.save_csv_btn.setEnabled(has_polys)
 
@@ -875,6 +886,86 @@ class SvgToDxf(QMainWindow):
             f"White regions: {n_regions} pieces, {len(polylines)} polylines.",
         )
         self._update_buttons()
+
+    def shapes_to_csv(self) -> None:
+        """One-click: parse closed SVG shapes (no shrink, no gap), update the
+        preview, and save the polygons directly to a CSV."""
+        if self.svg_path is None:
+            return
+        self.statusBar().showMessage("Parsing SVG shapes...")
+        QApplication.processEvents()
+        try:
+            polylines, vp_w, vp_h, skipped_open, dropped = (
+                svg_shapes_to_shrunk_polylines(self.svg_path, gap=0.0)
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Parse failed",
+                f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
+            )
+            self.statusBar().showMessage("Parse failed.")
+            return
+        if not polylines:
+            QMessageBox.warning(
+                self, "No closed shapes",
+                f"Found no closed shapes in the SVG "
+                f"(open paths skipped: {skipped_open}).",
+            )
+            self.statusBar().showMessage("No closed shapes found.")
+            return
+
+        self.polylines = polylines
+        self.viewport_w = vp_w
+        self.viewport_h = vp_h
+
+        # Update the right-pane preview so the user sees what was parsed.
+        preview = render_preview(polylines, vp_w, vp_h)
+        qimg = QImage(
+            preview.tobytes("raw", "RGB"), preview.width, preview.height,
+            preview.width * 3, QImage.Format_RGB888,
+        ).copy()
+        self.right_base_qimg = qimg
+        vp = self.right_scroll.viewport().size()
+        if qimg.width() > 0 and qimg.height() > 0:
+            fit = min(vp.width() / qimg.width(), vp.height() / qimg.height())
+            self.right_zoom = max(self.ZOOM_MIN, min(self.ZOOM_MAX, fit if fit > 0 else 1.0))
+        else:
+            self.right_zoom = 1.0
+        self._apply_right_zoom()
+        total_pts = sum(len(pl) for pl in polylines)
+        self.info_label.setText(
+            f"{len(polylines)} shapes  |  {total_pts} points  |  "
+            f"skipped open: {skipped_open}"
+        )
+        self._update_buttons()
+
+        # Open the save dialog immediately.
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        default_name = self.svg_path.stem + ".csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save CSV polygons", str(OUTPUT_DIR / default_name),
+            "CSV files (*.csv);;All files (*.*)",
+        )
+        if not path:
+            self.statusBar().showMessage(
+                f"Parsed {len(polylines)} shapes (save cancelled).",
+            )
+            return
+        out_path = Path(path)
+        if out_path.suffix.lower() != ".csv":
+            out_path = out_path.with_suffix(".csv")
+        try:
+            n = write_csv(self.polylines, out_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", f"{type(e).__name__}: {e}")
+            return
+        self.statusBar().showMessage(f"Saved {n} polygons → {out_path.name}")
+        QMessageBox.information(
+            self, "Saved",
+            f"Saved {n} polygons to:\n{out_path}\n\n"
+            f"Format: coordinates, color_r/g/b/a, color_hex "
+            f"(compatible with mosaic_to_csv polygon viewers).",
+        )
 
     def save_csv(self) -> None:
         if not self.polylines or self.svg_path is None:
