@@ -77,6 +77,11 @@ class VoronoiPuzzleEditor(_PhotoEditor):
         self.max_tiles_input.setVisible(False)
         self.fill_bg_chk.setChecked(False)
         self.fill_bg_chk.setVisible(False)
+        # Always keep the source aspect ratio — there's no other behavior we
+        # want here. Force the inherited checkbox on and hide it so the user
+        # can't accidentally disable it.
+        self.keep_aspect_chk.setChecked(True)
+        self.keep_aspect_chk.setVisible(False)
         for label in self.findChildren(QLabel):
             if label.text() in _HIDDEN_LABELS:
                 label.setVisible(False)
@@ -245,6 +250,35 @@ class VoronoiPuzzleEditor(_PhotoEditor):
             self.orange_btn.setText("Orange line")
         if hasattr(self, "no_line_btn"):
             self.no_line_btn.setText("No line")
+
+    def _on_generated(self, img_bytes: bytes) -> None:
+        """Override: Gemini can only emit images at its fixed set of
+        aspect ratios and resolutions. After it returns, resize the result
+        to EXACTLY match the source image's pixel dimensions so every pass
+        (Generate / Orange line / No line) lands at the loaded image's
+        resolution regardless of what the model produced."""
+        from io import BytesIO
+        from PIL import Image as _PILImage
+        try:
+            img = _PILImage.open(BytesIO(img_bytes))
+            img.load()
+        except Exception as e:
+            QMessageBox.critical(self, "Bad response",
+                                 f"Could not decode image: {e}")
+            return
+        # Resize to the source image's exact dimensions (LANCZOS for quality).
+        if self.source_pane.pil_image is not None:
+            target_w = self.source_pane.pil_image.width
+            target_h = self.source_pane.pil_image.height
+            if (img.width, img.height) != (target_w, target_h):
+                img = img.resize((target_w, target_h), _PILImage.LANCZOS)
+        self.result_pane.set_pil_image(
+            img, f"Generated  |  {img.width} × {img.height} px (matched source)",
+        )
+        self.statusBar().showMessage(
+            f"Generated and resized to {img.width} × {img.height} px "
+            f"(source dimensions).",
+        )
 
     # ----- second-pass recolour: black lines → orange lines ---------------
 

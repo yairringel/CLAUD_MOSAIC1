@@ -54,5 +54,5 @@ Camera:
 - Match the input image's framing, perspective, and orientation EXACTLY. Do not change crop, rotate, or change perspective. The output is the input image rendered on a single ceramic tile with the surface lines overlaid.
 
 Output resolution (mandatory):
-- Render the result at 4K (3840 × 3840 px). Do not downscale.
-- Output must be sharp at full 4K so the polygon-detection pipeline can extract every region as a clean polygon.
+- Match the input image's aspect ratio EXACTLY. Do NOT crop, do NOT pad, do NOT force the output to be square or to any specific dimensions. The output's width-to-height ratio is identical to the input's.
+- Output must be SHARP at full resolution so the polygon-detection pipeline can extract every region as a clean polygon.

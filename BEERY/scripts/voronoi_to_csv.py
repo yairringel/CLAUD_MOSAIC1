@@ -950,6 +950,10 @@ class VoronoiToCsv(_MosaicToCsv):
         h, w = rgb.shape[:2]
 
         # Rasterise the (possibly edited) polylines back into a clean mask.
+        # This is robust: connected components on the inverted mask reliably
+        # find every enclosed cell, even when polyline endpoints are slightly
+        # off-grid. We refine the contour vertices to actual control points
+        # in a SECOND pass below.
         line_w = max(1, int(self.target_width_spin.value()))
         raster = np.zeros((h, w), dtype=np.uint8)
         for pl in self.polylines:
@@ -959,15 +963,14 @@ class VoronoiToCsv(_MosaicToCsv):
                     isClosed=False, color=255,
                     thickness=line_w, lineType=cv2.LINE_8,
                 )
-        # Close any 1-px pinholes so cells don't leak through.
+        # Close 1-px pinholes so cells don't leak through.
         kern = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         self.orange_mask = cv2.morphologyEx(raster, cv2.MORPH_CLOSE, kern)
         orange_mask = self.orange_mask
 
         tile_mask = (255 - orange_mask).astype(np.uint8)
 
-        # Pad so cells that touch the image edge become bounded by an outer
-        # orange ring instead of merging with the "outside" component.
+        # Pad so border-touching cells get bounded by the padded ring.
         PAD = 5
         tile_padded = cv2.copyMakeBorder(
             tile_mask, PAD, PAD, PAD, PAD,
@@ -978,7 +981,7 @@ class VoronoiToCsv(_MosaicToCsv):
             cv2.BORDER_CONSTANT, value=(255, 102, 0),
         )
 
-        self.statusBar().showMessage("Detecting polygons from orange lines...")
+        self.statusBar().showMessage("Detecting cells from line drawing...")
         QApplication.processEvents()
 
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -998,7 +1001,6 @@ class VoronoiToCsv(_MosaicToCsv):
             y0 = int(stats[lid, cv2.CC_STAT_TOP])
             ww = int(stats[lid, cv2.CC_STAT_WIDTH])
             hh = int(stats[lid, cv2.CC_STAT_HEIGHT])
-            # Drop the outer ring (any component reaching the padded edge).
             if x0 == 0 or y0 == 0 or x0 + ww == pw or y0 + hh == ph:
                 continue
             sub_mask = (labels[y0:y0 + hh, x0:x0 + ww] == lid).astype(np.uint8) * 255
@@ -1022,15 +1024,66 @@ class VoronoiToCsv(_MosaicToCsv):
             mean_rgb = (cell_pixels.mean(axis=0) / 255.0).tolist()
             tiles.append((pts, tuple(mean_rgb)))
 
+        if not tiles:
+            QMessageBox.warning(
+                self, "No polygons",
+                "Connected-components found no cells. Either the line "
+                "drawing is empty / disconnected, or every cell is smaller "
+                "than Min tile area. Try lowering Min tile area.",
+            )
+            self.statusBar().showMessage("No polygons detected.")
+            self._update_buttons()
+            return
+
+        # ===== Step 2: refine polygon vertices to nearby control points =====
+        # The contour vertices from connectedComponents are pixel-grid
+        # positions on the rasterised line. Replace each with the nearest
+        # control point from any polyline (within tolerance) so the saved
+        # polygons share their vertices with the user's vector edits.
+        all_cps = []
+        for pl in self.polylines:
+            for p in pl:
+                all_cps.append((float(p[0]), float(p[1])))
+        if all_cps:
+            cps_arr = np.array(all_cps, dtype=np.float64)
+            # Snap tolerance ~3× line width with an 8-px floor (so thin
+            # lines still have a comfortable snap radius).
+            snap_tol = max(8.0, float(line_w) * 3.0)
+            snap_tol_sq = snap_tol * snap_tol
+            refined_tiles = []
+            for poly_pts, color in tiles:
+                snapped_pts = []
+                last_pt = None
+                for x, y in poly_pts:
+                    dx = cps_arr[:, 0] - x
+                    dy = cps_arr[:, 1] - y
+                    d_sq = dx * dx + dy * dy
+                    idx = int(np.argmin(d_sq))
+                    if d_sq[idx] < snap_tol_sq:
+                        chosen = (float(cps_arr[idx, 0]), float(cps_arr[idx, 1]))
+                    else:
+                        chosen = (float(x), float(y))
+                    if last_pt is None or chosen != last_pt:
+                        snapped_pts.append(chosen)
+                        last_pt = chosen
+                # Strip a closing-duplicate that may have been introduced.
+                if (len(snapped_pts) >= 2
+                        and snapped_pts[0] == snapped_pts[-1]):
+                    snapped_pts.pop()
+                if len(snapped_pts) >= 3:
+                    refined_tiles.append((
+                        np.array(snapped_pts, dtype=np.float64), color,
+                    ))
+            tiles = refined_tiles
+
         self.tiles = tiles
         if not tiles:
             QMessageBox.warning(
                 self, "No polygons",
-                f"Found {int((orange_mask > 0).sum())} orange pixels but "
-                f"extracted zero polygons. Try lowering Min tile area or "
-                f"the simplify ε.",
+                "Vertex-snap collapsed every cell below 3 vertices. Try a "
+                "larger Min tile area or a smaller simplify ε.",
             )
-            self.statusBar().showMessage("No polygons detected.")
+            self.statusBar().showMessage("All cells collapsed under snap.")
             self._update_buttons()
             return
 
