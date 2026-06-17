@@ -55,8 +55,9 @@ PAINT_PROMPT_FILE = PROMPTS_DIR / "paint_ceramic.txt"
 # Add-lines prompt variants — user picks one from the toolbar combobox
 # before clicking "Add lines". The first entry is the default.
 LINES_PROMPT_OPTIONS: list[tuple[str, Path]] = [
-    ("Open",   PROMPTS_DIR / "add_voronoi_lines.txt"),
-    ("Closed", PROMPTS_DIR / "add_voronoi_lines_closed.txt"),
+    ("Open",       PROMPTS_DIR / "add_voronoi_lines.txt"),
+    ("Closed",     PROMPTS_DIR / "add_voronoi_lines_closed.txt"),
+    ("Even-area",  PROMPTS_DIR / "add_voronoi_lines_even_area.txt"),
 ]
 
 # Inherited toolbar widgets we want gone — they don't apply to this workflow.
@@ -155,10 +156,14 @@ class VoroniEditor(_PhotoEditor):
             self.lines_prompt_combo.addItem(label, str(path))
         self.lines_prompt_combo.setToolTip(
             "Which 'Add lines' prompt to send to Gemini:\n"
-            "  Open   — the original prompt (allows loose ends).\n"
-            "  Closed — strict prompt that requires every line endpoint "
+            "  Open      — the original prompt (allows loose ends).\n"
+            "  Closed    — strict prompt that requires every line endpoint "
             "to terminate at another line (T/X junction) or the image "
-            "frame; the network must be a fully-closed planar graph."
+            "frame; the network must be a fully-closed planar graph.\n"
+            "  Even-area — asks for a Voronoi tessellation where every "
+            "region has roughly the same area (max 2× ratio between "
+            "largest and smallest). Eyes / eyebrows remain single "
+            "regions; features are otherwise de-emphasised."
         )
 
         # Stretch input: after Add lines lands, lets the user horizontally

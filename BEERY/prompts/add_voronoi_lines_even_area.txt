@@ -1,0 +1,40 @@
+The supplied image is a REFERENCE — use it to figure out WHERE to anchor the Voronoi cells (so the resulting tessellation respects the subject's major features). Your output is NOT the input with lines on top; your output is JUST the line network — pure-orange (#FF6600) lines on a pure-black (#000000) background, sized to match the input's aspect ratio.
+
+YOUR ONLY TASK: produce an image that contains ONLY the orange line network and a black background. Nothing else.
+
+Output content rules:
+- BACKGROUND: PURE BLACK (#000000) everywhere except where a line pixel sits. Every non-line pixel is exactly black, no gradient, no noise, no faint colour.
+- LINE NETWORK: PURE ORANGE (#FF6600), thin (1-2 px), solid, sharp.
+- DO NOT show any of the input image content in the output. NO face, NO hair, NO clothing, NO background scenery, NO colours from the input. The reference image is used ONLY to decide line PLACEMENT — none of its pixels appear in the output.
+- The output is a graphic line-art layer on black, period.
+
+EQUAL-AREA RULE — THIS IS THE PRIMARY GOAL OF THIS PROMPT:
+- Every region the orange lines enclose must have ROUGHLY THE SAME AREA as every other region. The aim is an even tessellation where each "tile" is approximately the same size in pixels.
+- Imagine the image is going to be cut into physical mosaic pieces of equal weight — that is the target.
+- Target cell count: 30-60 regions across the whole picture. Pick a count that gives a clean even tessellation given the image's aspect ratio.
+- Maximum tolerance: the LARGEST region must be no more than 2× the area of the SMALLEST region. Better if it is much tighter (1.5× or less). NEVER a region that is 3× or more the size of its smallest neighbour.
+- Achieve this by placing the seed points of the Voronoi diagram on a roughly even grid (with small jitter so the result looks organic, not gridded), THEN drawing the Voronoi cell boundaries. Do NOT pack many small cells in one area and a few big cells elsewhere.
+- Cell shape may vary (hexagons, pentagons, irregular quadrilaterals are all fine) — only the AREA must be roughly equal across cells.
+- Self-check #1 (area uniformity): mentally estimate the area of every region. Compare the largest to the smallest. If the ratio exceeds 2:1, you have failed; redo the seed-point placement more evenly before emitting the output.
+
+Feature awareness (SECONDARY to equal-area):
+- The reference image's strong feature contours (face outline, jawline, eye, lip, nostril, hairline, neck) MAY influence the local position of cell boundaries by ±10-20% of a cell's diameter — to make the result less gridded and more aesthetic. They DO NOT override the equal-area requirement.
+- EYES AND EYEBROWS MUST EACH BE A SINGLE INTACT REGION. Each eye (eye-white + iris + pupil + eyelid + lash line in the reference) is ONE region — no line crosses through the interior of an eye or eyebrow; lines only run AROUND them. Two eyes → exactly two eye regions; two eyebrows → exactly two eyebrow regions. The eye / eyebrow regions are the ONLY regions that may deviate noticeably from the equal-area target (they can be SMALLER than the mean, never larger).
+- Apart from the eye / eyebrow exception above, do NOT shape cells to follow features — keep them as close to equal-area as possible even when crossing contours.
+- Regions extend to the image border; lines that touch the border end exactly at the frame edge.
+
+Line specification — pure orange vector lines:
+- The lines must look MECHANICAL / VECTOR / DIGITAL — perfectly uniform width, perfectly sharp edges, perfectly solid colour. Think Illustrator pen-tool stroke.
+- Colour: PURE ORANGE (#FF6600) and ONLY pure orange. Solid, uniform, no transparency, no gradient, no anti-aliasing softness, no colour variation along the line. Every line pixel is #FF6600; every non-line pixel is #000000.
+- Width: AS THIN AS POSSIBLE — ideally 1 pixel wide, never more than 2 pixels.
+- THE ORANGE LINES MUST BE SOLID AND CONTINUOUS — NEVER BROKEN, NEVER INTERRUPTED, NEVER DASHED, NEVER FADED. Every region is fully outlined by an unbroken closed loop of pure-orange pixels.
+- Hard transition from orange line pixel to black background pixel — no anti-aliasing, no blur, no glow, no halo. Two-colour image only: #FF6600 (lines) and #000000 (background).
+
+Output dimensions:
+- Match the input image's aspect ratio EXACTLY so the line positions register pixel-for-pixel with the reference. Do NOT crop, do NOT pad, do NOT force the output to be square or to any specific dimensions.
+- Output must be SHARP at full resolution.
+
+Final self-check before emitting the image:
+- Only two colours appear in the entire output: pure orange (#FF6600) and pure black (#000000). Any other colour means failure — redo.
+- Largest region area ÷ smallest region area ≤ 2.0 (ignoring the dedicated eye / eyebrow regions, which may be smaller). If this ratio exceeds 2.0, you have failed; redo with more evenly-placed seed points before emitting.
+- Total region count is between 30 and 60.
