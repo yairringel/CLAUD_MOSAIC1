@@ -1,0 +1,42 @@
+The supplied image is a REFERENCE — use it to figure out WHERE the Voronoi lines should go (which features to follow). Your output is NOT the input with lines on top; your output is JUST the line network — pure-orange (#FF6600) lines on a pure-black (#000000) background, sized to match the input's aspect ratio.
+
+YOUR ONLY TASK: produce an image that contains ONLY the orange line network and a black background. Nothing else.
+
+Output content rules:
+- BACKGROUND: PURE BLACK (#000000) everywhere except where a line pixel sits. Every non-line pixel is exactly black, no gradient, no noise, no faint colour.
+- LINE NETWORK: PURE ORANGE (#FF6600), thin (1-2 px), solid, sharp.
+- DO NOT show any of the input image content in the output. NO face, NO hair, NO clothing, NO background scenery, NO colours from the input. The reference image is used ONLY to decide line PLACEMENT — none of its pixels appear in the output.
+- The output is a graphic line-art layer on black, period.
+
+CLOSURE RULES — THIS IS THE MOST IMPORTANT PART OF THIS PROMPT:
+- The line network must be a CLOSED PLANAR GRAPH. Every line is an EDGE bounding a polygon — never a free-standing curve.
+- NO LOOSE ENDS. NO DANGLING SEGMENTS. NO DEAD-END BRANCHES. Every line endpoint MUST terminate at one of: (a) another line, forming a T-junction or X-junction (= a graph vertex of degree ≥ 3); or (b) the image frame edge. Never anywhere else.
+- If you start drawing a line, you MUST close it — either by connecting it to another existing line, or by extending it all the way to the image border. A line that just "stops" inside the picture is a failure.
+- NO partial divisions. NO half-finished cells. NO line that protrudes into a region without closing back. Every region must be FULLY enclosed by lines on every side.
+- A line that branches off a junction (e.g. a Y or T) must itself terminate at another junction or at the frame — branches cannot dead-end either.
+- Self-check #1 (closure): scan the entire output. Find every pixel that is on a line AND has exactly ONE orange neighbour pixel — i.e. a line endpoint. The ONLY places such pixels may exist are: ON the image frame edge (top / bottom / left / right border row of the image). If you find a line endpoint anywhere in the interior of the image, you have failed; you must redo the drawing and close that end before producing the output.
+- Self-check #2 (fully-bounded regions): every black region between the lines must be a CLOSED polygon — pick any black pixel and trace an outward path; you must hit an orange line on every direction (up / down / left / right and diagonally). No black region "leaks" into another black region across a gap.
+
+Line layout — Voronoi cells following the REFERENCE image's features:
+- Draw 30-60 thin orange lines that subdivide the picture area into Voronoi-like regions.
+- Each region is LARGE — comparable to the size of a fist on the picture's scale, not a fingernail. 30-60 cells across the whole picture is the target.
+- The layout is a HYBRID between Voronoi cells and the REFERENCE image's natural contours: where a strong feature line runs in the reference (face outline, jawline, eye, lip, nostril, hairline, hair-flow lock, neck, drapery fold, hand silhouette), a line follows that feature; in flatter, featureless regions (cheek, forehead, background, sky), the layout falls back to Voronoi-like polygonal boundaries.
+- A region must NEVER straddle a strong feature in the reference — if a feature crosses, place a line ON that feature instead.
+- EYES AND EYEBROWS MUST EACH BE A SINGLE INTACT REGION. Each eye (eye-white + iris + pupil + eyelid + lash line in the reference) is ONE region — no line crosses through the interior of an eye or eyebrow; lines only run AROUND them. Two eyes → exactly two eye regions; two eyebrows → exactly two eyebrow regions.
+- Regions extend to the image border; lines that touch the border end exactly at the frame edge (this is the ONLY permissible kind of "end" — see CLOSURE RULES).
+
+Line specification — pure orange vector lines:
+- The lines must look MECHANICAL / VECTOR / DIGITAL — perfectly uniform width, perfectly sharp edges, perfectly solid colour. Think Illustrator pen-tool stroke.
+- Colour: PURE ORANGE (#FF6600) and ONLY pure orange. Solid, uniform, no transparency, no gradient, no anti-aliasing softness, no colour variation along the line. Every line pixel is #FF6600; every non-line pixel is #000000.
+- Width: AS THIN AS POSSIBLE — ideally 1 pixel wide, never more than 2 pixels.
+- THE ORANGE LINES MUST BE SOLID AND CONTINUOUS — NEVER BROKEN, NEVER INTERRUPTED, NEVER DASHED, NEVER FADED. Every region is fully outlined by an unbroken closed loop of pure-orange pixels.
+- Hard transition from orange line pixel to black background pixel — no anti-aliasing, no blur, no glow, no halo. Two-colour image only: #FF6600 (lines) and #000000 (background).
+
+Output dimensions:
+- Match the input image's aspect ratio EXACTLY so the line positions register pixel-for-pixel with the reference. Do NOT crop, do NOT pad, do NOT force the output to be square or to any specific dimensions.
+- Output must be SHARP at full resolution.
+
+Final self-check before emitting the image:
+- Only two colours appear in the entire output: pure orange (#FF6600) and pure black (#000000). Any other colour means failure — redo.
+- Every line endpoint is either at a T/X junction with another line OR on the image frame border. No interior endpoints exist. Any interior endpoint means failure — redo and close that end.
+- Every black region is fully bounded by lines on every side. No black region leaks into a neighbour. Any leak means failure — redo and close the gap.

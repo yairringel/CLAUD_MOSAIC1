@@ -1,0 +1,39 @@
+Convert the supplied reference image into a REALISTIC HAND-PAINTED rendering on a continuous ceramic surface — the WHOLE OUTPUT IMAGE IS THE CERAMIC SURFACE, edge to edge. The picture occupies 100% of the frame.
+
+THE OUTPUT FRAME IS THE PAINTING. There is NO ceramic "plate" or "tile" as a discrete object inside the frame, NO surrounding wall / table / background outside the surface, NO drop shadow under anything, NO bezel, NO edge of any kind. You are looking AT the painted surface, not at a plate sitting on something. The viewer cannot tell where the surface ends because the surface fills the entire output.
+
+THE PICTURE ITSELF IS A REAL OIL PAINTING. Render the subject with STRONG, OBVIOUS painterly character — the kind of painting where the viewer immediately sees the painter's hand on the surface. The output MUST read clearly as "an oil painting of the subject", not "a photograph". A casual viewer should not mistake the result for a photo even for a moment.
+
+Style reference: expressive realism in the tradition of John Singer Sargent, Joaquín Sorolla, Anders Zorn, Cecilia Beaux, or a confident contemporary realist oil painter with visible, gestural brushwork. NOT impressionist (subject must stay recognisable), NOT abstract, NOT cartoony, NOT digital airbrush. Real oil painting, with the look and feel of pigment moved by a brush on a flat ceramic ground.
+
+USE THE WHOLE INPUT IMAGE. The painting must include EVERYTHING that appears in the input image — the subject AND the background. Whatever the input background is (sky, wall, drapery, plain colour, blurred bokeh, anything), it gets rendered as part of the same painting on the same ceramic surface. DO NOT invent a new background. DO NOT replace the input background with a "plate sitting on a table" or any other framing context. The output composition is exactly the input composition, rendered as a painting.
+
+Painting style — VISIBLE painterly character EVERYWHERE EXCEPT THE FACE:
+- THE FACE IS THE EXCEPTION. Faces and facial features (skin, eyes, lashes, brows, lips, nostrils, teeth, the curve of the cheek and jaw) are rendered with SMOOTH, PLEASING, REFINED painted technique — soft skin tones, careful gradient transitions, no crude or visible individual brushstrokes. The face still reads as PAINTED (not photo-real airbrushed plastic), but the brushwork there is so fine and blended that the eye glides over the skin. Think the polished skin technique of Bouguereau, Ingres, the smoothest portions of Sargent's portrait faces — refined, pleasing, painterly but not crude. Facial features (eye shape, lip shape, nose, expression) must be precise and beautiful. The subject should look attractive, not crude.
+- Hair, clothing, drapery, background, accessories, hands, and any non-facial area — VISIBLE EXPRESSIVE BRUSHWORK. Brushstrokes clearly seen, following form (hair has hair-shaped strokes, drapery has draped strokes, flat backgrounds have broader gestural strokes). Subtle IMPASTO in highlights and accents on these non-facial areas, thinner washes in shadows. Visible brush direction following form.
+- Soft, MIXED colour transitions instead of photographic crispness across the whole painting. Edges between forms are PAINTED edges — slightly soft, broken, with brushstroke character — never pixel-sharp photographic edges. Mid-tone halos and lost edges are welcome where the painter would naturally place them.
+- Slight painter's COLOUR HARMONY: colours may be lightly simplified, warmed/cooled in unison, or grouped into a tighter palette the way an oil painter would mix on a palette. Do NOT change the subject's true colour identity — just temper it with painter-like restraint.
+- The subject remains RECOGNISABLE and proportionally accurate — REALIST painting, not impressionist abstraction. Eyes, lips, key facial landmarks stay CLEAR, PRECISE, and PLEASING.
+- Do NOT photo-realise, do NOT posterise / cartoonise, do NOT repaint into an abstract style. Real oil painting, confident brush in the non-facial areas, refined smooth painted skin on the face.
+- Hard rule: NEVER crude / chunky / jagged brush marks on a face. If the face has visible individual brushstrokes that read as "crude", you've failed.
+
+Material — one continuous ceramic surface filling the whole frame:
+- The whole output reads as a flat painted ceramic surface that fills the frame edge-to-edge. The surface IS the image; there is no "object" inside the image.
+- ZERO visible edge of any ceramic object, ZERO bezel, ZERO border, ZERO surrounding wall / table / background, ZERO drop shadow, ZERO indication of where the surface ends.
+- The surface is FLAT and MATTE-looking. NO highlights of any kind:
+    * NO gloss reflections, NO satin sheen, NO specular hot spots
+    * NO surface reflectivity variation, NO catch-lights, NO glare
+    * NO bevel, NO edge rounding anywhere
+    * NO craquelure, NO crack lines
+    * NO indication that the ceramic is shiny or reflective
+- Lighting is perfectly diffuse and perfectly even — like the painting is photographed under a soft overhead light with no directionality. No shadows on the surface itself (the painting can depict shadows that exist within the input subject, but the ceramic surface itself receives flat lighting).
+- ABSOLUTELY NO mosaic, NO tiles, NO grout, NO gaps, NO physical separation between regions, NO dividing lines anywhere. The surface is one unbroken painted picture.
+
+NO LINES. Do not draw any dividing lines, mosaic separators, Voronoi cells, grid lines, or graphic overlays on the painting. The output is JUST the painting on the unbroken ceramic surface.
+
+Camera:
+- Match the input image's framing, perspective, and orientation EXACTLY. Do not change crop, rotate, or change perspective. The output is the input subject AND its original background re-rendered as a realistic painting on a continuous ceramic surface.
+
+Output dimensions:
+- Match the input image's aspect ratio EXACTLY. Do NOT crop, do NOT pad, do NOT force the output to be square or to any specific dimensions.
+- Output must be SHARP at full resolution.
