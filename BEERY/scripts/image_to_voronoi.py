@@ -106,6 +106,16 @@ class VoronoiPuzzleEditor(_PhotoEditor):
         )
         self.orange_btn.clicked.connect(self.orange_line)
 
+        self.no_line_btn = QPushButton("No line")
+        self.no_line_btn.setToolTip(
+            "Optional step: send the CURRENT RESULT image (not the source!) "
+            "back to Gemini asking it to remove every dividing line and "
+            "inpaint over the gaps. The model keeps everything else "
+            "identical — same cells, same colours, same composition — just "
+            "without the line network."
+        )
+        self.no_line_btn.clicked.connect(self.no_line)
+
         self.convert_csv_btn = QPushButton("Convert to CSV")
         self.convert_csv_btn.setToolTip(
             "Use the ORANGE dividing lines in the result image to detect "
@@ -119,6 +129,7 @@ class VoronoiPuzzleEditor(_PhotoEditor):
         main_toolbar = self._toolbar_containing(self.save_res_btn)
         if main_toolbar is not None:
             main_toolbar.addWidget(self.orange_btn)
+            main_toolbar.addWidget(self.no_line_btn)
             main_toolbar.addWidget(self.convert_csv_btn)
 
         self._auto_load_default_prompt()
@@ -227,11 +238,13 @@ class VoronoiPuzzleEditor(_PhotoEditor):
 
 
     def _on_worker_done(self) -> None:
-        """Reset orange_btn label after the API worker finishes (parent
+        """Reset our extra-button labels after the API worker finishes (parent
         already resets generate_btn / background_btn / expand_btn)."""
         super()._on_worker_done()
         if hasattr(self, "orange_btn"):
             self.orange_btn.setText("Orange line")
+        if hasattr(self, "no_line_btn"):
+            self.no_line_btn.setText("No line")
 
     # ----- second-pass recolour: black lines → orange lines ---------------
 
@@ -293,6 +306,72 @@ class VoronoiPuzzleEditor(_PhotoEditor):
 
         self.statusBar().showMessage("Orange-line pass: recolouring black → orange...")
         self.orange_btn.setText("Orange line (running)")
+        self.generate_btn.setText("Generating...")
+        self._update_button_states()
+
+    # ----- second-pass: remove the dividing lines -------------------------
+
+    def no_line(self) -> None:
+        """Send the CURRENT RESULT image (which already has dividing lines)
+        back to Gemini, asking it to remove every dividing line and inpaint
+        seamlessly over the gaps. Input is the result pane, NOT the original
+        source — so the picture's framing / cell colours / ceramic feel from
+        the generation step are preserved exactly, only the line network is
+        removed."""
+        if self.result_pane.pil_image is None:
+            QMessageBox.information(
+                self, "No result image",
+                "Run Generate first to produce a Voronoi panel. Then click "
+                "No line to ask the model to inpaint over the dividing lines.",
+            )
+            return
+        if load_api_key() is None:
+            QMessageBox.critical(
+                self, "API key missing",
+                "No Gemini API key found.\n\n"
+                "Set the GEMINI_API_KEY env var, or click 'Choose Key "
+                "File...' to point at a key file.",
+            )
+            return
+
+        src = self.result_pane.pil_image.convert("RGB")
+        prompt = (
+            "The supplied image is a Voronoi panel with a network of thin "
+            "dividing lines (black, orange, or red) marking the shape "
+            "boundaries of the picture.\n\n"
+            "YOUR ONLY TASK: REMOVE EVERY DIVIDING LINE from the image. "
+            "Inpaint seamlessly across each gap so the picture looks "
+            "continuous, as if the lines were never there. Do nothing else.\n"
+            "\n"
+            "Rules:\n"
+            "- EVERY pixel that is currently part of a dividing line (any "
+            "line colour: black, orange, red, or otherwise) must be REPLACED "
+            "by the colour and content of the surrounding cell, blending "
+            "smoothly with adjacent cells so the join is invisible.\n"
+            "- EVERY OTHER PIXEL must remain IDENTICAL to the input — same "
+            "cells, same colours, same composition, same framing, same "
+            "lighting, same ceramic / stone surface character. Do not "
+            "restyle, recolour, redraw, or reshape any cell.\n"
+            "- The output is the input image with the line network erased "
+            "and inpainted — nothing added, nothing else changed.\n"
+            "- No new lines, no new edges, no new shapes, no new colours.\n"
+            "Output: a 4K (or matching aspect) image showing the same "
+            "picture as the input but with the dividing lines invisibly "
+            "removed."
+        )
+
+        aspect = closest_aspect_ratio(src.width, src.height)
+        self.worker = GenerationWorker(
+            src, prompt, DEFAULT_MODEL, aspect_ratio=aspect,
+        )
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished_ok.connect(self._on_generated)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.finished.connect(self._on_worker_done)
+        self.worker.start()
+
+        self.statusBar().showMessage("No-line pass: erasing dividing lines...")
+        self.no_line_btn.setText("No line (running)")
         self.generate_btn.setText("Generating...")
         self._update_button_states()
 

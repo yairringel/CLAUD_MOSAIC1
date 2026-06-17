@@ -1,0 +1,68 @@
+Convert the supplied reference image into a REALISTIC HAND-PAINTED rendering on a continuous ceramic surface — the WHOLE OUTPUT IMAGE IS THE CERAMIC SURFACE, edge to edge. The picture occupies 100% of the frame, with 30-60 thin SOLID ORANGE lines drawn DIRECTLY ON the surface marking where the picture is conceptually subdivided into Voronoi-like regions.
+
+The orange lines are DIGITAL VECTOR LINES, not painted brushwork. The painting underneath is hand-painted; the lines OVER it are crisp, mechanical, computer-drawn solid orange — like a vector graphic overlaid on a photo of a painting. The painting and the line layer are two distinct visual languages: the painting is painterly, the lines are vector-graphic.
+
+THE OUTPUT FRAME IS THE PAINTING. There is NO ceramic "plate" or "tile" as a discrete object inside the frame, NO surrounding wall / table / background outside the surface, NO drop shadow under anything, NO bezel, NO edge of any kind. You are looking AT the painted surface, not at a plate sitting on something. The viewer cannot tell where the surface ends because the surface fills the entire output.
+
+THIS IS NOT A PUZZLE OR MOSAIC. There are NO separate pieces, NO gaps, NO grout, NO physical cuts. The painting flows continuously across the lines — the lines lie ON TOP of the painting; they do not divide it into separate pieces.
+
+USE THE WHOLE INPUT IMAGE. The painting must include EVERYTHING that appears in the input image — the subject AND the background. Whatever the input background is (sky, wall, drapery, plain colour, blurred bokeh, anything), it gets rendered as part of the same painting on the same ceramic surface. DO NOT invent a new background. DO NOT replace the input background with a "plate sitting on a table" or any other framing context. The output composition is exactly the input composition, rendered as a painting.
+
+THE PICTURE ITSELF IS A REALISTIC PAINTING, NOT A PHOTOGRAPH. Render the subject as if a skilled painter had captured it in oil on porcelain — realistic likeness, faithful colours, accurate proportions, but with the look of HAND-PAINTED work: gentle brushwork texture, softly mixed colour transitions, painterly edges (not razor-sharp photographic ones), and the slight depth of painted layers. Style reference: fine realistic oil painting in the tradition of Sargent, Vermeer, or a modern photorealistic oil painter — never impressionist, never abstract, never cartoony, never stylised. The result should make a viewer think "that's a painting of the subject", not "that's the photo with a filter".
+
+The line layout is a HYBRID between Voronoi cells and the image's natural contours: where a strong feature line runs (face outline, jawline, eye, lip, nostril, hairline, hair-flow lock, neck, drapery fold, hand silhouette), a surface line follows that feature; in flatter, featureless regions (cheek, forehead, background, sky), the layout falls back to Voronoi-like polygonal boundaries.
+
+Composition — feature-following line layout (LARGE regions):
+- The surface lines divide the picture into 30-60 contiguous regions ONLY. Each region is LARGE — comparable to the size of a fist on the picture's scale, not a fingernail. Do NOT subdivide into many small regions.
+- Each region is bounded by Voronoi-like irregular polygonal boundaries with 4-8 mostly-straight line segments (slight gentle curves allowed where they trace a feature).
+- Regions are sized roughly evenly across the panel — no region dramatically larger or smaller than its neighbours.
+- Self-check: count the regions along one row across the widest part of the image. If that count exceeds 8-10, you have made the regions too small and must redo with fewer, bigger regions.
+- WHERE A FEATURE LINE EXISTS, ALIGN A SURFACE LINE TO IT. Specifically, surface lines should run along: the outline of the face, the jawline and chin, each eye's outline, each lip's outline, the line of the nostrils, the hairline, individual locks / waves of hair, the neck and collarbone, the shoulders, fabric folds. A region must never STRADDLE a strong feature — if a feature crosses, place a surface line ON that feature instead.
+- EYES AND EYEBROWS MUST EACH BE A SINGLE INTACT REGION. Each eye (eye-white + iris + pupil + eyelid + lash line, taken together) is ONE region — do NOT subdivide it. Each eyebrow is ONE region — do NOT subdivide it. No surface line ever runs through the inside of an eye or eyebrow; surface lines only run AROUND them. Two eyes → exactly two eye regions (one each). Two eyebrows → exactly two eyebrow regions (one each).
+- WHERE NO STRONG FEATURE EXISTS (flat cheek, background, sky, plain fabric), the layout reverts to Voronoi-like irregular polygons of similar size.
+- The result reads as part-Voronoi, part-feature-aware: the major lines of the subject ARE visible as surface lines, but the in-between areas look like a Voronoi pattern.
+
+Surface content — REALISTIC PAINTING on the ceramic surface:
+- The picture is RENDERED AS A PAINTING. Visible painterly character: brushwork texture in larger areas, soft mixed colour transitions, painted edges (not razor-sharp photographic edges). The subject still has accurate likeness, proportions, and colours from the input image — this is REALISTIC painting, not stylised.
+- The painting flows continuously across the surface lines. From cell to cell the image content connects seamlessly — only the thin orange vector line is drawn on top.
+- Do NOT flatten regions to a single solid colour. Do NOT posterise, cartoonise, or repaint into a different style. The painting carries gradient, tone, depth, and recognisable subject detail.
+- Do NOT add visible brushstroke patterns so heavy that they obscure facial features or other recognisable detail. Brushwork stays SUBTLE — a finishing layer, not the main visual element.
+- COLOURS MUST STAY UNIFIED AND COHERENT across the panel. Every region's colour must come faithfully from the underlying image — no region jumps out as an OUTLIER with a wrong colour. Neighbouring regions must have related colours that flow into each other; the only colour breaks allowed are the ones the input image itself has.
+- Self-check: scan the output for any single region whose colour clearly doesn't match what's in the same area of the input. If you can find one, you have failed this rule.
+
+Material — one continuous ceramic surface filling the whole frame:
+- The whole output reads as a flat painted ceramic surface that fills the frame edge-to-edge. The surface IS the image; there is no "object" inside the image.
+- ZERO visible edge of any ceramic object, ZERO bezel, ZERO border, ZERO surrounding wall / table / background, ZERO drop shadow, ZERO indication of where the surface ends. The viewer cannot tell where the surface ends because the surface ends only where the output frame ends.
+- The surface is FLAT and MATTE-looking. No highlights of any kind:
+    * NO gloss reflections, NO satin sheen, NO specular hot spots
+    * NO surface reflectivity variation, NO catch-lights, NO glare
+    * NO bevel, NO edge rounding around the orange lines
+    * NO craquelure, NO crack lines
+    * NO indication that the ceramic is shiny or reflective
+- Lighting is perfectly diffuse and perfectly even across the entire panel — like the painting is photographed under a soft overhead light with no directionality. No shadows in or on the surface itself (the painting can depict shadows that exist within the input subject, but the ceramic surface itself receives flat lighting).
+- ABSOLUTELY NOT a mosaic of separate tiles. NO grout, NO gaps, NO physical separation between regions. Just one continuous ceramic surface with thin orange vector lines drawn ON IT.
+
+Surface lines — the THIN PURE-ORANGE VECTOR shape markings:
+- Draw thin pure-orange lines DIRECTLY ON THE PAINTED CERAMIC SURFACE, marking the Voronoi-like shape divisions of the picture. These are DIGITAL VECTOR LINES overlaid on the painting — like a graphic-design vector layer on top of a photographed oil painting. They are NOT painted, NOT brushwork, NOT ink absorbed into the glaze, NOT physical cuts, NOT grout.
+- The lines must look MECHANICAL / VECTOR / DIGITAL — perfectly uniform width, perfectly sharp edges, perfectly solid colour. NEVER painterly, NEVER textured, NEVER showing brush direction or paint thickness. Think Illustrator pen-tool stroke, not artist's brush.
+- Color: PURE ORANGE (#FF6600) and ONLY pure orange. Solid, uniform, no transparency, no gradient, no anti-aliasing softness, no colour variation along the line. Every line pixel is #FF6600; every adjacent painted-surface pixel is non-orange.
+- Width: AS THIN AS POSSIBLE — ideally 1 pixel wide, never more than 2 pixels. The thinner the better. A single-pixel clean line is the goal.
+- THE ORANGE LINES MUST BE SOLID AND CONTINUOUS — NEVER BROKEN, NEVER INTERRUPTED, NEVER DASHED, NEVER FADED. Every region is fully outlined by an unbroken closed loop of pure-orange pixels. No dashes, no dots, no gaps, no breaks, no fades, no thin spots that fall below 1 px, no places where the line is interrupted by an underlying painted feature. Self-check: a single connected pure-orange skeleton across the whole panel.
+- Hard transition from orange line pixel to painted-surface pixel — no AA, no soft edges, no blended pixel ever.
+
+Line edges:
+- Line-to-surface transitions are SHARP — no anti-aliasing softness around the orange lines, no blur, no glow, no halo. The hard pixel transition from painted-surface pixel to pure-orange-line pixel must be crisp so the detection pipeline can extract the lines cleanly.
+- The orange lines are FLAT VECTOR MARKS ON THE SURFACE — no bevel, no edge rounding, no implication of physical separation between regions, no painted texture inside them. They lie ON the ceramic as a graphic overlay, not painted INTO it.
+
+Composition and complete coverage:
+- The painted ceramic surface fills the frame edge-to-edge. The viewer cannot tell where the surface ends — it ends only at the output frame.
+- EVERY pixel of the output is either the painted ceramic surface (including the painted background of the input image) or a pure-orange surface-line pixel. NO pixel shows the edge of a ceramic object, drop shadow, frame, table, wall, or anything outside the surface.
+- The input image's background — whatever it is — is part of the painting and occupies the same regions of the ceramic surface that it occupies in the input. Do not crop, recompose, or replace it.
+- Regions along the image border are clipped by the frame — their outer line boundaries align with the frame. The line at the very edge of the frame is itself solid and unbroken, like the inner lines.
+
+Camera:
+- Match the input image's framing, perspective, and orientation EXACTLY. Do not change crop, rotate, or change perspective. The output is the input image (subject AND its original background) re-rendered as a realistic painting on a continuous ceramic surface, with the surface lines overlaid.
+
+Output resolution (mandatory):
+- Render the result at 4K (3840 × 3840 px). Do not downscale.
+- Output must be sharp at full 4K so the polygon-detection pipeline can extract every region as a clean polygon.
