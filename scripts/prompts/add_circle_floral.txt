@@ -1,0 +1,24 @@
+The supplied image has TWO ORANGE (#FF6600) CIRCLES drawn on it — a smaller inner circle and a larger outer circle, both concentric. Between them is an ANNULAR RING.
+
+Your task: fill ONLY that annular ring with a CONTINUOUS FLORAL VINE decorative pattern. The rest of the image can be anything — we will composite the ring pixels back onto the original locally, so what happens outside the ring is not important.
+
+Pattern specification — FLORAL VINE:
+- Sinuous vine winding around the ring's midline, with leaves branching outward alternately on either side.
+- Stylised small flowers (rosettes, buds, or 4-6-petal blossoms) at regular intervals along the vine.
+- Follows the circular curvature — the vine's main axis bends smoothly around the ring so the whole motif curves with the circle.
+- The vine + leaves + flowers together FILL the ring width — leaves extend outward to touch both the inner and outer boundaries.
+- CONTINUOUS unbroken vine around the entire circumference — the two ends meet seamlessly, no visible seam.
+- The two orange guide circles disappear in the output — the ring is filled with the vine only.
+
+Style — decorative ceramic mosaic:
+- STYLISED / DECORATIVE — clean silhouettes for each leaf and flower, deliberate flat colour choices, no painterly softness, no anti-aliasing blur.
+- HIGH CONTRAST between the vine motif and the ring background so the pattern reads clearly.
+- Colour palette suited to a ceramic mosaic (earthy greens, terracotta, cream, muted blues) — not garish.
+
+Output dimensions:
+- Match the input image's aspect ratio and resolution EXACTLY.
+
+Self-check before emitting:
+- The vine fills the ring COMPLETELY around the entire circumference (360°).
+- The vine is continuous — no visible seam where the two ends meet.
+- No orange guide circles remain in the output.

@@ -1,0 +1,24 @@
+The supplied image has TWO ORANGE (#FF6600) CIRCLES drawn on it — a smaller inner circle and a larger outer circle, both concentric. Between them is an ANNULAR RING.
+
+Your task: fill ONLY that annular ring with a TWISTED ROPE / CABLE decorative pattern. The rest of the image can be anything — we will composite the ring pixels back onto the original locally, so what happens outside the ring is not important.
+
+Pattern specification — TWISTED ROPE:
+- Two (or three) strands twisting around each other along the ring's midline, forming a helical rope motif.
+- Consistent twist rate and rope thickness — the rope fills the ring's radial width, hugging both the inner and outer circle boundaries.
+- Clear shadow / dark line between the twisted strands so the twist reads unambiguously — the viewer must be able to see WHICH strand goes OVER at each crossing.
+- The rope's main axis follows the ring's circumference — the whole rope curves around the circle.
+- CONTINUOUS unbroken twist around the entire circumference — no gaps, no fades, no thin/thick stretches, no missed twists.
+- The two orange guide circles disappear in the output — the ring is filled with the rope only.
+
+Style — decorative ceramic mosaic:
+- MECHANICAL / DECORATIVE quality — clean geometric strand outlines, sharp shadow lines between strands. No painterly softness, no photo-realistic frayed fibres, no anti-aliasing blur.
+- HIGH CONTRAST between the rope strands and the ring background so the twist reads clearly.
+- Consistent lighting direction across all crossings (e.g. always "left strand over" or always the same alternating pattern).
+
+Output dimensions:
+- Match the input image's aspect ratio and resolution EXACTLY.
+
+Self-check before emitting:
+- The rope fills the ring COMPLETELY around the entire circumference (360°).
+- The twist is continuous — no visible seam where the two ends meet.
+- No orange guide circles remain in the output.

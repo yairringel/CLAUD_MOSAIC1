@@ -1,0 +1,24 @@
+The supplied image has TWO ORANGE (#FF6600) CIRCLES drawn on it — a smaller inner circle and a larger outer circle, both concentric. Between them is an ANNULAR RING.
+
+Your task: fill ONLY that annular ring with a CONTINUOUS LAUREL WREATH decorative pattern. The rest of the image can be anything — we will composite the ring pixels back onto the original locally, so what happens outside the ring is not important.
+
+Pattern specification — LAUREL WREATH:
+- Overlapping laurel leaves running around the ring, each leaf oriented TANGENTIALLY to the circle so the wreath appears to flow around the circumference.
+- Natural pointed-oval leaf shapes with faint central veining, but rendered in a stylised decorative form (not photorealistic).
+- Leaves alternate slightly to either side of a central curved stem that follows the ring's midline.
+- The chain of leaves is CONTINUOUS around the entire ring — no gaps, no bare stretches, no thin/thick sections.
+- Optional small clusters of laurel berries at regular intervals for authentic detail.
+- The two orange guide circles disappear in the output — the ring is filled with the laurel wreath only.
+
+Style — decorative ceramic mosaic:
+- MECHANICAL / VECTOR quality where possible — clean, well-defined leaf silhouettes; sharp edges; NO painterly softness, NO anti-aliasing blur.
+- HIGH CONTRAST between the leaves and the ring background so the wreath reads clearly.
+- Radial thickness fills the ring width — the wreath touches both the inner and outer boundaries.
+
+Output dimensions:
+- Match the input image's aspect ratio and resolution EXACTLY.
+
+Self-check before emitting:
+- The laurel wreath fills the ring COMPLETELY around the entire circumference (360°).
+- The wreath is continuous — no visible seam where the two ends meet.
+- No orange guide circles remain in the output.

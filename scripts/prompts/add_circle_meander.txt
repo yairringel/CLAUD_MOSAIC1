@@ -1,0 +1,22 @@
+The supplied image has TWO ORANGE (#FF6600) CIRCLES drawn on it — a smaller inner circle and a larger outer circle, both concentric. Between them is an ANNULAR RING.
+
+Your task: fill ONLY that annular ring with a CLASSIC GREEK MEANDER (Greek key) decorative pattern. The rest of the image can be anything — we will composite the ring pixels back onto the original locally, so what happens outside the ring is not important.
+
+Pattern specification — GREEK MEANDER:
+- Interlocking rectangular hooks / steps that form a continuous key motif — parallel horizontal-then-vertical strokes that fold back on themselves in the classic meander shape.
+- The pattern's main axis follows the ring's circumference — segments bend smoothly around the circle so the meander travels ALONG the ring, not radially across it.
+- Uniform pattern density and scale around the entire circumference — no gaps, no fades, no thin/thick stretches, no spots where the pattern breaks or the motif changes.
+- The two orange guide circles disappear in the output — the ring is filled with the meander only.
+
+Style — decorative ceramic mosaic:
+- MECHANICAL / VECTOR quality — perfectly sharp strokes, straight axis-aligned segments, no painterly texture, no anti-aliasing softness.
+- HIGH CONTRAST between the pattern strokes and the ring background so the motif reads clearly (e.g. black strokes on a warm cream ring background, or dark terracotta on cream — pick tones that suit the input image but stay high-contrast).
+- Radial thickness of the meander should FILL the ring width — the pattern touches both the inner and outer boundaries.
+
+Output dimensions:
+- Match the input image's aspect ratio and resolution EXACTLY. Do NOT crop, do NOT pad, do NOT force a square output.
+
+Self-check before emitting:
+- The meander fills the ring COMPLETELY around the entire circumference (360°).
+- The pattern is continuous — no seam where the two ends of the ring meet.
+- No orange guide circles are visible in the output.
