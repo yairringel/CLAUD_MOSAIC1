@@ -1104,6 +1104,26 @@ class MainWindow(QMainWindow):
         self.move_polygons_chk.setToolTip("When checked, polygons and circles move together with the image")
         right_sidebar_layout.addWidget(self.move_polygons_chk)
 
+        # Move ONLY the polygon array — image stays put. Mutually exclusive
+        # with 'Move Polygons' so the two arrow behaviours never fight.
+        self.only_polygons_chk = QCheckBox("Only Polygons")
+        self.only_polygons_chk.setToolTip(
+            "When checked, arrows translate ONLY the polygons + circles; "
+            "the image stays in place. Use this to slide the polygon "
+            "array across a fixed image."
+        )
+        right_sidebar_layout.addWidget(self.only_polygons_chk)
+        # Enforce mutual exclusivity via toggled signals — checking one
+        # clears the other.
+        def _on_move_polys(checked):
+            if checked and self.only_polygons_chk.isChecked():
+                self.only_polygons_chk.setChecked(False)
+        def _on_only_polys(checked):
+            if checked and self.move_polygons_chk.isChecked():
+                self.move_polygons_chk.setChecked(False)
+        self.move_polygons_chk.toggled.connect(_on_move_polys)
+        self.only_polygons_chk.toggled.connect(_on_only_polys)
+
         grid_arrows_layout = QGridLayout()
         grid_arrows_layout.setSpacing(2)
 
@@ -1382,9 +1402,8 @@ class MainWindow(QMainWindow):
         step = self.grid_step_spin.value()
         delta_x = dx * step
         delta_y = dy * step
-        self.canvas.grid_offset_x += delta_x
-        self.canvas.grid_offset_y += delta_y
-        if self.move_polygons_chk.isChecked():
+        if self.only_polygons_chk.isChecked():
+            # Move ONLY the polygons + circles; leave the image put.
             for circ in self.canvas.circles:
                 circ[0] += delta_x
                 circ[1] += delta_y
@@ -1392,6 +1411,18 @@ class MainWindow(QMainWindow):
                 [(px + delta_x, py + delta_y) for px, py in poly]
                 for poly in self.canvas.polygons
             ]
+        else:
+            # Default: shift the image, optionally the polygons with it.
+            self.canvas.grid_offset_x += delta_x
+            self.canvas.grid_offset_y += delta_y
+            if self.move_polygons_chk.isChecked():
+                for circ in self.canvas.circles:
+                    circ[0] += delta_x
+                    circ[1] += delta_y
+                self.canvas.polygons = [
+                    [(px + delta_x, py + delta_y) for px, py in poly]
+                    for poly in self.canvas.polygons
+                ]
         self.canvas.update()
 
     def reset_grid_offset(self):
@@ -1503,13 +1534,25 @@ class MainWindow(QMainWindow):
         # ── Export selected tiles ──────────────────────────────────────────
         tile_size_mm = self.tile_size_spin.value()
         dpi          = self.dpi_spin.value()
-        # tile_size_mm is interpreted as the WIDTH; the export's pixel height
-        # follows the same grid aspect ratio as the on-screen cell.
+        # tile_size_mm is interpreted as the WIDTH. Height comes out of the
+        # per-crop `scale` below; we no longer need a fixed target_h since
+        # each tile's output is proportional to its (possibly bled) crop.
         target_w = int((tile_size_mm / 25.4) * dpi)
-        target_h = max(1, int(target_w / max(0.01, self.canvas.grid_aspect_ratio)))
         source_image  = (self.canvas.display_image
                          if self.canvas.display_image is not None
                          else self.canvas.cv_image)
+
+        # Bleed setup — each tile gets 10 mm of extra source content on
+        # every INTERIOR side (a side that has a neighbouring tile), so
+        # physical prints overlap by 10 mm at seams and small assembly
+        # errors don't leave visible gaps. Exterior sides (edges of the
+        # tile grid) get NO bleed — the print is trimmed flush there.
+        BLEED_MM = 10.0
+        # mm-per-source-px is uniform in both axes because target_w:cell_w
+        # equals target_h:cell_h (same grid aspect). We only need one value.
+        bleed_src_px = int(round(BLEED_MM * cell_w / max(1e-6, tile_size_mm)))
+        bleed_out_px = int(round(BLEED_MM * dpi / 25.4))
+        scale = target_w / max(1, cell_w)   # output-px per source-px
 
         import os
         saved, skipped = [], []
@@ -1527,13 +1570,37 @@ class MainWindow(QMainWindow):
                 skipped.append(tile_name)
                 continue
 
-            x_start_c = max(0, x_start)
-            y_start_c = max(0, y_start)
-            x_end_c   = min(x_end, img_width)
-            y_end_c   = min(y_end, img_height)
+            # Per-side bleed based on the tile's position in the grid.
+            # A side gets bleed ONLY if there's a neighbouring tile on
+            # that side (i.e. the side is interior, not on the tile-grid
+            # perimeter). Corner tiles → bleed on the two interior sides
+            # only. Edge tiles → bleed on 3 interior sides. Interior
+            # tiles → bleed on all 4.
+            b_left   = bleed_src_px if col_index > 0                  else 0
+            b_right  = bleed_src_px if col_index < num_cols - 1       else 0
+            b_top    = bleed_src_px if row_index > 0                  else 0
+            b_bottom = bleed_src_px if row_index < num_rows - 1       else 0
+
+            # Extended source-crop bounds with the per-side bleed applied,
+            # then clamped to the image so we can't read outside the source
+            # (defensive — Rule-B guarantees the extra source exists, but
+            # unusual grid_offsets could push a row/col fully off).
+            x_start_c = max(0, x_start - b_left)
+            y_start_c = max(0, y_start - b_top)
+            x_end_c   = min(x_end + b_right, img_width)
+            y_end_c   = min(y_end + b_bottom, img_height)
+            if x_end_c <= x_start_c or y_end_c <= y_start_c:
+                skipped.append(tile_name)
+                continue
 
             tile_image  = source_image[y_start_c:y_end_c, x_start_c:x_end_c]
-            tile_resized = cv2.resize(tile_image, (target_w, target_h),
+
+            # Output size — proportional to how much source we actually
+            # got (post-clamp), preserving the source→output scale. This
+            # keeps every output pixel worth the same physical mm.
+            out_w = max(1, int(round((x_end_c - x_start_c) * scale)))
+            out_h = max(1, int(round((y_end_c - y_start_c) * scale)))
+            tile_resized = cv2.resize(tile_image, (out_w, out_h),
                                       interpolation=cv2.INTER_LANCZOS4)
             tile_bgr = cv2.cvtColor(tile_resized, cv2.COLOR_RGB2BGR)
 
@@ -1543,7 +1610,11 @@ class MainWindow(QMainWindow):
             else:
                 skipped.append(tile_name)
 
-        msg = f"Saved {len(saved)} tile(s) to:\n{folder}"
+        msg = (
+            f"Saved {len(saved)} tile(s) to:\n{folder}\n\n"
+            f"Bleed: {int(BLEED_MM)} mm on interior sides "
+            f"(~{bleed_out_px} px @ {dpi} DPI, ~{bleed_src_px} src px)."
+        )
         if skipped:
             msg += f"\n\nSkipped (out of bounds): {', '.join(skipped)}"
         QMessageBox.information(self, "Done", msg)

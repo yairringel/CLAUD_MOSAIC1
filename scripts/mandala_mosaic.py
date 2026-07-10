@@ -36,6 +36,20 @@ class Canvas(QWidget):
         self.polygon_points = []  # Points for the current polygon being drawn
         self.polygon_cursor_size = 10  # Size of the square cursor in pixels
         self.polygons = []  # List of completed polygons
+
+        # Line drawing mode (mirrors duplicator.py). Click + drag to trace a
+        # path; on release we place rotated squares of `line_polygon_size`
+        # every `line_polygon_size + line_polygon_gap` world units along it.
+        # If mandala_mode is on, each square gets num_copies radial copies.
+        # Mutually exclusive with polygon_mode — set_line_mode / toggle_polygon_mode
+        # keep them synchronised.
+        self.line_mode = False
+        self.is_drawing_line = False
+        self.line_start_point = None
+        self.current_line_end = None
+        self.line_points = []                # world-coord path samples
+        self.line_polygon_size = 15          # world-px side of each square
+        self.line_polygon_gap = 2            # world-px gap between squares
         
         # Zoom and pan variables
         self.zoom_factor = 1.0
@@ -67,6 +81,12 @@ class Canvas(QWidget):
         # Parent shape tracking for polygon groups
         self.polygon_groups = []  # List of polygon groups, each group shares the same parent
         self.current_group_id = 0  # Counter for unique group IDs
+
+        # Undo stack — full-state snapshots taken BEFORE each polygon-list
+        # mutation. undo_last() pops and restores. Bounded to keep memory
+        # sane on large sessions.
+        self._undo_stack = []
+        self._MAX_UNDO = 50
         
         # Selection tracking
         self.selected_polygon_index = -1  # Index of currently selected polygon (-1 means none)
@@ -302,12 +322,297 @@ class Canvas(QWidget):
             print(f"Error loading image: {e}")
             return False
     
+    def set_line_mode(self, enabled):
+        """Enable / disable the line-drawing tool. Mutex with polygon_mode
+        and eraser_mode — turning line mode on turns those off."""
+        self.line_mode = bool(enabled)
+        if self.line_mode:
+            # Exit polygon mode + eraser mode so their handlers don't fire.
+            if self.polygon_mode:
+                self.polygon_mode = False
+                self.polygon_points = []
+                self.cursor_timer.stop()
+                # Sync the "Polygon" checkbox in the right panel.
+                parent = self.parent()
+                while parent:
+                    for child in parent.findChildren(QCheckBox):
+                        if child.text() == "Polygon":
+                            child.blockSignals(True)
+                            child.setChecked(False)
+                            child.blockSignals(False)
+                            break
+                    parent = parent.parent()
+            if self.eraser_mode:
+                self.eraser_mode = False
+                parent = self.parent()
+                while parent:
+                    for child in parent.findChildren(QCheckBox):
+                        if child.text() == "Eraser Mode":
+                            child.blockSignals(True)
+                            child.setChecked(False)
+                            child.blockSignals(False)
+                            break
+                    parent = parent.parent()
+            self.setCursor(Qt.CrossCursor)
+        else:
+            # Leaving line mode — clear any in-flight line drag.
+            self.is_drawing_line = False
+            self.line_points = []
+            self.line_start_point = None
+            self.current_line_end = None
+            self.setCursor(Qt.ArrowCursor)
+        self.update()
+
+    def _snapshot_state(self):
+        """Return a lightweight deep copy of the polygon state — enough to
+        restore an undo without accidentally aliasing QColor / list refs
+        with the live scene. polygon_groups' 'polygons' lists are dropped
+        here and rebuilt on restore via group_id lookup, which avoids
+        stale cross-references between the snapshot and the live data."""
+        def copy_polygon(p):
+            d = dict(p)
+            if 'points' in d:
+                d['points'] = list(d['points'])
+            if isinstance(d.get('color'), QColor):
+                d['color'] = QColor(d['color'])
+            if isinstance(d.get('parent_shape'), dict):
+                ps = dict(d['parent_shape'])
+                if 'points' in ps:
+                    ps['points'] = list(ps['points'])
+                d['parent_shape'] = ps
+            return d
+        def copy_group(g):
+            gd = dict(g)
+            gd.pop('polygons', None)   # rebuilt on restore
+            return gd
+        return {
+            'polygons': [copy_polygon(p) for p in self.polygons],
+            'polygon_groups': [copy_group(g) for g in self.polygon_groups],
+            'current_group_id': self.current_group_id,
+        }
+
+    def _push_undo_snapshot(self):
+        """Save the current state to the undo stack. Call BEFORE any
+        polygon-list mutation (add / remove / recolour / regroup)."""
+        self._undo_stack.append(self._snapshot_state())
+        # Bounded to _MAX_UNDO — drop the oldest snapshot when we overflow.
+        if len(self._undo_stack) > self._MAX_UNDO:
+            self._undo_stack.pop(0)
+
+    def undo_last(self):
+        """Restore the most recent snapshot. Returns True if something
+        was undone, False if the stack was empty."""
+        if not self._undo_stack:
+            return False
+        state = self._undo_stack.pop()
+        self.polygons = state['polygons']
+        self.polygon_groups = state['polygon_groups']
+        self.current_group_id = state['current_group_id']
+        # Re-link each group's 'polygons' list to the restored polygon dicts
+        # by group_id (we dropped that list in _snapshot_state to keep the
+        # snapshot cheap; here we rebuild it so downstream code that reads
+        # group['polygons'] still works).
+        for g in self.polygon_groups:
+            gid = g.get('group_id')
+            g['polygons'] = [
+                p for p in self.polygons if p.get('group_id') == gid
+            ]
+        # Clear selection — the restored polygons have new object identity
+        # so any cached index / reference is stale.
+        self.selected_polygon_index = -1
+        self.selected_polygon_indices = []
+        self.selected_control_point = -1
+        self.update()
+        return True
+
+    def set_line_polygon_size(self, size):
+        """Set the size (world-px) of each square placed along the line."""
+        self.line_polygon_size = max(1, int(size))
+
+    def set_line_polygon_gap(self, gap):
+        """Set the gap (world-px) between consecutive squares."""
+        self.line_polygon_gap = max(0, int(gap))
+
+    @staticmethod
+    def _rotated_square_points(cx, cy, size, angle_rad):
+        """Return the 4 world-coord corners of a square centred at (cx, cy)
+        with the given side length, rotated by angle_rad (0 = axis-aligned)."""
+        half = size / 2.0
+        local = [(-half, -half), (half, -half), (half, half), (-half, half)]
+        cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+        return [
+            (cx + x * cos_a - y * sin_a, cy + x * sin_a + y * cos_a)
+            for x, y in local
+        ]
+
+    def create_polygons_along_line(self):
+        """Place squares along the traced line at (size + gap) intervals.
+        Each square is aligned to the local path tangent. If mandala_mode
+        is on, every square gets num_copies radial copies around the
+        mandala centre; all squares (and their radial copies) share ONE
+        group_id so eraser + regenerate treats them as one unit."""
+        if len(self.line_points) < 2:
+            return
+
+        pts = list(self.line_points)
+        # Cumulative segment lengths (world units).
+        seg_lens = []
+        total = 0.0
+        for i in range(len(pts) - 1):
+            x1, y1 = pts[i]
+            x2, y2 = pts[i + 1]
+            d = math.hypot(x2 - x1, y2 - y1)
+            seg_lens.append(d)
+            total += d
+        if total <= 0:
+            return
+
+        step = self.line_polygon_size + self.line_polygon_gap
+        if step <= 0:
+            return
+        n_polys = int(total / step)
+        if n_polys <= 0:
+            return
+
+        def pos_and_angle_at(t):
+            """Interpolate (x, y, tangent_angle) at path-distance t."""
+            acc = 0.0
+            for i, seg_len in enumerate(seg_lens):
+                if seg_len <= 0:
+                    continue
+                if acc + seg_len >= t or i == len(seg_lens) - 1:
+                    frac = min(1.0, max(0.0, (t - acc) / seg_len))
+                    x1, y1 = pts[i]
+                    x2, y2 = pts[i + 1]
+                    cx = x1 + frac * (x2 - x1)
+                    cy = y1 + frac * (y2 - y1)
+                    ang = math.atan2(y2 - y1, x2 - x1)
+                    return cx, cy, ang
+                acc += seg_len
+            # Fallback — last vertex.
+            return pts[-1][0], pts[-1][1], 0.0
+
+        # Fill colour for every square along the line = the palette
+        # colour selected in the left panel. Falls back to opaque black
+        # if the left panel isn't wired up (defensive).
+        if (self.left_panel is not None
+                and hasattr(self.left_panel, "selected_color")
+                and isinstance(self.left_panel.selected_color, QColor)):
+            fill_color = QColor(self.left_panel.selected_color)
+        else:
+            fill_color = QColor(0, 0, 0)
+
+        # Build the base list of squares along the line (before any mandala
+        # rotation). Each entry = (points, fill_color) — every square uses
+        # the same palette colour.
+        base_squares = []
+        for i in range(n_polys):
+            t = (i + 0.5) * step
+            if t >= total:
+                break
+            cx, cy, ang = pos_and_angle_at(t)
+            square = self._rotated_square_points(
+                cx, cy, self.line_polygon_size, ang,
+            )
+            base_squares.append((square, QColor(fill_color)))
+
+        if not base_squares:
+            return
+
+        # Undo checkpoint — captures state BEFORE the new line polygons +
+        # their radial copies are added.
+        self._push_undo_snapshot()
+
+        # A single group_id ties the entire line (plus its radial copies)
+        # together, so eraser + selection treat it as one editable unit.
+        group_id = self.current_group_id
+        self.current_group_id += 1
+        group_polygons = []
+
+        if self.mandala_mode:
+            self.initialize_mandala_center()
+            mcx = self.mandala_center_world_x
+            mcy = self.mandala_center_world_y
+            angle_step = 360.0 / self.num_copies if self.num_copies > 0 else 60.0
+            for base_i, (square_pts, color) in enumerate(base_squares):
+                # One parent_shape per base square, SHARED across its
+                # radial copies (by object identity). This is what the
+                # sibling-propagation code uses to find peers when a
+                # single copy's control point is dragged.
+                parent_shape = {
+                    'is_line_base_square': True,
+                    'base_index': base_i,
+                    'num_copies': self.num_copies,
+                }
+                for copy_i in range(self.num_copies):
+                    a_deg = copy_i * angle_step
+                    a_rad = math.radians(a_deg)
+                    cos_a, sin_a = math.cos(a_rad), math.sin(a_rad)
+                    rotated = []
+                    for wx, wy in square_pts:
+                        rx = wx - mcx
+                        ry = wy - mcy
+                        rotated.append((
+                            rx * cos_a - ry * sin_a + mcx,
+                            rx * sin_a + ry * cos_a + mcy,
+                        ))
+                    polygon_data = {
+                        'points': rotated,
+                        'color': color,          # copies share the source square's colour
+                        'group_id': group_id,
+                        'copy_index': copy_i,
+                        'rotation_angle': a_deg,
+                        'is_line_polygon': True,
+                        'parent_shape': parent_shape,  # shared across copies of this base square
+                    }
+                    self.polygons.append(polygon_data)
+                    group_polygons.append(polygon_data)
+        else:
+            # No mandala — just drop each square as an independent polygon,
+            # still tagged with the same group_id for easy bulk erase.
+            for square_pts, color in base_squares:
+                polygon_data = {
+                    'points': square_pts,
+                    'color': color,
+                    'group_id': group_id,
+                    'copy_index': 0,
+                    'rotation_angle': 0.0,
+                    'is_line_polygon': True,
+                    'is_single': True,
+                }
+                self.polygons.append(polygon_data)
+                group_polygons.append(polygon_data)
+
+        # Record the group so downstream selection / regeneration logic
+        # can find it. parent_shape is None because line-polygons are not
+        # produced from a single parent polygon — reshape-all-copies is
+        # not supported for line groups in this first version.
+        self.polygon_groups.append({
+            'group_id': group_id,
+            'parent_shape': None,
+            'polygons': group_polygons,
+            'creation_time': len(self.polygon_groups),
+            'is_line_group': True,
+        })
+        self.update()
+
     def toggle_polygon_mode(self):
         """Toggle polygon drawing mode on/off"""
         self.polygon_mode = not self.polygon_mode
-        
+
         if self.polygon_mode:
-            # Entering polygon mode - exit eraser mode if active
+            # Entering polygon mode — exit line-mode + eraser mode.
+            if self.line_mode:
+                self.set_line_mode(False)
+                parent = self.parent()
+                while parent:
+                    for child in parent.findChildren(QCheckBox):
+                        if child.text() == "Line":
+                            child.blockSignals(True)
+                            child.setChecked(False)
+                            child.blockSignals(False)
+                            break
+                    parent = parent.parent()
             if self.eraser_mode:
                 self.eraser_mode = False
                 
@@ -362,6 +667,8 @@ class Canvas(QWidget):
         """Create polygons arranged in a circle around center"""
         if len(self.polygon_points) < 3:
             return
+        # Undo checkpoint — captures state BEFORE the new group is added.
+        self._push_undo_snapshot()
         
         # Get mandala center in world coordinates (use fixed center)
         self.initialize_mandala_center()  # Ensure center is initialized
@@ -448,6 +755,8 @@ class Canvas(QWidget):
         """Create a single polygon without radial copies"""
         if len(self.polygon_points) < 3:
             return
+        # Undo checkpoint — captures state BEFORE the new polygon lands.
+        self._push_undo_snapshot()
         
         # Use same filling logic as mandala mode
         if self.background_image and not self.background_image.isNull():
@@ -637,6 +946,8 @@ class Canvas(QWidget):
             selected = QColor(0, 0, 0)
         new_color = QColor(selected)
         clicked = self.polygons[idx]
+        # Undo checkpoint — captures the old colour(s) BEFORE repaint.
+        self._push_undo_snapshot()
         # In mandala mode, repaint the entire group so all radial copies stay in sync.
         gid = clicked.get('group_id')
         if self.mandala_mode and gid is not None:
@@ -695,6 +1006,15 @@ class Canvas(QWidget):
             self.paint_polygon_at_point(world_x, world_y)
             return
 
+        if event.button() == Qt.LeftButton and self.line_mode:
+            # Line mode: press starts tracing a path.
+            world_x, world_y = self.screen_to_world(event.x(), event.y())
+            self.line_start_point = (world_x, world_y)
+            self.current_line_end = (world_x, world_y)
+            self.is_drawing_line = True
+            self.line_points = [(world_x, world_y)]
+            self.update()
+            return
         if event.button() == Qt.LeftButton and self.polygon_mode:
             # In polygon mode, left click adds point to polygon
             self.add_polygon_point(event.x(), event.y())
@@ -745,6 +1065,20 @@ class Canvas(QWidget):
     
     def mouseMoveEvent(self, event):
         """Handle mouse move events"""
+        if self.is_drawing_line:
+            # Line mode — append a path sample if it's far enough from the
+            # last one. Threshold in world units matches duplicator.py so
+            # zoom doesn't over/undersample the path.
+            world_x, world_y = self.screen_to_world(event.x(), event.y())
+            self.current_line_end = (world_x, world_y)
+            if not self.line_points:
+                self.line_points.append((world_x, world_y))
+            else:
+                lx, ly = self.line_points[-1]
+                if math.hypot(world_x - lx, world_y - ly) > 5:
+                    self.line_points.append((world_x, world_y))
+            self.update()
+            return
         if self.is_erasing:
             # Continue erasing while dragging
             world_x, world_y = self.screen_to_world(event.x(), event.y())
@@ -825,6 +1159,15 @@ class Canvas(QWidget):
     
     def mouseReleaseEvent(self, event):
         """Handle mouse release events"""
+        if self.is_drawing_line:
+            # Line mode — bake the traced path into polygons.
+            self.create_polygons_along_line()
+            self.is_drawing_line = False
+            self.line_points = []
+            self.line_start_point = None
+            self.current_line_end = None
+            self.update()
+            return
         if self.is_erasing:
             # Stop erasing
             self.is_erasing = False
@@ -833,19 +1176,20 @@ class Canvas(QWidget):
             self.is_dragging_center = False
             self.setCursor(Qt.ArrowCursor if not self.polygon_mode else Qt.BlankCursor)
         elif self.is_dragging_control_point:
-            # When control point dragging is complete, update copies in mandala mode
-            if (self.mandala_mode and len(self.selected_polygon_indices) > 1 and 
-                self.selected_polygon_index >= 0 and self.selected_control_point >= 0):
-                
-                # Get the final position of the dragged control point
+            # When control-point dragging finishes in mandala mode, mirror
+            # the move into every sibling copy (same parent_shape by
+            # reference). The propagation walks siblings itself — we don't
+            # need the whole group to be selected any more (selection is
+            # one polygon at a time now).
+            if (self.mandala_mode
+                    and self.selected_polygon_index >= 0
+                    and self.selected_control_point >= 0):
                 polygon_data = self.polygons[self.selected_polygon_index]
                 points = polygon_data['points']
-                
                 if self.selected_control_point < len(points):
                     final_x, final_y = points[self.selected_control_point]
                     self.update_corresponding_points_in_copies(final_x, final_y)
-                    self.update()  # Force a redraw
-            
+                    self.update()  # force a redraw
             # Stop dragging control point
             self.is_dragging_control_point = False
             self.selected_control_point = -1
@@ -989,6 +1333,8 @@ class Canvas(QWidget):
         for i, polygon_data in enumerate(self.polygons):
             points = polygon_data['points']
             if self.point_in_polygon(world_x, world_y, points):
+                # Undo checkpoint — captures the polygon BEFORE removal.
+                self._push_undo_snapshot()
                 # Remove this specific polygon
                 affected_group_id = polygon_data.get('group_id')
                 self.polygons.pop(i)
@@ -1008,29 +1354,23 @@ class Canvas(QWidget):
         return False  # No polygon found at point
     
     def select_polygon_at_point(self, world_x, world_y):
-        """Select a polygon at the given world coordinates"""
+        """Select a single polygon at the given world coordinates. Even in
+        mandala mode, selection is one-polygon-at-a-time — but dragging a
+        control point still propagates to sibling copies via
+        update_corresponding_points_in_copies (siblings identified by
+        shared parent_shape reference + their rotation_angle)."""
         self.selected_polygon_index = -1
         self.selected_polygon_indices = []
-        
-        # Check polygons in reverse order (last drawn first)
+
+        # Check polygons in reverse order (last drawn first).
         for i in range(len(self.polygons) - 1, -1, -1):
             polygon_data = self.polygons[i]
             points = polygon_data['points']
-            
             if self.point_in_polygon(world_x, world_y, points):
                 self.selected_polygon_index = i
-                
-                # Check if this polygon is part of a mandala group
-                if self.mandala_mode and 'group_id' in polygon_data:
-                    # Select entire group in mandala mode
-                    group_id = polygon_data['group_id']
-                    self.select_polygon_group(group_id)
-                else:
-                    # Select only this polygon (single mode or standalone polygon)
-                    self.selected_polygon_indices = [i]
-                
+                self.selected_polygon_indices = [i]
                 break
-        
+
         self.update()
     
     def select_polygon_group(self, group_id):
@@ -1333,7 +1673,23 @@ class Canvas(QWidget):
                         x1, y1 = screen_points[i]
                         x2, y2 = screen_points[i + 1]
                         painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-    
+
+        # In-progress line preview (blue) while the user is dragging in line mode.
+        if self.line_mode and self.is_drawing_line and len(self.line_points) >= 1:
+            painter.setPen(QPen(QColor(30, 120, 255), 2))
+            prev = None
+            for wx, wy in self.line_points:
+                sx, sy = self.world_to_screen(wx, wy)
+                if prev is not None:
+                    painter.drawLine(int(prev[0]), int(prev[1]),
+                                     int(sx), int(sy))
+                prev = (sx, sy)
+            # Also draw the cursor endpoint for feedback.
+            if self.current_line_end is not None and prev is not None:
+                ex, ey = self.world_to_screen(*self.current_line_end)
+                painter.drawLine(int(prev[0]), int(prev[1]),
+                                 int(ex), int(ey))
+
     def draw_control_points(self, painter):
         """Draw control points for the selected polygon(s)"""
         if self.selected_polygon_index < 0 or self.selected_polygon_index >= len(self.polygons):
@@ -1415,83 +1771,59 @@ class Canvas(QWidget):
                               dot_size, dot_size)
 
     def update_corresponding_points_in_copies(self, new_world_x, new_world_y):
-        """Update the corresponding control point in all copy polygons using correct circular logic"""
+        """Propagate a control-point drag on the SELECTED polygon to all
+        its radial sibling copies. Siblings = polygons sharing the same
+        `parent_shape` object reference. Each sibling's same-index
+        control point is moved by rotating the dragged point around the
+        mandala centre by (sibling_rotation - primary_rotation).
+
+        Works for both:
+          - polygon-mode groups (all N radial copies share ONE parent_shape)
+          - line-mode groups (each base square has its own parent_shape,
+            shared across its N radial copies)
+        Standalone polygons (no parent_shape) have no siblings and this
+        method returns without side effects."""
         import math
-        
-        # Get the correct mandala center
-        center_x = self.mandala_center_world_x if self.mandala_center_world_x is not None else 0.0
-        center_y = self.mandala_center_world_y if self.mandala_center_world_y is not None else 0.0
-        
-        # Calculate radius and the ACTUAL angle of the dragged point
-        radius = math.sqrt((new_world_x - center_x)**2 + (new_world_y - center_y)**2)
-        dragged_angle = math.atan2(new_world_y - center_y, new_world_x - center_x)
-        
-        # Check if we have valid selection data
-        if (self.selected_polygon_index < 0 or 
-            self.selected_control_point < 0 or 
-            len(self.selected_polygon_indices) <= 1):
+
+        if (self.selected_polygon_index < 0
+                or self.selected_control_point < 0
+                or self.selected_polygon_index >= len(self.polygons)):
             return
-            
-        # Get the primary polygon data
-        primary_polygon = self.polygons[self.selected_polygon_index]
-        if 'group_id' not in primary_polygon:
-            return
-            
-        # Get group info to find the number of copies
-        group_info = self.get_polygon_group_by_id(primary_polygon['group_id'])
-        if not group_info:
-            return
-            
-        num_copies = group_info['parent_shape']['num_copies']
-        
-        # Calculate the target positions starting from the dragged point's angle
-        angle_step = 2 * math.pi / num_copies
-        target_positions = []
-        
-        for i in range(num_copies):
-            # Start from the dragged point's angle and add increments
-            angle = dragged_angle + (i * angle_step)
-            target_x = center_x + radius * math.cos(angle)
-            target_y = center_y + radius * math.sin(angle)
-            target_positions.append((target_x, target_y))
-        
-        # Map each existing polygon to the closest target position
-        # Get current positions
-        current_positions = []
-        for idx in self.selected_polygon_indices:
-            if idx < len(self.polygons):
-                polygon = self.polygons[idx]
-                points = polygon['points']
-                if self.selected_control_point < len(points):
-                    current_pos = points[self.selected_control_point]
-                    current_positions.append((idx, current_pos))
-        
-        used_targets = set()
-        
-        for poly_idx, current_pos in current_positions:
-            if poly_idx == self.selected_polygon_index:
-                # Primary polygon stays where user dragged it
+
+        primary = self.polygons[self.selected_polygon_index]
+        parent_shape = primary.get('parent_shape')
+        if parent_shape is None:
+            return  # standalone polygon — no siblings to update
+
+        cp_idx = self.selected_control_point
+        primary_angle_deg = float(primary.get('rotation_angle', 0.0))
+
+        cx = (self.mandala_center_world_x
+              if self.mandala_center_world_x is not None else 0.0)
+        cy = (self.mandala_center_world_y
+              if self.mandala_center_world_y is not None else 0.0)
+
+        for i, poly in enumerate(self.polygons):
+            if i == self.selected_polygon_index:
+                continue  # primary already updated by the drag handler
+            # Sibling identity: same parent_shape by reference.
+            if poly.get('parent_shape') is not parent_shape:
                 continue
-                
-            # Find the closest unused target position
-            best_target_idx = None
-            best_distance = float('inf')
-            
-            for target_idx, target_pos in enumerate(target_positions):
-                if target_idx in used_targets:
-                    continue
-                    
-                distance = math.sqrt((current_pos[0] - target_pos[0])**2 + (current_pos[1] - target_pos[1])**2)
-                if distance < best_distance:
-                    best_distance = distance
-                    best_target_idx = target_idx
-            
-            if best_target_idx is not None:
-                target_pos = target_positions[best_target_idx]
-                used_targets.add(best_target_idx)
-                
-                # Update this polygon's control point
-                self.polygons[poly_idx]['points'][self.selected_control_point] = target_pos
+            pts = poly.get('points', [])
+            if cp_idx >= len(pts):
+                continue
+            # Rotate the new position around the mandala centre by
+            # (sibling_angle - primary_angle) so the sibling's same-index
+            # control point lands in the analogous rotated position.
+            sibling_angle_deg = float(poly.get('rotation_angle', 0.0))
+            delta_rad = math.radians(sibling_angle_deg - primary_angle_deg)
+            rx = new_world_x - cx
+            ry = new_world_y - cy
+            cos_a = math.cos(delta_rad)
+            sin_a = math.sin(delta_rad)
+            new_rx = rx * cos_a - ry * sin_a
+            new_ry = rx * sin_a + ry * cos_a
+            poly['points'][cp_idx] = (cx + new_rx, cy + new_ry)
         
         # Clear debug dots since we're now actually moving the polygons
         self.debug_circle_dots = []
@@ -1819,12 +2151,55 @@ class SidePanel(QFrame):
             load_bg_button = QPushButton("Load Background")
             load_bg_button.clicked.connect(self.load_background)
             layout.addWidget(load_bg_button)
-            
+
+            # Undo the last polygon-list mutation (draw, erase, repaint,
+            # line-draw). Also bound to Ctrl+Z globally (see main()).
+            self.undo_button = QPushButton("Undo (Ctrl+Z)")
+            self.undo_button.setToolTip(
+                "Undo the last polygon action (add / draw line / erase / "
+                "repaint). Ctrl+Z has the same effect."
+            )
+            self.undo_button.clicked.connect(self.on_undo_clicked)
+            layout.addWidget(self.undo_button)
+
             # Add polygon checkbox
             self.polygon_checkbox = QCheckBox("Polygon")
             self.polygon_checkbox.toggled.connect(self.on_polygon_toggled)
             layout.addWidget(self.polygon_checkbox)
-            
+
+            # Line-drawing tool — click + drag on the canvas to trace a
+            # path; on release, rotated squares of the size below are
+            # placed along it. If Mandala is on, each square gets
+            # radial copies too.
+            self.line_checkbox = QCheckBox("Line")
+            self.line_checkbox.setToolTip(
+                "Draw a path with click+drag; on release, squares of the "
+                "chosen size are dropped along it. With Mandala checked, "
+                "radial copies of every square are also created."
+            )
+            self.line_checkbox.toggled.connect(self.on_line_toggled)
+            layout.addWidget(self.line_checkbox)
+
+            # Line-polygon size (world-px side of each square)
+            layout.addWidget(QLabel("Polygon Size (px):"))
+            self.line_polygon_size_input = QLineEdit()
+            self.line_polygon_size_input.setText(str(canvas.line_polygon_size))
+            self.line_polygon_size_input.setPlaceholderText("15")
+            self.line_polygon_size_input.textChanged.connect(
+                self.on_line_polygon_size_changed,
+            )
+            layout.addWidget(self.line_polygon_size_input)
+
+            # Gap between consecutive line polygons
+            layout.addWidget(QLabel("Polygon Gap (px):"))
+            self.line_polygon_gap_input = QLineEdit()
+            self.line_polygon_gap_input.setText(str(canvas.line_polygon_gap))
+            self.line_polygon_gap_input.setPlaceholderText("2")
+            self.line_polygon_gap_input.textChanged.connect(
+                self.on_line_polygon_gap_changed,
+            )
+            layout.addWidget(self.line_polygon_gap_input)
+
             # Add mandala checkbox
             self.mandala_checkbox = QCheckBox("Mandala")
             self.mandala_checkbox.setChecked(True)  # Checked by default
@@ -1926,11 +2301,52 @@ class SidePanel(QFrame):
                 # User cancelled size dialog, load with original size
                 self.canvas.set_background_image(file_path)
     
+    def on_undo_clicked(self):
+        """Undo button handler — pops the top of the canvas undo stack."""
+        if self.canvas:
+            self.canvas.undo_last()
+
     def on_polygon_toggled(self, checked):
         """Handle polygon checkbox toggle"""
         if self.canvas:
             self.canvas.toggle_polygon_mode()
-    
+            # Turning Polygon on turns Line off — keep the checkbox in sync.
+            if checked and hasattr(self, 'line_checkbox') \
+                    and self.line_checkbox.isChecked():
+                self.line_checkbox.blockSignals(True)
+                self.line_checkbox.setChecked(False)
+                self.line_checkbox.blockSignals(False)
+
+    def on_line_toggled(self, checked):
+        """Handle Line checkbox toggle — mutex with Polygon."""
+        if not self.canvas:
+            return
+        self.canvas.set_line_mode(checked)
+        if checked and self.polygon_checkbox.isChecked():
+            # set_line_mode already turned polygon_mode off on the canvas;
+            # sync the checkbox visual state without re-firing the handler.
+            self.polygon_checkbox.blockSignals(True)
+            self.polygon_checkbox.setChecked(False)
+            self.polygon_checkbox.blockSignals(False)
+
+    def on_line_polygon_size_changed(self, text):
+        """Update the line-polygon square size (world-px)."""
+        if not self.canvas:
+            return
+        try:
+            self.canvas.set_line_polygon_size(int(float(text)))
+        except (ValueError, TypeError):
+            pass  # ignore mid-typing invalid text
+
+    def on_line_polygon_gap_changed(self, text):
+        """Update the gap between consecutive line polygons (world-px)."""
+        if not self.canvas:
+            return
+        try:
+            self.canvas.set_line_polygon_gap(int(float(text)))
+        except (ValueError, TypeError):
+            pass
+
     def on_mandala_toggled(self, checked):
         """Handle mandala checkbox toggle"""
         if self.canvas:
@@ -2565,7 +2981,15 @@ class MandalaMosaicWindow(QMainWindow):
         # results, replace-source results, etc.). Matches duplicator.py.
         canvas.left_panel  = left_panel
         canvas.right_panel = right_panel
-        
+
+        # Global Ctrl+Z shortcut → undo the last polygon mutation. Attached
+        # to the main window so it fires regardless of which widget has
+        # focus (canvas, sidebar spinbox, palette, ...).
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+        undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        undo_shortcut.activated.connect(canvas.undo_last)
+
         central_widget.setLayout(main_layout)
 
 
