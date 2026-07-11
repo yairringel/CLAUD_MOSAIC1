@@ -936,16 +936,47 @@ class Canvas(QWidget):
     def save_state(self):
         """Save the current polygon state to the undo stack"""
         import copy
-        
+
         # Create a deep copy of the current polygons list
         current_state = copy.deepcopy(self.polygons)
-        
+
         # Add to undo stack
         self.undo_stack.append(current_state)
-        
+
         # Limit the size of the undo stack
         if len(self.undo_stack) > self.max_undo_states:
             self.undo_stack.pop(0)  # Remove oldest state
+
+    def apply_per_polygon_scale(self, factor):
+        """Scale every polygon around its own centroid by `factor`. Each
+        polygon's centroid stays fixed; vertices move radially away from
+        (factor > 1) or toward (factor < 1) that centroid. Distinct from
+        array-wide scaling, which moves whole polygons apart / together
+        around a shared origin."""
+        if factor <= 0 or abs(factor - 1.0) < 1e-9:
+            return
+        if not self.polygons:
+            return
+        # Undo checkpoint before mutation.
+        self.save_state()
+        n = 0
+        for poly in self.polygons:
+            pts = poly.get('points') if isinstance(poly, dict) else None
+            if not pts:
+                continue
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            poly['points'] = [
+                (cx + (px - cx) * factor, cy + (py - cy) * factor)
+                for px, py in pts
+            ]
+            n += 1
+        # Any cached overlap / selection derived from vertex positions is now
+        # stale — clear it so subsequent operations don't act on old numbers.
+        self.overlap_data = []
+        self.showing_overlaps = False
+        self.update()
+        print(f"Scaled {n} polygons per-centroid by factor {factor:.4f}")
     
     def undo_last_action(self):
         """Undo the last action by restoring the previous polygon state"""
@@ -2889,7 +2920,30 @@ class SidePanel(QFrame):
             self.y_scale_input.setPlaceholderText('Enter Y scale percentage (e.g., 100)')
             self.y_scale_input.textChanged.connect(self.on_scale_changed)
             layout.addWidget(self.y_scale_input)
-            
+
+            # Per-Polygon Scale — scales EACH polygon around its OWN centroid,
+            # so polygon centres don't move; only vertices go outward (>1) or
+            # inward (<1). Distinct from array-wide scale, which moves whole
+            # polygons apart / together.
+            per_poly_label = QLabel('Per-Polygon Scale:')
+            layout.addWidget(per_poly_label)
+            self.per_poly_scale_input = QLineEdit()
+            self.per_poly_scale_input.setText('1.0')
+            self.per_poly_scale_input.setPlaceholderText(
+                'e.g. 1.1 = 10% bigger per polygon'
+            )
+            layout.addWidget(self.per_poly_scale_input)
+            self.per_poly_scale_apply_btn = QPushButton('Apply Per-Polygon Scale')
+            self.per_poly_scale_apply_btn.setToolTip(
+                'Scale every polygon around its own centroid by this factor. '
+                'Polygon centres stay put; only the vertices move. '
+                '1.0 = no change; 1.1 = 10% bigger; 0.9 = 10% smaller.'
+            )
+            self.per_poly_scale_apply_btn.clicked.connect(
+                self.on_apply_per_polygon_scale
+            )
+            layout.addWidget(self.per_poly_scale_apply_btn)
+
             # Add grid checkbox
             self.grid_checkbox = QCheckBox("Show Grid")
             self.grid_checkbox.setChecked(False)  # Unchecked by default
@@ -3478,22 +3532,52 @@ class SidePanel(QFrame):
         try:
             x_text = self.x_scale_input.text().strip()
             y_text = self.y_scale_input.text().strip()
-            
+
             if not x_text or not y_text:
                 return  # Don't change anything for empty input
-                
+
             x_scale_percentage = float(x_text)
             y_scale_percentage = float(y_text)
-            
+
             # Clamp between 1% and 1000%
             x_scale_percentage = max(1, min(1000, x_scale_percentage))
             y_scale_percentage = max(1, min(1000, y_scale_percentage))
-            
+
             if self.canvas:
                 self.canvas.scale_background_image(x_scale_percentage / 100.0, y_scale_percentage / 100.0)
         except ValueError:
             # Invalid input, ignore
             pass
+
+    def on_apply_per_polygon_scale(self):
+        """Click handler for the 'Apply Per-Polygon Scale' button. Reads the
+        factor from the input, validates it, and calls the canvas to scale
+        every polygon around its own centroid."""
+        if not self.canvas:
+            return
+        text = self.per_poly_scale_input.text().strip()
+        if not text:
+            return
+        try:
+            factor = float(text)
+        except ValueError:
+            QMessageBox.warning(
+                self, "Invalid scale",
+                "Per-Polygon Scale must be a number (e.g. 1.1).",
+            )
+            return
+        # Clamp to a sensible range so a stray value can't zero-out or blow
+        # up the whole array. 0.05..20 is generous.
+        if factor <= 0:
+            QMessageBox.warning(
+                self, "Invalid scale",
+                "Per-Polygon Scale must be greater than 0.",
+            )
+            return
+        factor = max(0.05, min(20.0, factor))
+        if abs(factor - 1.0) < 1e-9:
+            return  # no-op — nothing to do at 1.0
+        self.canvas.apply_per_polygon_scale(factor)
     
     def save_array(self):
         """Save polygons to CSV file compatible with mosaic_editor_pyqt"""
