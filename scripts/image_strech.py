@@ -5,7 +5,10 @@ import pickle
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QPushButton, QLabel, QFileDialog, QMessageBox, QScrollArea, QSpinBox, QDoubleSpinBox,
                              QSlider, QGroupBox, QFormLayout, QShortcut)
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont, QKeySequence
+from PyQt5.QtGui import (
+    QBrush, QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap,
+    QPolygonF,
+)
 from PyQt5.QtCore import Qt, QPoint, QPointF, QEvent, pyqtSignal, QRectF
 
 class ImageCanvas(QWidget):
@@ -54,6 +57,11 @@ class ImageCanvas(QWidget):
         self.grid_offset_y = 0  # Grid vertical offset in pixels
         self.grid_line_thickness = 2  # Grid line thickness in pixels
         self.polygon_line_thickness = 1  # Polygon line thickness in pixels
+        # When False, paintEvent draws a solid red rectangle where the
+        # image would go — useful for inspecting polygon geometry without
+        # the mosaic underneath distracting the eye. Overlays (grid,
+        # polygons, circles) still draw on top as usual.
+        self.show_background_image = True
         # Circles: each entry is [cx, cy, radius]
         self.circles = []
         self.drawing_circle = False
@@ -620,7 +628,9 @@ class ImageCanvas(QWidget):
         img_pan_y = float(self.grid_offset_y)
 
         if self.image:
-            # Draw image shifted so it pans under the fixed grid
+            # Same rect either way — swap the source image for a solid red
+            # fill when the sidebar's "Show Background Image" is off, so
+            # polygon geometry is easier to inspect against a neutral field.
             img_width = self.image.width()
             img_height = self.image.height()
             target_rect = QRectF(
@@ -628,7 +638,10 @@ class ImageCanvas(QWidget):
                 (label_offset + img_pan_y) * self.scale_factor,
                 img_width * self.scale_factor,
                 img_height * self.scale_factor)
-            painter.drawImage(target_rect, self.image)
+            if self.show_background_image:
+                painter.drawImage(target_rect, self.image)
+            else:
+                painter.fillRect(target_rect, QColor(220, 30, 30))
         
         # Translate and scale for drawing overlays
         painter.translate(label_offset * self.scale_factor, label_offset * self.scale_factor)
@@ -694,6 +707,20 @@ class ImageCanvas(QWidget):
 
         # Draw completed polygons
         if self.polygons:
+            # When the background image is hidden (red field), also fill
+            # every polygon interior solid white so shapes read against
+            # the red. Drawn BEFORE the outline pass so the outline sits
+            # on top and remains visible.
+            if not self.show_background_image:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(Qt.white))
+                for poly in self.polygons:
+                    if len(poly) >= 3:
+                        painter.drawPolygon(QPolygonF(
+                            [QPointF(px, py) for px, py in poly]
+                        ))
+                painter.setBrush(Qt.NoBrush)
+
             for idx, poly in enumerate(self.polygons):
                 # Marked-overlapping > fill-selected > selected > normal
                 if idx in self.overlapping_indices:
@@ -704,13 +731,13 @@ class ImageCanvas(QWidget):
                     painter.setPen(QPen(Qt.magenta, self.polygon_line_thickness))
                 else:
                     painter.setPen(QPen(Qt.green, self.polygon_line_thickness))
-                
+
                 if len(poly) > 1:
                     for i in range(len(poly) - 1):
-                        painter.drawLine(QPointF(poly[i][0], poly[i][1]), 
+                        painter.drawLine(QPointF(poly[i][0], poly[i][1]),
                                          QPointF(poly[i+1][0], poly[i+1][1]))
                     # Close loop
-                    painter.drawLine(QPointF(poly[-1][0], poly[-1][1]), 
+                    painter.drawLine(QPointF(poly[-1][0], poly[-1][1]),
                                      QPointF(poly[0][0], poly[0][1]))
                 
                 # Draw control points for selected polygon
@@ -772,7 +799,13 @@ class MainWindow(QMainWindow):
         self.resize(800, 600)
         
         self.canvas = ImageCanvas()
-        
+
+        # Report the currently-selected polygon's area (px²) in the status bar.
+        # Fires with the new selection index (-1 = deselected).
+        self.canvas.selection_changed.connect(
+            self.on_polygon_selection_changed,
+        )
+
         # Scroll area for the canvas
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidget(self.canvas)
@@ -1096,6 +1129,35 @@ class MainWindow(QMainWindow):
         scale_poly_layout.addWidget(apply_scale_btn)
         right_sidebar_layout.addLayout(scale_poly_layout)
 
+        # Per-Polygon Scale — same UX as duplicator.py. Scales EACH
+        # polygon around its OWN centroid (mean of its vertices), so
+        # every polygon's centre stays put and only its vertices move
+        # outward (>1) or inward (<1). Distinct from the array scale
+        # above, which scales all coords around the origin (moves
+        # polygons apart / together).
+        right_sidebar_layout.addSpacing(6)
+        right_sidebar_layout.addWidget(QLabel("Scale Each Polygon:"))
+        per_poly_layout = QHBoxLayout()
+        self.per_poly_scale_spin = QDoubleSpinBox()
+        self.per_poly_scale_spin.setRange(0.05, 20.0)
+        self.per_poly_scale_spin.setDecimals(2)
+        self.per_poly_scale_spin.setSingleStep(0.05)
+        self.per_poly_scale_spin.setValue(1.0)
+        self.per_poly_scale_spin.setToolTip(
+            "Factor to scale each polygon around its own centroid. "
+            "1.0 = no change; 1.1 = 10% bigger; 0.9 = 10% smaller. "
+            "Every polygon's centre stays put; only vertices move."
+        )
+        per_poly_layout.addWidget(self.per_poly_scale_spin)
+        apply_per_poly_btn = QPushButton("Apply")
+        apply_per_poly_btn.setToolTip(
+            "Scale every polygon around its own centroid by the factor. "
+            "Polygon centres stay put; only vertices move."
+        )
+        apply_per_poly_btn.clicked.connect(self.apply_per_polygon_scale)
+        per_poly_layout.addWidget(apply_per_poly_btn)
+        right_sidebar_layout.addLayout(per_poly_layout)
+
         right_sidebar_layout.addSpacing(10)
         right_sidebar_layout.addWidget(QLabel("Move Image:"))
 
@@ -1123,6 +1185,24 @@ class MainWindow(QMainWindow):
                 self.move_polygons_chk.setChecked(False)
         self.move_polygons_chk.toggled.connect(_on_move_polys)
         self.only_polygons_chk.toggled.connect(_on_only_polys)
+
+        # Show Background Image — toggle the image on/off; when off, the
+        # image area is painted solid red so polygon geometry stands out
+        # for inspection. Overlays (grid, polygons, circles) still draw
+        # on top either way.
+        self.show_bg_chk = QCheckBox("Show Background Image")
+        self.show_bg_chk.setChecked(True)
+        self.show_bg_chk.setToolTip(
+            "When ON, the loaded mosaic image is drawn as the canvas "
+            "background (default). When OFF, the image area is filled "
+            "with solid red so polygons and grid lines are easier to "
+            "inspect on a neutral field."
+        )
+        def _on_show_bg_toggled(checked):
+            self.canvas.show_background_image = bool(checked)
+            self.canvas.update()
+        self.show_bg_chk.toggled.connect(_on_show_bg_toggled)
+        right_sidebar_layout.addWidget(self.show_bg_chk)
 
         grid_arrows_layout = QGridLayout()
         grid_arrows_layout.setSpacing(2)
@@ -1287,6 +1367,22 @@ class MainWindow(QMainWindow):
             return 0.0
         return float(cv2.contourArea(pts))
 
+    def on_polygon_selection_changed(self, idx: int) -> None:
+        """Status-bar hook: when the canvas selection changes, show the
+        selected polygon's area in px². idx = -1 means nothing selected."""
+        if idx is None or idx < 0:
+            self.statusBar().clearMessage()
+            return
+        polys = self.canvas.polygons
+        if not (0 <= idx < len(polys)):
+            self.statusBar().clearMessage()
+            return
+        area = self._polygon_area(polys[idx])
+        self.statusBar().showMessage(
+            f"Selected polygon #{idx}: {area:,.1f} px²  "
+            f"({len(polys[idx])} vertices)"
+        )
+
     def erase_polygons_by_max_points(self):
         n = self.max_points_spin.value()
         self._erase_polygons_matching(
@@ -1387,6 +1483,36 @@ class MainWindow(QMainWindow):
         self.canvas.apply_effects()
         self.canvas.update()
 
+    def apply_per_polygon_scale(self):
+        """Scale each polygon around its own centroid by the spinbox factor.
+        Every polygon's centroid stays fixed; only vertices move. Same
+        behaviour as duplicator.py's Per-Polygon Scale."""
+        if not self.canvas.polygons:
+            QMessageBox.warning(self, "Warning", "No polygons to scale.")
+            return
+        factor = float(self.per_poly_scale_spin.value())
+        if factor <= 0 or abs(factor - 1.0) < 1e-9:
+            return  # no-op — nothing to do at 1.0 (or invalid non-positive)
+        scaled = []
+        for poly in self.canvas.polygons:
+            if not poly:
+                scaled.append(poly)
+                continue
+            cx = sum(pt[0] for pt in poly) / len(poly)
+            cy = sum(pt[1] for pt in poly) / len(poly)
+            scaled.append(
+                [(cx + (px - cx) * factor,
+                  cy + (py - cy) * factor)
+                 for px, py in poly]
+            )
+        self.canvas.polygons = scaled
+        # Invalidate the array-scale baseline so a subsequent Scale
+        # Polygon Array applies to the NEW positions, not the pre-per-
+        # polygon-scale ones (else the two operations fight each other).
+        self._original_polygons = None
+        self.canvas.apply_effects()
+        self.canvas.update()
+
     def pan_image(self, dx, dy):
         step = self.grid_step_spin.value()
         hbar = self.scroll_area.horizontalScrollBar()
@@ -1440,8 +1566,73 @@ class MainWindow(QMainWindow):
         self.canvas.grid_offset_y = 0
         self.canvas.update()
     
+    @staticmethod
+    def _read_tile_polygon_from_dxf(dxf_path):
+        """Read a `box_<label>.dxf` (as written by mosaic_studio.py's
+        save_boxes) and return the OFFSET-BOUNDARY polygon as an
+        (N, 2) numpy float array in DXF-unit coords. Returns None on
+        failure or if no suitable polyline is found.
+
+        A `box_<label>.dxf` file contains (per save_polygons_to_dxf):
+          - a dark-gray rectangular FRAME (dxfattribs color = 8)
+          - a blue OFFSET boundary (dxfattribs color = 5) around the
+            box's polygons — a buffered outward-expansion by
+            (offset_line_percent × cell_size). ← this is what we cut with
+          - each mosaic tile polygon (any other colour) inside the box
+
+        We pick the color-5 offset polyline. If no offset boundary
+        exists (older DXFs, or the offset step failed), we fall back to
+        the largest non-frame polyline."""
+        try:
+            import ezdxf
+        except Exception:
+            return None
+        try:
+            doc = ezdxf.readfile(str(dxf_path))
+        except Exception:
+            return None
+        candidates = []
+        for e in doc.modelspace().query("LWPOLYLINE"):
+            try:
+                colour = int(getattr(e.dxf, "color", 0))
+            except Exception:
+                colour = 0
+            pts = []
+            try:
+                for v in e.get_points():
+                    pts.append((float(v[0]), float(v[1])))
+            except Exception:
+                continue
+            if len(pts) < 3:
+                continue
+            candidates.append((np.asarray(pts, dtype=np.float32), colour))
+        if not candidates:
+            return None
+        # Preferred: the OFFSET boundary (color 5) — this is the outer
+        # border line the user asked to cut with.
+        offset_only = [(p, c) for (p, c) in candidates if c == 5]
+        if offset_only:
+            return offset_only[0][0]
+        # Fallback: skip the frame (color 8) and take the largest of what
+        # remains — that's the biggest actual shape in the file.
+        non_frame = [(p, c) for (p, c) in candidates if c != 8]
+        if not non_frame:
+            non_frame = candidates
+        non_frame.sort(
+            key=lambda c: (
+                (c[0][:, 0].max() - c[0][:, 0].min())
+                * (c[0][:, 1].max() - c[0][:, 1].min())
+            ),
+            reverse=True,
+        )
+        return non_frame[0][0]
+
     def save_tile_image(self):
-        """Open a grid-selection popup then save chosen tiles as JPEG files."""
+        """Open a grid-selection popup then save chosen tiles as JPEG files,
+        each cut with its own `<label>_tile.dxf` polygon from a user-picked
+        DXF directory (per-box subdirs, as save_boxes in mosaic_studio.py
+        writes them). Outside the polygon is filled solid white; the crop
+        follows the DXF geometry exactly (no rectangular bleed)."""
         if self.canvas.cv_image is None:
             QMessageBox.warning(self, "Warning", "No image loaded. Please load an image first.")
             return
@@ -1525,98 +1716,174 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Info", "No tiles selected.")
             return
 
-        # ── Choose output folder ───────────────────────────────────────────
-        from PyQt5.QtWidgets import QFileDialog as _QFD
-        folder = QFileDialog.getExistingDirectory(self, "Choose Output Folder")
-        if not folder:
+        # ── Choose DXF directory (contains per-box subdirs) ────────────────
+        # Layout expected (from mosaic_studio.py save_boxes):
+        #   <dxf_dir>/A1/box_A1.dxf
+        #   <dxf_dir>/B3/box_B3.dxf
+        # Each DXF's OFFSET boundary (color 5) defines the exact cut shape.
+        dxf_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Choose DXF Directory (per-box subdirs with box_*.dxf inside)",
+        )
+        if not dxf_dir:
             return
+
+        # ── Ask for the scale that was used at Save Array time ─────────────
+        # Save Array in image_strech.py multiplies every polygon coordinate
+        # by  (target_grid_box_px / original_grid_box_px)  before writing
+        # the CSV, and the DXFs mosaic_studio.py writes carry the SAME
+        # scaled coords. To crop the image we must UN-scale the DXF coords
+        # (divide by that same factor) — otherwise the polygon lands
+        # somewhere off-image and the crop comes out black.
+        original_cell_px = 1.0
+        if self.canvas.cv_image is not None:
+            img_w = self.canvas.cv_image.shape[1]
+            original_cell_px = max(
+                1.0, img_w * (self.canvas.grid_size_percent / 100.0),
+            )
+        from PyQt5.QtWidgets import QInputDialog
+        target_cell_px, ok = QInputDialog.getDouble(
+            self,
+            "Un-scale DXF Coordinates",
+            "What target grid box size did you enter when you ran "
+            "'Save Array' to make the CSV that produced these DXFs?\n\n"
+            f"Current image's grid box (unscaled) is {original_cell_px:.2f} px.\n"
+            "Enter the SAME value you entered at Save Array time.\n\n"
+            "DXF coords will be divided by (target / current) so they land "
+            "back on the image pixels.",
+            value=round(original_cell_px, 2),
+            min=0.01,
+            max=1_000_000.0,
+            decimals=2,
+        )
+        if not ok:
+            return
+        # inverse_scale = image-pixel-per-DXF-unit. Multiplying DXF coords
+        # by this yields image-pixel coords.
+        inverse_scale = original_cell_px / max(1e-9, target_cell_px)
 
         # ── Export selected tiles ──────────────────────────────────────────
         tile_size_mm = self.tile_size_spin.value()
         dpi          = self.dpi_spin.value()
-        # tile_size_mm is interpreted as the WIDTH. Height comes out of the
-        # per-crop `scale` below; we no longer need a fixed target_h since
-        # each tile's output is proportional to its (possibly bled) crop.
+        # tile_size_mm × dpi / 25.4 = output pixels for a source region
+        # that is exactly one grid cell wide. `scale` maps source pixels
+        # → output pixels so every tile shares the same mm-per-pixel.
         target_w = int((tile_size_mm / 25.4) * dpi)
-        source_image  = (self.canvas.display_image
-                         if self.canvas.display_image is not None
-                         else self.canvas.cv_image)
-
-        # Bleed setup — each tile gets 10 mm of extra source content on
-        # every INTERIOR side (a side that has a neighbouring tile), so
-        # physical prints overlap by 10 mm at seams and small assembly
-        # errors don't leave visible gaps. Exterior sides (edges of the
-        # tile grid) get NO bleed — the print is trimmed flush there.
-        BLEED_MM = 10.0
-        # mm-per-source-px is uniform in both axes because target_w:cell_w
-        # equals target_h:cell_h (same grid aspect). We only need one value.
-        bleed_src_px = int(round(BLEED_MM * cell_w / max(1e-6, tile_size_mm)))
-        bleed_out_px = int(round(BLEED_MM * dpi / 25.4))
         scale = target_w / max(1, cell_w)   # output-px per source-px
+        # IMPORTANT: cut from the RAW loaded image (cv_image), not the
+        # canvas display_image. display_image may have been transformed
+        # by effects (threshold, edge detect, cut ops) and would produce
+        # a black or mono result inside the polygon. cv_image is the
+        # unmodified source. Fall back to display_image only if cv_image
+        # is missing (which shouldn't happen given the earlier guard).
+        source_image = (self.canvas.cv_image
+                        if self.canvas.cv_image is not None
+                        else self.canvas.display_image)
 
         import os
-        saved, skipped = [], []
+        saved, skipped_no_dxf, skipped_other = [], [], []
         for (row_index, col_index) in selected:
             row_letter = chr(ord('A') + row_index) if row_index < 26 else f"R{row_index+1}"
             tile_name  = f"{row_letter}{col_index + 1}"
 
-            x_start = int(col_index * cell_w - self.canvas.grid_offset_x)
-            y_start = int(row_index * cell_h - self.canvas.grid_offset_y)
-            x_end   = x_start + cell_w
-            y_end   = y_start + cell_h
-
-            # Skip tiles fully outside image
-            if x_start >= img_width or y_start >= img_height or x_end <= 0 or y_end <= 0:
-                skipped.append(tile_name)
+            # Locate the per-box DXF. mosaic_studio.save_boxes writes it as
+            # box_<label>.dxf; try that first, then the capitalised form
+            # (Windows is case-insensitive so this rarely matters, but
+            # explicit is safer on Linux/Mac).
+            dxf_candidates = [
+                os.path.join(dxf_dir, tile_name, f"box_{tile_name}.dxf"),
+                os.path.join(dxf_dir, tile_name, f"Box_{tile_name}.dxf"),
+            ]
+            dxf_path = next(
+                (p for p in dxf_candidates if os.path.isfile(p)), None,
+            )
+            if dxf_path is None:
+                skipped_no_dxf.append(tile_name)
                 continue
 
-            # Per-side bleed based on the tile's position in the grid.
-            # A side gets bleed ONLY if there's a neighbouring tile on
-            # that side (i.e. the side is interior, not on the tile-grid
-            # perimeter). Corner tiles → bleed on the two interior sides
-            # only. Edge tiles → bleed on 3 interior sides. Interior
-            # tiles → bleed on all 4.
-            b_left   = bleed_src_px if col_index > 0                  else 0
-            b_right  = bleed_src_px if col_index < num_cols - 1       else 0
-            b_top    = bleed_src_px if row_index > 0                  else 0
-            b_bottom = bleed_src_px if row_index < num_rows - 1       else 0
-
-            # Extended source-crop bounds with the per-side bleed applied,
-            # then clamped to the image so we can't read outside the source
-            # (defensive — Rule-B guarantees the extra source exists, but
-            # unusual grid_offsets could push a row/col fully off).
-            x_start_c = max(0, x_start - b_left)
-            y_start_c = max(0, y_start - b_top)
-            x_end_c   = min(x_end + b_right, img_width)
-            y_end_c   = min(y_end + b_bottom, img_height)
-            if x_end_c <= x_start_c or y_end_c <= y_start_c:
-                skipped.append(tile_name)
+            polygon = self._read_tile_polygon_from_dxf(dxf_path)
+            if polygon is None or len(polygon) < 3:
+                skipped_no_dxf.append(tile_name)
                 continue
 
-            tile_image  = source_image[y_start_c:y_end_c, x_start_c:x_end_c]
+            # UN-SCALE the DXF polygon back into CANVAS (grid) space.
+            # Save Array multiplied every coord by (target / current)
+            # before writing the CSV; dividing by the same factor here
+            # gets us back to canvas-relative coords.
+            polygon = polygon * inverse_scale
 
-            # Output size — proportional to how much source we actually
-            # got (post-clamp), preserving the source→output scale. This
-            # keeps every output pixel worth the same physical mm.
-            out_w = max(1, int(round((x_end_c - x_start_c) * scale)))
-            out_h = max(1, int(round((y_end_c - y_start_c) * scale)))
+            # APPLY THE PAN — polygons are stored in CANVAS coords where
+            # the grid origin is fixed at (0, 0); the image is drawn at
+            # canvas position (grid_offset_x, grid_offset_y). So the
+            # image-pixel that a canvas coord P maps to is P - grid_offset.
+            # Matches the same convention as the OLD grid-cell code:
+            #   x_start = col*cell_w - grid_offset_x
+            # If you never used the pan arrows, grid_offset is (0, 0) and
+            # this is a no-op; otherwise it makes the crop align with the
+            # image at its current on-canvas position.
+            polygon = polygon - np.array(
+                [self.canvas.grid_offset_x, self.canvas.grid_offset_y],
+                dtype=np.float32,
+            )
+
+            # Polygon bounding box in source-image coords, clamped to
+            # the source so we never index outside it.
+            x_min = int(np.floor(polygon[:, 0].min()))
+            y_min = int(np.floor(polygon[:, 1].min()))
+            x_max = int(np.ceil (polygon[:, 0].max()))
+            y_max = int(np.ceil (polygon[:, 1].max()))
+            x_min = max(0, x_min); y_min = max(0, y_min)
+            x_max = min(img_width,  x_max); y_max = min(img_height, y_max)
+            if x_max <= x_min or y_max <= y_min:
+                skipped_other.append(tile_name)
+                continue
+
+            # Crop, then mask outside the polygon to solid white.
+            tile_image = source_image[y_min:y_max, x_min:x_max].copy()
+            h_crop, w_crop = tile_image.shape[:2]
+            mask = np.zeros((h_crop, w_crop), dtype=np.uint8)
+            local_pts = polygon.copy()
+            local_pts[:, 0] -= x_min
+            local_pts[:, 1] -= y_min
+            cv2.fillPoly(mask, [local_pts.astype(np.int32)], 255)
+            tile_image[mask == 0] = (255, 255, 255)
+
+            # Output size — proportional to the actual crop.
+            out_w = max(1, int(round(w_crop * scale)))
+            out_h = max(1, int(round(h_crop * scale)))
             tile_resized = cv2.resize(tile_image, (out_w, out_h),
                                       interpolation=cv2.INTER_LANCZOS4)
             tile_bgr = cv2.cvtColor(tile_resized, cv2.COLOR_RGB2BGR)
 
-            out_path = os.path.join(folder, f"{tile_name}.jpg")
+            # Save the JPEG into the SAME directory that contains the DXF
+            # for this box — i.e. right next to box_<label>.dxf. That way
+            # each box's tile folder collects both its geometry and its
+            # cut image together, no separate output tree to manage.
+            out_path = os.path.join(
+                os.path.dirname(dxf_path), f"{tile_name}.jpg",
+            )
             if cv2.imwrite(out_path, tile_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]):
                 saved.append(tile_name)
             else:
-                skipped.append(tile_name)
+                skipped_other.append(tile_name)
 
         msg = (
-            f"Saved {len(saved)} tile(s) to:\n{folder}\n\n"
-            f"Bleed: {int(BLEED_MM)} mm on interior sides "
-            f"(~{bleed_out_px} px @ {dpi} DPI, ~{bleed_src_px} src px)."
+            f"Saved {len(saved)} tile(s) into their per-box subfolders "
+            f"under:\n{dxf_dir}\n\n"
+            f"Each JPEG sits next to its box_<label>.dxf and was cut with "
+            f"that file's OFFSET boundary (color 5); outside the polygon "
+            f"is solid white."
         )
-        if skipped:
-            msg += f"\n\nSkipped (out of bounds): {', '.join(skipped)}"
+        if skipped_no_dxf:
+            msg += (
+                f"\n\nSkipped (no box_<label>.dxf found or unreadable): "
+                f"{', '.join(skipped_no_dxf)}"
+            )
+        if skipped_other:
+            msg += (
+                f"\n\nSkipped (out of bounds or write error): "
+                f"{', '.join(skipped_other)}"
+            )
         QMessageBox.information(self, "Done", msg)
 
     def update_resolution(self):

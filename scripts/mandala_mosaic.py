@@ -18,8 +18,9 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QPoint, QTimer, QBuffer, QByteArray, pyqtSignal
 from PyQt5.QtGui import (
     QPainter, QColor, QPen, QPixmap, QBrush, QFont, QPolygon, QCursor,
-    QLinearGradient,
+    QLinearGradient, QImage,
 )
+import numpy as np
 
 
 class Canvas(QWidget):
@@ -428,6 +429,121 @@ class Canvas(QWidget):
     def set_line_polygon_size(self, size):
         """Set the size (world-px) of each square placed along the line."""
         self.line_polygon_size = max(1, int(size))
+
+    @staticmethod
+    def _qimage_to_numpy_rgb(qimg):
+        """Convert a QImage OR QPixmap to an (H, W, 3) uint8 numpy array
+        in RGB order. `background_image` in this app is a QPixmap (see
+        set_background_image); accept it directly so the caller doesn't
+        need to know."""
+        if qimg is None:
+            return None
+        # QPixmap has no .format() — bounce through QImage first.
+        if isinstance(qimg, QPixmap):
+            qimg = qimg.toImage()
+        if qimg.isNull():
+            return None
+        if qimg.format() != QImage.Format_RGB888:
+            qimg = qimg.convertToFormat(QImage.Format_RGB888)
+        w = qimg.width()
+        h = qimg.height()
+        stride = qimg.bytesPerLine()
+        ptr = qimg.constBits()
+        ptr.setsize(h * stride)
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, stride)
+        # bytesPerLine may include stride padding — trim to w*3 bytes per row.
+        return arr[:, : w * 3].reshape(h, w, 3).copy()
+
+    def detect_polygons_between_circles(self):
+        """Detect polygons in the ring between the inner and outer circles
+        using mosaic_to_csv.py's adaptive-threshold + connected-components
+        + Douglas-Peucker pipeline. Each detected tile is added to
+        self.polygons as a standalone polygon filled with its mean colour.
+
+        Returns the number of polygons added."""
+        if self.background_image is None or self.background_image.isNull():
+            raise RuntimeError("No background image loaded.")
+
+        # Lazy import so mosaic_to_csv is only loaded when Detect is clicked
+        # (it pulls in ~a full Qt/PIL toolchain).
+        import sys as _sys
+        from pathlib import Path as _Path
+        mtc_dir = (_Path(__file__).resolve().parent.parent
+                   / "IMAGE_TO_MOSAIC" / "scripts")
+        if str(mtc_dir) not in _sys.path:
+            _sys.path.insert(0, str(mtc_dir))
+        from mosaic_to_csv import detect_tiles
+
+        # Convert background QImage → numpy RGB (image-pixel coords).
+        img_rgb = self._qimage_to_numpy_rgb(self.background_image)
+        if img_rgb is None:
+            raise RuntimeError("Background image conversion failed.")
+        h, w = img_rgb.shape[:2]
+
+        # Circle geometry in image-pixel coords. World coords for the
+        # background are offset by image_offset_x/y — subtract to reach
+        # pixel space.
+        self.initialize_mandala_center()
+        cx_px = float(self.mandala_center_world_x) - float(self.image_offset_x)
+        cy_px = float(self.mandala_center_world_y) - float(self.image_offset_y)
+        r_in = float(self.circle_diameter) / 2.0
+        r_out = float(self.outer_circle_diameter) / 2.0
+        if r_in <= 0 or r_out <= r_in:
+            raise RuntimeError(
+                "Circle geometry is invalid — need inner < outer, both > 0.",
+            )
+
+        # Ring mask: True inside the ring. Apply to the input as black
+        # outside the ring so adaptive-threshold + connected-components
+        # can only find tiles between the two circles.
+        Y, X = np.ogrid[:h, :w]
+        dist_sq = (X - cx_px) ** 2 + (Y - cy_px) ** 2
+        ring_mask = (dist_sq >= r_in ** 2) & (dist_sq <= r_out ** 2)
+        masked = np.where(ring_mask[..., None], img_rgb, 0).astype(np.uint8)
+
+        # Detection using the same defaults as mosaic_to_csv.py's GUI
+        # (block_size=51, C=5, min_area=200, epsilon_ratio=0.02). Colours
+        # sampled from the ORIGINAL background so tiles keep their real
+        # colour instead of a mask-dimmed one.
+        tiles = detect_tiles(
+            masked,
+            block_size=51, C=5, min_area=200, epsilon_ratio=0.02,
+            color_source_rgb=img_rgb,
+        )
+        if not tiles:
+            return 0
+
+        # Undo checkpoint before adding.
+        self._push_undo_snapshot()
+
+        added = 0
+        offx = float(self.image_offset_x)
+        offy = float(self.image_offset_y)
+        for pts, mean_rgb in tiles:
+            # Defensive: centroid must be inside the ring — detect_tiles
+            # already drops border-touching components, but a tile that
+            # straddles the mask edge could still land partly outside.
+            cxp = float(pts[:, 0].mean())
+            cyp = float(pts[:, 1].mean())
+            d_sq = (cxp - cx_px) ** 2 + (cyp - cy_px) ** 2
+            if d_sq < r_in ** 2 or d_sq > r_out ** 2:
+                continue
+
+            r255 = max(0, min(255, int(round(mean_rgb[0] * 255))))
+            g255 = max(0, min(255, int(round(mean_rgb[1] * 255))))
+            b255 = max(0, min(255, int(round(mean_rgb[2] * 255))))
+            polygon_data = {
+                'points': [(float(p[0]) + offx, float(p[1]) + offy)
+                           for p in pts],
+                'color': QColor(r255, g255, b255),
+                'is_single': True,
+                'is_detected': True,
+            }
+            self.polygons.append(polygon_data)
+            added += 1
+
+        self.update()
+        return added
 
     def set_line_polygon_gap(self, gap):
         """Set the gap (world-px) between consecutive squares."""
@@ -2229,6 +2345,25 @@ class SidePanel(QFrame):
             self.outer_circle_diameter_input = QLineEdit("1500")
             self.outer_circle_diameter_input.textChanged.connect(self.on_outer_circle_diameter_changed)
             layout.addWidget(self.outer_circle_diameter_input)
+
+            # Detect polygons in the ring between the inner + outer circles
+            # using mosaic_to_csv.py's adaptive-threshold + connected-
+            # components + Douglas-Peucker pipeline. Results are added to
+            # the canvas as standalone polygons filled with each tile's
+            # mean colour.
+            self.detect_polys_btn = QPushButton("Detect Polygons in Ring")
+            self.detect_polys_btn.setToolTip(
+                "Detect tesserae in the ring between the inner and outer "
+                "circles from the background image, using the same "
+                "algorithm as mosaic_to_csv.py (adaptive Gaussian "
+                "threshold + connected components + Douglas-Peucker "
+                "simplification). Each detected polygon is added to the "
+                "canvas filled with its mean colour."
+            )
+            self.detect_polys_btn.clicked.connect(
+                self.on_detect_polygons_between_circles,
+            )
+            layout.addWidget(self.detect_polys_btn)
             
             # Add show image checkbox
             self.show_image_checkbox = QCheckBox("Show Image")
@@ -2370,6 +2505,24 @@ class SidePanel(QFrame):
                 self.canvas.set_outer_circle_diameter(diameter)
             except ValueError:
                 pass   # ignore mid-typing invalid text
+
+    def on_detect_polygons_between_circles(self):
+        """Detect-Polygons-in-Ring button handler — delegates to the canvas
+        method which does the actual detection + polygon insertion."""
+        if not self.canvas:
+            return
+        try:
+            n = self.canvas.detect_polygons_between_circles()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Detection failed", f"{type(e).__name__}: {e}",
+            )
+            return
+        QMessageBox.information(
+            self, "Detection complete",
+            f"Detected {n} polygon(s) in the ring between the inner and "
+            f"outer circles. They are now on the canvas.",
+        )
 
     def on_circle_diameter_changed(self, text):
         """Handle circle diameter input change"""
