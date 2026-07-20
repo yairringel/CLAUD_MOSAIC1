@@ -1853,26 +1853,36 @@ class MainWindow(QMainWindow):
             out_h = max(1, int(round(h_crop * scale)))
             tile_resized = cv2.resize(tile_image, (out_w, out_h),
                                       interpolation=cv2.INTER_LANCZOS4)
-            tile_bgr = cv2.cvtColor(tile_resized, cv2.COLOR_RGB2BGR)
 
-            # Save the JPEG into the SAME directory that contains the DXF
-            # for this box — i.e. right next to box_<label>.dxf. That way
-            # each box's tile folder collects both its geometry and its
-            # cut image together, no separate output tree to manage.
+            # Save the PNG into the SAME directory that contains the DXF
+            # for this box — right next to box_<label>.dxf. Each box's
+            # tile folder collects both its geometry and its cut image
+            # together, no separate output tree to manage.
+            # DPI is written into the PNG's pHYs chunk so Photoshop /
+            # Illustrator / Inkscape open the file at the correct
+            # physical print size (mm / inches) instead of defaulting
+            # to 72 dpi.
             out_path = os.path.join(
-                os.path.dirname(dxf_path), f"{tile_name}.jpg",
+                os.path.dirname(dxf_path), f"{tile_name}.png",
             )
-            if cv2.imwrite(out_path, tile_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+            try:
+                from PIL import Image as _PILImage
+                # tile_resized is RGB (cv_image is stored RGB in this app).
+                _PILImage.fromarray(tile_resized).save(
+                    out_path, format="PNG",
+                    dpi=(float(dpi), float(dpi)),
+                )
                 saved.append(tile_name)
-            else:
+            except Exception:
                 skipped_other.append(tile_name)
 
         msg = (
             f"Saved {len(saved)} tile(s) into their per-box subfolders "
             f"under:\n{dxf_dir}\n\n"
-            f"Each JPEG sits next to its box_<label>.dxf and was cut with "
-            f"that file's OFFSET boundary (color 5); outside the polygon "
-            f"is solid white."
+            f"Each PNG sits next to its box_<label>.dxf, was cut with "
+            f"that file's OFFSET boundary (color 5), and carries the "
+            f"current DPI ({dpi}) in its pHYs metadata so Photoshop "
+            f"opens it at the correct print size."
         )
         if skipped_no_dxf:
             msg += (
