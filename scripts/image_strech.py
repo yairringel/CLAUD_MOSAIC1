@@ -6,13 +6,16 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QPushButton, QLabel, QFileDialog, QMessageBox, QScrollArea, QSpinBox, QDoubleSpinBox,
                              QSlider, QGroupBox, QFormLayout, QShortcut)
 from PyQt5.QtGui import (
-    QBrush, QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap,
-    QPolygonF,
+    QBrush, QColor, QCursor, QFont, QImage, QKeySequence, QPainter,
+    QPainterPath, QPen, QPixmap, QPolygonF,
 )
 from PyQt5.QtCore import Qt, QPoint, QPointF, QEvent, pyqtSignal, QRectF
 
 class ImageCanvas(QWidget):
     selection_changed = pyqtSignal(int) # Emits index of selected polygon, or -1
+    polygon_sampled  = pyqtSignal(int)  # Emits the just-sampled polygon index
+    polygon_pasted   = pyqtSignal(int)  # Emits the just-pasted target polygon index
+    copy_mode_ended  = pyqtSignal()     # Copy Polygon mode exited (Esc); button un-toggles
 
     def __init__(self):
         super().__init__()
@@ -62,6 +65,41 @@ class ImageCanvas(QWidget):
         # the mosaic underneath distracting the eye. Overlays (grid,
         # polygons, circles) still draw on top as usual.
         self.show_background_image = True
+
+        # Copy Polygon workflow — a single stateful two-click gesture:
+        #   1st click → source polygon (sample_polygon_mode fires)
+        #   2nd click → target polygon (paste_polygon_mode fires, warp)
+        # copy_polygon_workflow=True glues the two together so the sample
+        # step auto-transitions into the paste step on the SAME arming
+        # (mousePressEvent handles the switch). Set from the sidebar's
+        # "Copy Polygon" button; cleared on paste completion or Esc.
+        # sampled_polygon_index remembers the source across clicks.
+        # polygon_fill_images: dict of {target_polygon_index: QImage RGBA}.
+        # Each warped patch is stretched from the source polygon's bbox
+        # (cv2.resize) into the target polygon's bbox, alpha-masked to
+        # the target polygon shape, and painted in paintEvent under a
+        # QPainterPath clip so it only appears inside the polygon.
+        self.sample_polygon_mode = False
+        self.paste_polygon_mode = False
+        self.copy_polygon_workflow = False
+        self.sampled_polygon_index = None
+        self.polygon_fill_images = {}
+        # Captured at sample time — the ACTUAL contents of the source
+        # polygon (masked to its shape, not just its bbox). Reused by
+        # the paste step so we stretch only the polygon's interior,
+        # not the surrounding pixels.
+        self._sampled_rgb = None       # (H, W, 3) uint8, RGB
+        self._sampled_alpha = None     # (H, W)    uint8, 255 inside polygon
+        # Colored cursors so the user can tell which phase of the Copy
+        # Polygon workflow they're in: GREEN cross = pick the SOURCE,
+        # RED cross = pick the TARGET. They cycle back to GREEN after
+        # each paste so multiple copies can be made without unpressing.
+        self._cursor_source_phase = self._make_colored_cross_cursor(
+            QColor(0, 200, 0),
+        )
+        self._cursor_target_phase = self._make_colored_cross_cursor(
+            QColor(220, 30, 30),
+        )
         # Circles: each entry is [cx, cy, radius]
         self.circles = []
         self.drawing_circle = False
@@ -261,7 +299,63 @@ class ImageCanvas(QWidget):
             
             # Ensure point is within image bounds (allow slightly outside for editing handles)
             if 0 <= img_x < self.image.width() and 0 <= img_y < self.image.height() or (not self.selecting_mode and not self.drawing_polygon and not self.drawing_circle):
-                
+
+                # Polygon-sampling modes win over every other click:
+                # one left-click either records the source polygon
+                # (sample) or performs the warp+paste into the clicked
+                # target polygon (paste). Both auto-exit after one hit.
+                # `img_x` / `img_y` are in GRID / canvas coords — the
+                # same coord system polygons are stored in — so a
+                # standard point-in-polygon test works directly.
+                if (self.sample_polygon_mode
+                        and event.button() == Qt.LeftButton):
+                    idx = self._find_polygon_at(img_x, img_y)
+                    if idx is None:
+                        # Missed — stay in sample phase (green cross)
+                        # so accidental clicks don't drop us out.
+                        return
+                    self.sampled_polygon_index = idx
+                    # Capture the polygon interior NOW so the sidebar
+                    # preview shows exactly what will be pasted.
+                    result = self._capture_source_patch(idx)
+                    if result is not None:
+                        self._sampled_rgb, self._sampled_alpha = result
+                    else:
+                        self._sampled_rgb = None
+                        self._sampled_alpha = None
+                    self.polygon_sampled.emit(idx)
+                    self.sample_polygon_mode = False
+                    # Inside the Copy Polygon toggle-workflow, advance
+                    # to the target phase (RED cross) — no button press
+                    # needed. Otherwise (one-shot sample) exit the mode.
+                    if self.copy_polygon_workflow:
+                        self.paste_polygon_mode = True
+                        self.setCursor(self._cursor_target_phase)
+                    else:
+                        self.setCursor(Qt.ArrowCursor)
+                    self.update()
+                    return
+                if (self.paste_polygon_mode
+                        and event.button() == Qt.LeftButton):
+                    tgt = self._find_polygon_at(img_x, img_y)
+                    if tgt is None:
+                        # Missed — stay in paste phase (red cross).
+                        return
+                    self._warp_sampled_to_target(tgt)
+                    self.polygon_pasted.emit(tgt)
+                    self.paste_polygon_mode = False
+                    # Inside the Copy Polygon toggle-workflow, LOOP back
+                    # to the source phase (GREEN cross) so the user can
+                    # keep making copies. Outside the toggle-workflow,
+                    # exit to the arrow cursor.
+                    if self.copy_polygon_workflow:
+                        self.sample_polygon_mode = True
+                        self.setCursor(self._cursor_source_phase)
+                    else:
+                        self.setCursor(Qt.ArrowCursor)
+                    self.update()
+                    return
+
                 if self.fill_mode:
                     # Toggle the clicked polygon's membership in the fill
                     # selection. Only left-clicks count; right-click is a
@@ -490,6 +584,18 @@ class ImageCanvas(QWidget):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
+            # Exit either polygon-sampling mode if the user changes their mind.
+            was_in_copy = (self.sample_polygon_mode
+                           or self.paste_polygon_mode
+                           or self.copy_polygon_workflow)
+            if was_in_copy:
+                self.sample_polygon_mode = False
+                self.paste_polygon_mode = False
+                self.copy_polygon_workflow = False
+                self.setCursor(Qt.ArrowCursor)
+                # Tell the main window to un-toggle the Copy Polygon
+                # button so its checked state matches reality.
+                self.copy_mode_ended.emit()
             self.selected_polygon_index = None
             self.selected_circle_index = None
             self.dragging_point_index = None
@@ -499,7 +605,21 @@ class ImageCanvas(QWidget):
             self.update()
         elif event.key() == Qt.Key_Delete:
             if self.selected_polygon_index is not None:
-                self.polygons.pop(self.selected_polygon_index)
+                deleted_idx = self.selected_polygon_index
+                self.polygons.pop(deleted_idx)
+                # Rebuild polygon_fill_images so keys after the deletion
+                # shift down by 1 (matches the polygons list re-indexing).
+                self.polygon_fill_images = {
+                    (i if i < deleted_idx else i - 1): im
+                    for i, im in self.polygon_fill_images.items()
+                    if i != deleted_idx
+                }
+                # If the deleted polygon was the sampled source, invalidate.
+                if self.sampled_polygon_index == deleted_idx:
+                    self.sampled_polygon_index = None
+                elif (self.sampled_polygon_index is not None
+                      and self.sampled_polygon_index > deleted_idx):
+                    self.sampled_polygon_index -= 1
                 self.selected_polygon_index = None
                 self.dragging_point_index = None
                 self.selection_changed.emit(-1)
@@ -509,6 +629,238 @@ class ImageCanvas(QWidget):
                 self.circles.pop(self.selected_circle_index)
                 self.selected_circle_index = None
                 self.update()
+
+    @staticmethod
+    def _make_colored_cross_cursor(color: QColor) -> QCursor:
+        """Build a 32-px cross cursor in the given colour with a white
+        outline so it stays visible on any background. Hotspot is the
+        centre pixel."""
+        pix = QPixmap(32, 32)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        # White outline first (thicker).
+        p.setPen(QPen(QColor(255, 255, 255), 4))
+        p.drawLine(16, 2, 16, 30)
+        p.drawLine(2, 16, 30, 16)
+        # Coloured cross on top.
+        p.setPen(QPen(color, 2))
+        p.drawLine(16, 2, 16, 30)
+        p.drawLine(2, 16, 30, 16)
+        p.end()
+        return QCursor(pix, 16, 16)
+
+    @staticmethod
+    def _point_in_polygon(x, y, poly):
+        """Ray-casting point-in-polygon test. poly is a list of (x, y)
+        tuples in the same coord system as (x, y)."""
+        n = len(poly)
+        if n < 3:
+            return False
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > y) != (yj > y)) and (
+                x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
+            ):
+                inside = not inside
+            j = i
+        return inside
+
+    def _find_polygon_at(self, x, y):
+        """Return the index of the topmost polygon containing (x, y) in
+        grid / canvas coords, or None. Iterates in reverse so recently-
+        drawn polygons are picked first (matches typical Z-order)."""
+        for i in range(len(self.polygons) - 1, -1, -1):
+            if self._point_in_polygon(x, y, self.polygons[i]):
+                return i
+        return None
+
+    def _capture_source_patch(self, src_idx):
+        """Extract the SOURCE polygon's interior from cv_image. Returns
+        (rgb, alpha) numpy arrays where alpha is 255 inside the polygon
+        shape (and 0 in the bbox area outside the polygon), or None on
+        failure. The RGB pixels outside the polygon are still present in
+        the array but are masked out via alpha — later resize passes
+        stretch both channels together so the polygon-shape stays the
+        actual source area, not its enclosing rectangle."""
+        if (self.cv_image is None
+                or not (0 <= src_idx < len(self.polygons))):
+            return None
+        src_poly = self.polygons[src_idx]
+        if len(src_poly) < 3:
+            return None
+        h_img, w_img = self.cv_image.shape[:2]
+        # Grid → image coords: subtract grid_offset (image sits at
+        # canvas position (grid_offset_x, grid_offset_y)). Clamp to
+        # image bounds.
+        src_ipx = [p[0] - self.grid_offset_x for p in src_poly]
+        src_ipy = [p[1] - self.grid_offset_y for p in src_poly]
+        sx1 = max(0, int(round(min(src_ipx))))
+        sy1 = max(0, int(round(min(src_ipy))))
+        sx2 = min(w_img, int(round(max(src_ipx)) + 1))
+        sy2 = min(h_img, int(round(max(src_ipy)) + 1))
+        if sx2 <= sx1 or sy2 <= sy1:
+            return None
+        src_rgb = self.cv_image[sy1:sy2, sx1:sx2].copy()
+        src_h, src_w = src_rgb.shape[:2]
+        # Source polygon alpha in source-bbox-local coords.
+        src_alpha = np.zeros((src_h, src_w), dtype=np.uint8)
+        src_local = np.array(
+            [[int(round(p[0] - self.grid_offset_x - sx1)),
+              int(round(p[1] - self.grid_offset_y - sy1))]
+             for p in src_poly],
+            dtype=np.int32,
+        )
+        cv2.fillPoly(src_alpha, [src_local], 255)
+        return src_rgb, src_alpha
+
+    def last_sampled_qimage(self):
+        """Return the last-captured source patch as an RGBA QImage (for
+        the sidebar preview), or None if nothing has been sampled."""
+        if self._sampled_rgb is None or self._sampled_alpha is None:
+            return None
+        rgba = np.ascontiguousarray(
+            np.dstack([self._sampled_rgb, self._sampled_alpha]),
+        )
+        h, w = rgba.shape[:2]
+        return QImage(
+            rgba.data, w, h, w * 4, QImage.Format_RGBA8888,
+        ).copy()
+
+    @staticmethod
+    def _resample_polygon_boundary(pts, n):
+        """Resample a polygon boundary to n points equally spaced by
+        arc length (starting at vertex 0, not including the closing
+        vertex). Returns an (n, 2) float32 array."""
+        pts = np.asarray(pts, dtype=np.float32)
+        if len(pts) < 3:
+            return pts
+        # Segment lengths, closing the loop back to pts[0].
+        loop = np.vstack([pts, pts[:1]])
+        seg_diffs = np.diff(loop, axis=0)
+        seg_lens = np.linalg.norm(seg_diffs, axis=1)
+        cum_lens = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        total = cum_lens[-1]
+        if total <= 0:
+            return pts
+        target_lens = np.linspace(0.0, total, n, endpoint=False)
+        out = np.zeros((n, 2), dtype=np.float32)
+        for i, t in enumerate(target_lens):
+            seg_i = int(np.searchsorted(cum_lens, t, side="right") - 1)
+            seg_i = max(0, min(len(seg_lens) - 1, seg_i))
+            seg_len = max(float(seg_lens[seg_i]), 1e-6)
+            frac = (t - cum_lens[seg_i]) / seg_len
+            p0 = pts[seg_i]
+            p1 = pts[(seg_i + 1) % len(pts)]
+            out[i] = p0 + frac * (p1 - p0)
+        return out
+
+    def _warp_sampled_to_target(self, target_idx):
+        """Piecewise-affine warp from the SOURCE polygon shape to the
+        TARGET polygon shape. Both boundaries are resampled to the same
+        number of points, fan-triangulated from the centroid, and every
+        triangle is warped with cv2.getAffineTransform + cv2.warpAffine.
+
+        This is what makes the target polygon FILL completely: each
+        target-triangle receives its matching source-triangle content,
+        stretched non-linearly, so the source polygon's boundary maps
+        exactly to the target polygon's boundary regardless of shape
+        differences. A simple bbox-to-bbox resize can't achieve this —
+        it leaves gaps where the source polygon didn't cover its own
+        bbox, or bleeds surrounding pixels through them."""
+        if (self.sampled_polygon_index is None
+                or not (0 <= self.sampled_polygon_index < len(self.polygons))
+                or not (0 <= target_idx < len(self.polygons))
+                or self.cv_image is None):
+            return
+        src_poly_grid = self.polygons[self.sampled_polygon_index]
+        tgt_poly_grid = self.polygons[target_idx]
+        if len(src_poly_grid) < 3 or len(tgt_poly_grid) < 3:
+            return
+
+        # Source polygon in IMAGE-pixel coords (subtract grid_offset).
+        src_pts_img = np.array(
+            [(p[0] - self.grid_offset_x,
+              p[1] - self.grid_offset_y) for p in src_poly_grid],
+            dtype=np.float32,
+        )
+        # Target polygon bbox and target-bbox-local coords.
+        tgt_pts = np.array(tgt_poly_grid, dtype=np.float32)
+        tx1 = float(tgt_pts[:, 0].min())
+        ty1 = float(tgt_pts[:, 1].min())
+        tx2 = float(tgt_pts[:, 0].max())
+        ty2 = float(tgt_pts[:, 1].max())
+        tw = max(1, int(round(tx2 - tx1)))
+        th = max(1, int(round(ty2 - ty1)))
+        tgt_pts_local = tgt_pts - np.array([tx1, ty1], dtype=np.float32)
+
+        # Resample both boundaries to the SAME number of points so we
+        # have one-to-one correspondence for the triangulation. N=32 is
+        # a good balance: fine enough to reproduce curved boundaries
+        # smoothly, coarse enough to keep the warp fast.
+        N = 32
+        src_boundary = self._resample_polygon_boundary(src_pts_img, N)
+        tgt_boundary = self._resample_polygon_boundary(tgt_pts_local, N)
+        src_center = src_pts_img.mean(axis=0)
+        tgt_center = tgt_pts_local.mean(axis=0)
+
+        # Output accumulators.
+        warped_rgb = np.zeros((th, tw, 3), dtype=np.uint8)
+        warped_alpha = np.zeros((th, tw), dtype=np.uint8)
+
+        # Fan triangulation from centroid: N triangles (centroid,
+        # boundary_i, boundary_{i+1}). For each pair we compute an
+        # affine that maps the source triangle onto the target
+        # triangle, warp the whole cv_image with it, and stamp the
+        # result into the target-triangle region.
+        for i in range(N):
+            j = (i + 1) % N
+            src_tri = np.array(
+                [src_center, src_boundary[i], src_boundary[j]],
+                dtype=np.float32,
+            )
+            tgt_tri = np.array(
+                [tgt_center, tgt_boundary[i], tgt_boundary[j]],
+                dtype=np.float32,
+            )
+            # Skip degenerate (near-zero-area) triangles — they'd make
+            # the affine solve unstable.
+            v1 = tgt_tri[1] - tgt_tri[0]
+            v2 = tgt_tri[2] - tgt_tri[0]
+            if abs(v1[0] * v2[1] - v1[1] * v2[0]) < 1e-3:
+                continue
+
+            M = cv2.getAffineTransform(src_tri, tgt_tri)
+            warped_full = cv2.warpAffine(
+                self.cv_image, M, (tw, th),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+
+            # Only the target triangle receives its warped source
+            # content — other regions of `warped_full` are ignored.
+            tri_mask = np.zeros((th, tw), dtype=np.uint8)
+            cv2.fillConvexPoly(
+                tri_mask,
+                np.round(tgt_tri).astype(np.int32), 255,
+            )
+            sel = tri_mask > 0
+            warped_rgb[sel] = warped_full[sel]
+            warped_alpha[sel] = 255
+
+        warped_rgba = np.ascontiguousarray(
+            np.dstack([warped_rgb, warped_alpha]),
+        )
+        qimg = QImage(
+            warped_rgba.data, tw, th, tw * 4,
+            QImage.Format_RGBA8888,
+        ).copy()
+        self.polygon_fill_images[target_idx] = qimg
+        self.update()
 
     def perform_stretch(self):
         if len(self.points) != 4:
@@ -707,19 +1059,44 @@ class ImageCanvas(QWidget):
 
         # Draw completed polygons
         if self.polygons:
-            # When the background image is hidden (red field), also fill
-            # every polygon interior solid white so shapes read against
-            # the red. Drawn BEFORE the outline pass so the outline sits
-            # on top and remains visible.
-            if not self.show_background_image:
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(Qt.white))
-                for poly in self.polygons:
-                    if len(poly) >= 3:
-                        painter.drawPolygon(QPolygonF(
-                            [QPointF(px, py) for px, py in poly]
-                        ))
-                painter.setBrush(Qt.NoBrush)
+            # Fill pass, drawn BEFORE the outline pass so outlines sit on top.
+            # For each polygon:
+            #  - if it has a warped image patch in polygon_fill_images, clip
+            #    to the polygon shape and drawImage into its bbox.
+            #  - otherwise, when background-off mode is on, fill solid white
+            #    so shapes read against the red canvas.
+            painter.setPen(Qt.NoPen)
+            for idx, poly in enumerate(self.polygons):
+                if len(poly) < 3:
+                    continue
+                qpath = QPainterPath()
+                qpath.moveTo(poly[0][0], poly[0][1])
+                for px, py in poly[1:]:
+                    qpath.lineTo(px, py)
+                qpath.closeSubpath()
+                warped = self.polygon_fill_images.get(idx)
+                if warped is not None and not warped.isNull():
+                    # Draw the warped patch inside the polygon shape.
+                    # Clipping restricts drawing to the polygon; the patch
+                    # is already the size of the polygon's bbox, so we
+                    # place its top-left at (min_x, min_y) of the polygon.
+                    xs = [p[0] for p in poly]
+                    ys = [p[1] for p in poly]
+                    min_x, min_y = min(xs), min(ys)
+                    max_x, max_y = max(xs), max(ys)
+                    painter.save()
+                    painter.setClipPath(qpath)
+                    painter.drawImage(
+                        QRectF(min_x, min_y, max_x - min_x, max_y - min_y),
+                        warped,
+                    )
+                    painter.restore()
+                elif not self.show_background_image:
+                    painter.setBrush(QBrush(Qt.white))
+                    painter.drawPolygon(QPolygonF(
+                        [QPointF(px, py) for px, py in poly]
+                    ))
+            painter.setBrush(Qt.NoBrush)
 
             for idx, poly in enumerate(self.polygons):
                 # Marked-overlapping > fill-selected > selected > normal
@@ -930,6 +1307,52 @@ class MainWindow(QMainWindow):
         fill_row.addWidget(self.fill_gap_spin)
         fill_row.addWidget(self.fix_gap_btn)
         sidebar_layout.addLayout(fill_row)
+
+        # ── Copy Polygon (unified two-click workflow) ─────────────────
+        # Single button. Arms a stateful two-click gesture on the canvas:
+        # 1st click → source polygon (image content is remembered)
+        # 2nd click → target polygon (source's bbox contents are
+        #             non-uniformly stretched to fit the target's bbox,
+        #             then clipped to the target polygon shape via alpha)
+        # Escape at any point cancels the workflow.
+        # Toggle button: press once to enter Copy Polygon mode, click
+        # source (GREEN cross) then target (RED cross) as many times as
+        # you like — mode stays on until you unpress the button or hit
+        # Esc. Cursor colour is your live indicator of the current phase.
+        self.copy_poly_btn = QPushButton("Copy Polygon")
+        self.copy_poly_btn.setCheckable(True)
+        self.copy_poly_btn.setToolTip(
+            "Toggle Copy Polygon mode. GREEN cross = pick the SOURCE "
+            "polygon; after that the cursor turns to a RED cross = pick "
+            "the TARGET polygon (the source is warped into it). Then "
+            "the cursor cycles back to GREEN so you can copy another "
+            "polygon without pressing this button again. Un-press this "
+            "button (or press Esc) to exit."
+        )
+        self.copy_poly_btn.toggled.connect(self.on_copy_polygon_toggled)
+        sidebar_layout.addWidget(self.copy_poly_btn)
+        # Un-toggle the button when Esc exits copy mode on the canvas
+        # side, so the checked state stays in sync with reality.
+        self.canvas.copy_mode_ended.connect(
+            lambda: self._set_copy_button_checked_silent(False),
+        )
+
+        # Debug / feedback preview: shows the SOURCE polygon's interior
+        # exactly as it was captured (masked to the source polygon shape,
+        # transparency around it in a checkerboard pattern via a subtle
+        # background so you can see the shape).
+        sidebar_layout.addWidget(QLabel("Sampled source:"))
+        self.sampled_preview_label = QLabel()
+        self.sampled_preview_label.setFixedSize(240, 160)
+        self.sampled_preview_label.setAlignment(Qt.AlignCenter)
+        self.sampled_preview_label.setStyleSheet(
+            "QLabel { background-color: #eaeaea; border: 1px dashed #888; }"
+        )
+        self.sampled_preview_label.setText("(none yet)")
+        sidebar_layout.addWidget(self.sampled_preview_label)
+
+        self.canvas.polygon_sampled.connect(self._on_polygon_sampled)
+        self.canvas.polygon_pasted.connect(self._on_polygon_pasted)
         sidebar_layout.addWidget(self.circle_btn)
         sidebar_layout.addWidget(save_btn)
         sidebar_layout.addWidget(save_circle_btn)
@@ -1366,6 +1789,97 @@ class MainWindow(QMainWindow):
         if len(pts) < 3:
             return 0.0
         return float(cv2.contourArea(pts))
+
+    # ----- copy polygon (toggle-mode, cycles source ↔ target) -----------
+
+    def _set_copy_button_checked_silent(self, checked: bool):
+        """Set the Copy Polygon button's checked state WITHOUT firing
+        its toggled signal — used when the canvas exits via Esc and
+        we just need the checkbox visual to catch up."""
+        self.copy_poly_btn.blockSignals(True)
+        self.copy_poly_btn.setChecked(checked)
+        self.copy_poly_btn.blockSignals(False)
+
+    def on_copy_polygon_toggled(self, checked: bool):
+        """Copy Polygon toggle handler — pressed enters mode, unpressed
+        exits. While pressed, the canvas cycles between source phase
+        (green cross) and target phase (red cross) on every paste."""
+        if checked:
+            # Guard preconditions; if they fail, un-toggle the button.
+            if not self.canvas.polygons:
+                self._set_copy_button_checked_silent(False)
+                QMessageBox.warning(
+                    self, "No polygons",
+                    "Load or draw polygons first — Copy Polygon needs "
+                    "at least two polygons on the canvas.",
+                )
+                return
+            if self.canvas.cv_image is None:
+                self._set_copy_button_checked_silent(False)
+                QMessageBox.warning(
+                    self, "No image",
+                    "Load an image — the paste needs image pixels to warp.",
+                )
+                return
+            # Arm source phase (green cross).
+            self.canvas.sample_polygon_mode = True
+            self.canvas.paste_polygon_mode = False
+            self.canvas.copy_polygon_workflow = True
+            self.canvas.setCursor(self.canvas._cursor_source_phase)
+            self.statusBar().showMessage(
+                "Copy Polygon ON — GREEN cross: click a SOURCE polygon. "
+                "Unpress the button or hit Esc to exit.",
+            )
+        else:
+            # Exit: clear all copy-mode flags and restore the arrow.
+            self.canvas.sample_polygon_mode = False
+            self.canvas.paste_polygon_mode = False
+            self.canvas.copy_polygon_workflow = False
+            self.canvas.setCursor(Qt.ArrowCursor)
+            self.statusBar().showMessage("Copy Polygon OFF")
+
+    def _on_polygon_sampled(self, idx: int) -> None:
+        n = (
+            len(self.canvas.polygons[idx])
+            if 0 <= idx < len(self.canvas.polygons) else 0
+        )
+        # Refresh the sidebar preview so the user can see EXACTLY what
+        # was captured — pixels are masked to the source polygon shape
+        # (transparent outside), scaled to fit the preview label.
+        qimg = self.canvas.last_sampled_qimage()
+        if qimg is not None and not qimg.isNull():
+            pix = QPixmap.fromImage(qimg).scaled(
+                self.sampled_preview_label.width(),
+                self.sampled_preview_label.height(),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+            self.sampled_preview_label.setPixmap(pix)
+            self.sampled_preview_label.setText("")
+        else:
+            self.sampled_preview_label.clear()
+            self.sampled_preview_label.setText("(sample failed)")
+        if self.canvas.copy_polygon_workflow:
+            self.statusBar().showMessage(
+                f"Source = #{idx} ({n} vertices). Cursor is RED now — "
+                f"click a TARGET polygon to paste. Esc to cancel.",
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Source polygon set to #{idx} ({n} vertices) — see "
+                f"sidebar preview.",
+            )
+
+    def _on_polygon_pasted(self, idx: int) -> None:
+        src = self.canvas.sampled_polygon_index
+        if self.canvas.copy_polygon_workflow:
+            self.statusBar().showMessage(
+                f"Copied polygon #{src} → #{idx}. Cursor is GREEN again "
+                f"— click another SOURCE, or un-press Copy Polygon.",
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Copied polygon #{src} → #{idx}.",
+            )
 
     def on_polygon_selection_changed(self, idx: int) -> None:
         """Status-bar hook: when the canvas selection changes, show the
