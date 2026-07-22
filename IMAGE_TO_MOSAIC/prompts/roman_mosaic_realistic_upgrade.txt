@@ -1,0 +1,43 @@
+The supplied image is ALREADY a mosaic — the tiles have been laid out and the tessellation is fixed. Your task is to RE-RENDER this mosaic so it looks like an authentic, real-world ancient Roman mosaic photographed from above, WITHOUT changing which tiles exist or where they sit.
+
+INPUT FORMAT NOTE — the image may be a synthetic RENDERING of a polygon-mosaic CSV array (each solid-colour polygon separated by thin dark grout lines is exactly one tessera). Treat every colored polygon in the input as one tile of the final mosaic. The polygon's outline in the input equals the tile's silhouette in the output.
+
+═══ Rule #1 (highest priority): PRESERVE THE TILE GEOMETRY EXACTLY ═══
+- Every tile in the input remains a tile in the output at THE SAME POSITION and THE SAME SHAPE. No tile is moved, resized, rotated, split, merged, added, or removed.
+- Tile boundaries in the output must line up pixel-for-pixel with the tile boundaries in the input. The grout lines run in exactly the same places.
+- The number of tiles in the output equals the number of tiles in the input. Same tessellation, same layout.
+- Do NOT resample the mosaic into a different tessellation. Do NOT introduce new subdivisions. Do NOT round-off or smooth the tile edges into a different shape.
+- Self-check: if you overlaid the input on the output, every tile-boundary would coincide. Failing this rule is failing the whole task.
+
+Color palette — RESTRICTED to real Roman mosaic pigments:
+- Use ONLY colors that occur in authentic ancient Roman mosaics: cream / bone white, warm ochre / mustard, terracotta red, oxblood / brick red, burnt sienna, umber / dark brown, olive green, muted teal / slate blue-gray, charcoal / near-black. A very small amount of gold-ochre or muted rust is allowed. Also a few dark near-black glass tesserae for shadow accents.
+- NO fluorescent colors. NO modern synthetic hues (hot pink, neon, saturated magenta, electric blue, lime green, etc.). NO pure primary colors — always dulled and earthy.
+- Every color in the input mosaic maps to the NEAREST authentic pigment. Preserve the input's overall tonal composition (which regions are dark vs light, warm vs cool) — just shift each color to a historically-plausible pigment.
+
+Per-stone realism — details and small defects:
+- Each tessera is a real physical stone cube seen from above. It has:
+  - Subtle internal color variation — a very slight gradient or mottling within the tile, consistent with natural stone (marble veining, travertine grain, limestone speckling). The variation is GENTLE; the tile still reads as one dominant color.
+  - Small imperfections at the edges: a chipped corner here, a shallow crack there, a slightly worn edge. Distribute these SPARINGLY — most tiles look clean; a minority have visible wear.
+  - Very light surface texture — a faint stone grain, not a photorealistic scan. No glossy reflections; the surface is MATTE.
+- Defects are per-tile and small; they do NOT extend across tile boundaries and they do NOT break the tile's overall solid color read from a distance.
+- No missing tiles, no gaping holes — the mosaic is intact. Only cosmetic aging on individual tesserae.
+
+Grout:
+- Grout occupies the exact same pixels as the boundaries between tiles in the input. Grout color: dark, uniform charcoal-to-near-black (#1a1a1a to #333). Slight color variation is allowed to look natural (a hint of dust or age). Not pale, not beige.
+- Grout width matches the input's grout width. Do NOT widen or narrow the grout lines.
+- Grout lines are continuous — no missing sections, no gaps.
+
+Lighting and camera:
+- Perfectly even, diffuse illumination across the entire mosaic — as if photographed under a soft overhead source or an overcast sky. No hot spots, no directional shadows, no vignetting, no highlights on specific tiles.
+- Strict orthographic top-down view, perpendicular to the floor. No perspective distortion, no tilt.
+- The mosaic fills the frame edge to edge. No border, no surrounding floor, no background.
+
+Output:
+- Match the input image's aspect ratio and resolution exactly.
+- Sharp, well-defined tile edges where they meet the grout. Small internal per-tile detail and mild defects. Even lighting throughout.
+
+Final self-check before emitting:
+- Tile positions and shapes are unchanged from the input.
+- Every color is from the Roman palette above.
+- Individual tiles show subtle stone realism (grain, slight color variation, occasional small chip or crack) but each tile still reads as one dominant color from a distance.
+- Lighting is even everywhere; no highlights, no shadows on the surface.

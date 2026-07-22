@@ -717,19 +717,6 @@ class ImageCanvas(QWidget):
         cv2.fillPoly(src_alpha, [src_local], 255)
         return src_rgb, src_alpha
 
-    def last_sampled_qimage(self):
-        """Return the last-captured source patch as an RGBA QImage (for
-        the sidebar preview), or None if nothing has been sampled."""
-        if self._sampled_rgb is None or self._sampled_alpha is None:
-            return None
-        rgba = np.ascontiguousarray(
-            np.dstack([self._sampled_rgb, self._sampled_alpha]),
-        )
-        h, w = rgba.shape[:2]
-        return QImage(
-            rgba.data, w, h, w * 4, QImage.Format_RGBA8888,
-        ).copy()
-
     @staticmethod
     def _resample_polygon_boundary(pts, n):
         """Resample a polygon boundary to n points equally spaced by
@@ -855,12 +842,77 @@ class ImageCanvas(QWidget):
         warped_rgba = np.ascontiguousarray(
             np.dstack([warped_rgb, warped_alpha]),
         )
-        qimg = QImage(
-            warped_rgba.data, tw, th, tw * 4,
-            QImage.Format_RGBA8888,
-        ).copy()
-        self.polygon_fill_images[target_idx] = qimg
+
+        # BAKE INTO BACKGROUND (not stored as polygon fill):
+        # Enlarge the warped patch by 20% around its centre so it bleeds
+        # slightly beyond the target polygon's boundary, then alpha-blend
+        # into cv_image directly. The polygon itself stays "empty" in
+        # polygon_fill_images — its outline still renders on top of the
+        # pasted background content but no polygon-fill patch is stored.
+        self.polygon_fill_images.pop(target_idx, None)
+        self._paste_warped_onto_background(
+            warped_rgba, tx1, ty1, tw, th, scale=1.20,
+        )
         self.update()
+
+    def _paste_warped_onto_background(
+        self, warped_rgba, tx1, ty1, tw, th, scale=1.20,
+    ):
+        """Enlarge `warped_rgba` uniformly by `scale` around its own
+        centre (which equals the target polygon's bounding-box centre),
+        then alpha-blend it into cv_image at the corresponding image-
+        pixel position. Triggers apply_effects + update_image_from_cv
+        so the change appears immediately on the canvas.
+
+        The 20% enlargement makes the pasted content bleed just past
+        the target polygon edge, so subsequent Copy Polygons into
+        neighbouring polygons overlap cleanly instead of leaving seams
+        at every tile boundary."""
+        if self.cv_image is None:
+            return
+        ew = max(1, int(round(tw * scale)))
+        eh = max(1, int(round(th * scale)))
+        enlarged = cv2.resize(
+            warped_rgba, (ew, eh), interpolation=cv2.INTER_LANCZOS4,
+        )
+
+        # Target bbox centre in IMAGE-pixel coords (subtract grid_offset
+        # because cv_image is indexed in image pixels while tx1/ty1 are
+        # in grid coords).
+        img_cx = (tx1 + tw / 2.0) - self.grid_offset_x
+        img_cy = (ty1 + th / 2.0) - self.grid_offset_y
+
+        # Top-left of the enlarged patch in image pixels — centred on
+        # the target's bbox centre, so growing by 15% expands equally
+        # on all four sides.
+        px = int(round(img_cx - ew / 2.0))
+        py = int(round(img_cy - eh / 2.0))
+
+        # Clamp to image bounds; skip entirely if fully off-image.
+        h_img, w_img = self.cv_image.shape[:2]
+        x1 = max(0, px); y1 = max(0, py)
+        x2 = min(w_img, px + ew); y2 = min(h_img, py + eh)
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        # Local slice of the enlarged patch that lands inside the image.
+        lx1 = x1 - px; ly1 = y1 - py
+        lx2 = lx1 + (x2 - x1); ly2 = ly1 + (y2 - y1)
+        patch = enlarged[ly1:ly2, lx1:lx2]  # (h, w, 4) uint8 RGBA
+
+        # Standard alpha blend into cv_image (RGB, uint8).
+        patch_rgb = patch[:, :, :3].astype(np.float32)
+        alpha = patch[:, :, 3:4].astype(np.float32) / 255.0
+        bg_region = self.cv_image[y1:y2, x1:x2].astype(np.float32)
+        blended = bg_region * (1.0 - alpha) + patch_rgb * alpha
+        self.cv_image[y1:y2, x1:x2] = np.clip(
+            blended, 0, 255,
+        ).astype(np.uint8)
+
+        # Refresh display + QImage so the new pixels show on the canvas.
+        # apply_effects rebuilds display_image (applying any tilts) and
+        # update_image_from_cv rebuilds the QImage that paintEvent draws.
+        self.apply_effects()
 
     def perform_stretch(self):
         if len(self.points) != 4:
@@ -1336,20 +1388,6 @@ class MainWindow(QMainWindow):
         self.canvas.copy_mode_ended.connect(
             lambda: self._set_copy_button_checked_silent(False),
         )
-
-        # Debug / feedback preview: shows the SOURCE polygon's interior
-        # exactly as it was captured (masked to the source polygon shape,
-        # transparency around it in a checkerboard pattern via a subtle
-        # background so you can see the shape).
-        sidebar_layout.addWidget(QLabel("Sampled source:"))
-        self.sampled_preview_label = QLabel()
-        self.sampled_preview_label.setFixedSize(240, 160)
-        self.sampled_preview_label.setAlignment(Qt.AlignCenter)
-        self.sampled_preview_label.setStyleSheet(
-            "QLabel { background-color: #eaeaea; border: 1px dashed #888; }"
-        )
-        self.sampled_preview_label.setText("(none yet)")
-        sidebar_layout.addWidget(self.sampled_preview_label)
 
         self.canvas.polygon_sampled.connect(self._on_polygon_sampled)
         self.canvas.polygon_pasted.connect(self._on_polygon_pasted)
@@ -1843,21 +1881,6 @@ class MainWindow(QMainWindow):
             len(self.canvas.polygons[idx])
             if 0 <= idx < len(self.canvas.polygons) else 0
         )
-        # Refresh the sidebar preview so the user can see EXACTLY what
-        # was captured — pixels are masked to the source polygon shape
-        # (transparent outside), scaled to fit the preview label.
-        qimg = self.canvas.last_sampled_qimage()
-        if qimg is not None and not qimg.isNull():
-            pix = QPixmap.fromImage(qimg).scaled(
-                self.sampled_preview_label.width(),
-                self.sampled_preview_label.height(),
-                Qt.KeepAspectRatio, Qt.SmoothTransformation,
-            )
-            self.sampled_preview_label.setPixmap(pix)
-            self.sampled_preview_label.setText("")
-        else:
-            self.sampled_preview_label.clear()
-            self.sampled_preview_label.setText("(sample failed)")
         if self.canvas.copy_polygon_workflow:
             self.statusBar().showMessage(
                 f"Source = #{idx} ({n} vertices). Cursor is RED now — "
@@ -1865,8 +1888,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage(
-                f"Source polygon set to #{idx} ({n} vertices) — see "
-                f"sidebar preview.",
+                f"Source polygon set to #{idx} ({n} vertices).",
             )
 
     def _on_polygon_pasted(self, idx: int) -> None:

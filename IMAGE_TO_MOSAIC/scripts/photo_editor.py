@@ -656,6 +656,17 @@ class PhotoEditor(QMainWindow):
         # Toolbar
         bar = QHBoxLayout()
         self.load_btn       = QPushButton("Load Image...")
+        self.load_csv_btn   = QPushButton("Load CSV Array...")
+        self.load_csv_btn.setToolTip(
+            "Load a polygon-mosaic CSV (from image_strech.py's Save Array "
+            "or mosaic_to_csv.py). Each polygon becomes a rendered tile "
+            "filled with its saved mean colour and surrounded by a thin "
+            "dark grout outline. The rendered mosaic image is placed in "
+            "the Source pane — run Generate with the "
+            "roman_mosaic_realistic_upgrade prompt to have Gemini upgrade "
+            "the flat tiles into realistic Roman stones while preserving "
+            "your polygon geometry exactly."
+        )
         self.background_btn = QPushButton("Background...")
         self.expand_btn     = QPushButton("Expand 15%")
         self.prompt_btn     = QPushButton("Choose Prompt...")
@@ -664,7 +675,8 @@ class PhotoEditor(QMainWindow):
         self.generate_btn   = QPushButton("Generate →")
         self.save_src_btn   = QPushButton("Save Source...")
         self.save_res_btn   = QPushButton("Save Result...")
-        for b in (self.load_btn, self.background_btn, self.expand_btn, self.prompt_btn,
+        for b in (self.load_btn, self.load_csv_btn, self.background_btn,
+                  self.expand_btn, self.prompt_btn,
                   self.key_btn, self.preview_btn, self.generate_btn,
                   self.save_src_btn, self.save_res_btn):
             bar.addWidget(b)
@@ -764,6 +776,7 @@ class PhotoEditor(QMainWindow):
 
         # Wire up
         self.load_btn.clicked.connect(self.load_image)
+        self.load_csv_btn.clicked.connect(self.load_csv_array)
         self.background_btn.clicked.connect(self.edit_background)
         # Hook so the overlay refreshes the moment the spin value changes.
         # (Already connected above; this line is a no-op intentionally left for clarity.)
@@ -865,6 +878,174 @@ class PhotoEditor(QMainWindow):
     def _on_square_size_changed(self, value: int) -> None:
         """Spin-box callback: update the red overlay on the source pane."""
         self.source_pane.set_reference_square_size(value)
+
+    @staticmethod
+    def _parse_polygon_csv(csv_path):
+        """Parse a polygon-array CSV and return (polys, width, height).
+
+        polys: list of (Nx2 numpy vertex array, (r, g, b) floats in 0-1).
+        width/height: canvas dimensions in polygon-coord units (ints).
+
+        Handles both CSV coordinate formats found in this project:
+          - JSON array: `[[x, y], [x, y], ...]` (image_strech.py Save Array)
+          - Semicolon-separated: `x,y;x,y;...`  (mosaic_to_csv.py)
+        Special parameter rows (`IMAGE_PARAMS`, `GRID_PARAMS`) are skipped."""
+        import csv as _csv
+        import json as _json
+        import numpy as _np
+        polys = []
+        max_x = 0.0
+        max_y = 0.0
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                coords_str = (row.get("coordinates")
+                              or row.get("polygon_coords")
+                              or "").strip()
+                if (not coords_str
+                        or coords_str in ("IMAGE_PARAMS", "GRID_PARAMS")):
+                    continue
+                # Strip any leading/trailing quotes CSV escaping may have added.
+                coords_str = coords_str.strip("'\"")
+                coord_list = None
+                # First try JSON (`[[x, y], [x, y], ...]`).
+                try:
+                    coord_list = _json.loads(coords_str)
+                except (ValueError, TypeError):
+                    pass
+                # Fall back to semicolon-separated (`x,y;x,y;...`).
+                if coord_list is None:
+                    try:
+                        coord_list = [
+                            [float(v) for v in pt.split(",")]
+                            for pt in coords_str.split(";") if pt.strip()
+                        ]
+                    except Exception:
+                        continue
+                if not coord_list or len(coord_list) < 3:
+                    continue
+                pts = _np.asarray(coord_list, dtype=_np.float32)
+                if pts.ndim != 2 or pts.shape[1] < 2:
+                    continue
+                try:
+                    r = float(row.get("color_r", 0.5) or 0.5)
+                    g = float(row.get("color_g", 0.5) or 0.5)
+                    b = float(row.get("color_b", 0.5) or 0.5)
+                except (ValueError, TypeError):
+                    r, g, b = 0.5, 0.5, 0.5
+                polys.append((pts, (r, g, b)))
+                if len(pts) > 0:
+                    max_x = max(max_x, float(pts[:, 0].max()))
+                    max_y = max(max_y, float(pts[:, 1].max()))
+        return polys, int(_math.ceil(max_x)) + 1, int(_math.ceil(max_y)) + 1
+
+    @staticmethod
+    def _render_polygons_to_image(
+        polys, width, height, target_long_side=3840,
+    ):
+        """Rasterise a list of (vertices, (r, g, b)) polygons into an RGB
+        PIL Image at ~4K resolution.
+
+        Coordinates in the CSV are typically in a modest range (e.g. a
+        few hundred pixels), so rendering at native size would leave
+        Gemini with too little input detail. This scales the whole
+        rendering so the longest side becomes `target_long_side` (3840
+        by default), then draws grout + outer frame at a fixed thin
+        absolute pixel thickness (2 px, anti-aliased). At 4K, 2 px is a
+        tiny fraction of the canvas — thin as visually requested."""
+        import cv2 as _cv2
+        import numpy as _np
+        if width <= 0 or height <= 0 or not polys:
+            return None
+        # Scale so the longest side becomes target_long_side.
+        scale = float(target_long_side) / max(width, height)
+        scaled_w = max(1, int(round(width * scale)))
+        scaled_h = max(1, int(round(height * scale)))
+        canvas = _np.zeros((scaled_h, scaled_w, 3), dtype=_np.uint8)
+
+        # Fill every polygon with its stored colour, at the scaled coords.
+        for pts, (r, g, b) in polys:
+            color = (
+                max(0, min(255, int(round(r * 255)))),
+                max(0, min(255, int(round(g * 255)))),
+                max(0, min(255, int(round(b * 255)))),
+            )
+            scaled_pts = (pts * scale).astype(_np.int32)
+            _cv2.fillPoly(canvas, [scaled_pts], color)
+
+        # Thin grout outlines OVER the fills so every tile has a clear
+        # boundary at the scaled resolution.
+        grout = (30, 30, 30)
+        grout_thickness = 2   # px absolute — thin at 4K
+        for pts, _ in polys:
+            scaled_pts = (pts * scale).astype(_np.int32)
+            _cv2.polylines(
+                canvas, [scaled_pts], isClosed=True,
+                color=grout, thickness=grout_thickness,
+                lineType=_cv2.LINE_AA,
+            )
+        # Thin outer frame line along the (scaled) canvas edge.
+        _cv2.rectangle(
+            canvas, (0, 0), (scaled_w - 1, scaled_h - 1),
+            grout, thickness=grout_thickness, lineType=_cv2.LINE_AA,
+        )
+        return Image.fromarray(canvas)
+
+    def load_csv_array(self) -> None:
+        """Load a polygon-mosaic CSV, render its polygons into a PIL
+        Image (each polygon filled with its saved mean colour + thin
+        dark grout outlines between them), and place the result in the
+        source pane so Generate treats it exactly like a loaded image."""
+        start_dir = str(INPUT_DIR) if INPUT_DIR.exists() else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load polygon CSV array", start_dir,
+            "CSV polygon arrays (*.csv);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            polys, w, h = self._parse_polygon_csv(path)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "CSV parse failed", f"{type(e).__name__}: {e}",
+            )
+            return
+        if not polys:
+            QMessageBox.warning(
+                self, "Empty CSV",
+                "No valid polygons found in the file. Expected a "
+                "coordinates column (JSON array or semicolon-separated) "
+                "plus color_r/g/b.",
+            )
+            return
+        if w < 4 or h < 4:
+            QMessageBox.warning(
+                self, "Bad dimensions",
+                f"Computed canvas size {w} × {h} px is too small — the "
+                f"polygon coordinates may be at the wrong scale.",
+            )
+            return
+        try:
+            pil = self._render_polygons_to_image(polys, w, h)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Render failed", f"{type(e).__name__}: {e}",
+            )
+            return
+        self.current_source_path = Path(path)
+        self.source_pane.set_pil_image(
+            pil,
+            f"{Path(path).name}  |  {pil.width} × {pil.height} px  |  "
+            f"{len(polys)} polygons from CSV",
+        )
+        self.source_pane.set_reference_square_size(
+            self.square_size_input.value(),
+        )
+        self.statusBar().showMessage(
+            f"Loaded {len(polys)} polygons from {Path(path).name} "
+            f"({pil.width} × {pil.height} px)",
+        )
+        self._update_button_states()
 
     def choose_prompt(self) -> None:
         start_dir = str(PROMPTS_DIR) if PROMPTS_DIR.exists() else ""
