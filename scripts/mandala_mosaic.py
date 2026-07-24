@@ -12,8 +12,9 @@ import pickle
 import random
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QFrame, QLabel, QPushButton, QFileDialog, QCheckBox, QSpinBox, QLineEdit,
-    QInputDialog, QMessageBox, QSizePolicy, QSlider, QColorDialog,
+    QFrame, QGridLayout, QLabel, QPushButton, QFileDialog, QCheckBox,
+    QSpinBox, QLineEdit, QInputDialog, QMessageBox, QSizePolicy, QSlider,
+    QColorDialog,
 )
 from PyQt5.QtCore import Qt, QPoint, QTimer, QBuffer, QByteArray, pyqtSignal
 from PyQt5.QtGui import (
@@ -31,6 +32,12 @@ class Canvas(QWidget):
         self.setMinimumSize(600, 600)
         self.setStyleSheet("background-color: white; border: 1px solid black;")
         self.background_image = None
+        # Snapshot of the just-loaded background pixmap at its initial
+        # size — treated as the "100 %" reference for the sidebar's
+        # Background Scale input. Every scale-spinbox change re-scales
+        # from THIS reference, not from the current background_image,
+        # so subsequent scale values don't compound.
+        self.background_original = None
         
         # Polygon drawing mode variables
         self.polygon_mode = False
@@ -109,6 +116,16 @@ class Canvas(QWidget):
         # Circle drag handle
         self.is_dragging_center = False
         self.drag_handle_size = 12  # Size of the drag handle circle
+
+        # Polygon body-drag state — set on left-click when a polygon is
+        # selected, cleared on release. is_dragging_polygon distinguishes
+        # a whole-polygon translate from is_dragging_control_point (single
+        # vertex drag). _polygon_drag_last_world tracks the last cursor
+        # world position so mouseMove computes incremental deltas.
+        # _polygon_drag_did_snapshot ensures ONE undo checkpoint per drag.
+        self.is_dragging_polygon = False
+        self._polygon_drag_last_world = None
+        self._polygon_drag_did_snapshot = False
         
         # Image drag handle
         self.is_dragging_image = False
@@ -204,6 +221,24 @@ class Canvas(QWidget):
         self.circle_diameter = max(1, diameter)  # Ensure positive value
         if self.show_circle:
             self.update()  # Refresh display if circle is visible
+
+    def move_circles(self, dx: float, dy: float) -> None:
+        """Nudge the mandala circles' centre by (dx, dy) in world units.
+        Adjusts self.center_offset_x/y (the persistent offset added to
+        the canvas-centre base position), then recomputes the mandala
+        centre and repaints. Called by the sidebar arrow buttons."""
+        self.center_offset_x += float(dx)
+        self.center_offset_y += float(dy)
+        self.update_mandala_center()
+        self.update()
+
+    def reset_circle_offset(self) -> None:
+        """Reset the mandala circle centre back to the canvas centre.
+        Zeros out center_offset_x/y and re-derives mandala_center_world_*."""
+        self.center_offset_x = 0
+        self.center_offset_y = 0
+        self.update_mandala_center()
+        self.update()
 
     def set_outer_circle_diameter(self, diameter):
         """Set the outer (concentric) circle diameter. Shown alongside the
@@ -316,12 +351,38 @@ class Canvas(QWidget):
             else:
                 # Use original size
                 self.background_image = original_pixmap
-            
+
+            # Snapshot the freshly-loaded pixmap as the "100 %" reference
+            # for the sidebar's Background Scale input. Every scale change
+            # re-derives self.background_image from this snapshot so
+            # values are always absolute (relative to first-load size),
+            # not compounding on top of the current scale.
+            self.background_original = self.background_image
             self.update()  # Trigger repaint
             return True
         except Exception as e:
             print(f"Error loading image: {e}")
             return False
+
+    def set_background_scale(self, pct: float) -> None:
+        """Rescale the background image to `pct` % of the ORIGINAL loaded
+        size (i.e. the pixmap right after set_background_image cached
+        it). Applied absolutely — passing 100 restores the original;
+        passing 50 always halves the original, not the current size."""
+        if (self.background_original is None
+                or self.background_original.isNull()
+                or pct <= 0):
+            return
+        ow = self.background_original.width()
+        oh = self.background_original.height()
+        if ow <= 0 or oh <= 0:
+            return
+        new_w = max(1, int(round(ow * float(pct) / 100.0)))
+        new_h = max(1, int(round(oh * float(pct) / 100.0)))
+        self.background_image = self.background_original.scaled(
+            new_w, new_h, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        self.update()
     
     def set_line_mode(self, enabled):
         """Enable / disable the line-drawing tool. Mutex with polygon_mode
@@ -811,14 +872,16 @@ class Canvas(QWidget):
         # Create group data structure
         group_polygons = []
         
-        # Get color from original polygon points (for all copies to share)
-        if self.background_image and not self.background_image.isNull():
-            # Get average color from background image using original points
-            shared_color = self.get_average_color_from_background(self.polygon_points)
+        # Fill colour = the palette colour selected in the left panel.
+        # Every polygon in this mandala group is filled with that colour
+        # (falls back to opaque black if the left panel isn't wired up).
+        if (self.left_panel is not None
+                and hasattr(self.left_panel, "selected_color")
+                and isinstance(self.left_panel.selected_color, QColor)):
+            shared_color = QColor(self.left_panel.selected_color)
         else:
-            # No background image - use transparent polygons
-            shared_color = QColor(0, 0, 0, 0)  # Fully transparent
-        
+            shared_color = QColor(0, 0, 0)
+
         # Create specified number of polygons with calculated rotation
         for i in range(self.num_copies):
             angle_degrees = i * angle_step
@@ -874,13 +937,14 @@ class Canvas(QWidget):
         # Undo checkpoint — captures state BEFORE the new polygon lands.
         self._push_undo_snapshot()
         
-        # Use same filling logic as mandala mode
-        if self.background_image and not self.background_image.isNull():
-            # Get average color from background image for this polygon
-            color = self.get_average_color_from_background(self.polygon_points)
+        # Fill colour = the palette colour selected in the left panel.
+        # Falls back to opaque black if the left panel isn't wired up.
+        if (self.left_panel is not None
+                and hasattr(self.left_panel, "selected_color")
+                and isinstance(self.left_panel.selected_color, QColor)):
+            color = QColor(self.left_panel.selected_color)
         else:
-            # No background image - use transparent polygons
-            color = QColor(0, 0, 0, 0)  # Fully transparent
+            color = QColor(0, 0, 0)
         
         # Create polygon data structure (similar to radial polygons but simpler)
         polygon_data = {
@@ -1122,6 +1186,17 @@ class Canvas(QWidget):
             self.paint_polygon_at_point(world_x, world_y)
             return
 
+        # LEFT-click while Paint mode is ON = repaint the clicked polygon
+        # with the palette colour. Wins over selection / drag / line /
+        # polygon-draw so paint mode is unambiguous. In mandala mode the
+        # entire group is repainted (paint_polygon_at_point handles that).
+        if (event.button() == Qt.LeftButton and self.paint_mode
+                and not self.polygon_mode and not self.line_mode
+                and not self.eraser_mode):
+            world_x, world_y = self.screen_to_world(event.x(), event.y())
+            self.paint_polygon_at_point(world_x, world_y)
+            return
+
         if event.button() == Qt.LeftButton and self.line_mode:
             # Line mode: press starts tracing a path.
             world_x, world_y = self.screen_to_world(event.x(), event.y())
@@ -1170,9 +1245,28 @@ class Canvas(QWidget):
                 self.setCursor(Qt.ClosedHandCursor)
                 self.update()
             else:
-                # Check for polygon selection
+                # Polygon selection + body-drag. Matches duplicator.py's UX:
+                # first click on a polygon SELECTS it; a subsequent click
+                # INSIDE the already-selected polygon starts a body-drag.
+                # This split-click pattern avoids the "every click triggers
+                # a drag" surprise.
                 world_x, world_y = self.screen_to_world(event.x(), event.y())
-                self.select_polygon_at_point(world_x, world_y)
+                if (self.selected_polygon_index is not None
+                        and self.selected_polygon_index >= 0
+                        and self.selected_polygon_index < len(self.polygons)
+                        and self.point_in_polygon(
+                            world_x, world_y,
+                            self.polygons[self.selected_polygon_index]["points"])):
+                    # Start dragging the already-selected polygon.
+                    self.is_dragging_polygon = True
+                    self._polygon_drag_last_world = (world_x, world_y)
+                    self._polygon_drag_did_snapshot = False
+                    self.setCursor(Qt.ClosedHandCursor)
+                else:
+                    # First click on a polygon (or click on empty space).
+                    # select_polygon_at_point sets selected_polygon_index
+                    # to the hit polygon or -1 if nothing was hit.
+                    self.select_polygon_at_point(world_x, world_y)
         elif event.button() == Qt.MiddleButton:
             # Start panning
             self.is_panning = True
@@ -1232,6 +1326,21 @@ class Canvas(QWidget):
                 self.last_pan_point = event.pos()
                 self.update()
             
+        elif self.is_dragging_polygon and self._polygon_drag_last_world is not None:
+            # Whole-polygon translate: apply the world-space delta since
+            # the last mouse position, propagating to mandala siblings if
+            # applicable. Undo checkpoint is taken on the first actual
+            # movement (not on plain click-release with no drag).
+            world_x, world_y = self.screen_to_world(event.x(), event.y())
+            lx, ly = self._polygon_drag_last_world
+            dx = world_x - lx
+            dy = world_y - ly
+            if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                if not self._polygon_drag_did_snapshot:
+                    self._push_undo_snapshot()
+                    self._polygon_drag_did_snapshot = True
+                self._translate_selected_polygon(dx, dy)
+                self._polygon_drag_last_world = (world_x, world_y)
         elif self.is_dragging_control_point and self.selected_control_point >= 0:
             # Drag control point to reshape polygon
             world_x, world_y = self.screen_to_world(event.x(), event.y())
@@ -1291,6 +1400,13 @@ class Canvas(QWidget):
             # Stop dragging center
             self.is_dragging_center = False
             self.setCursor(Qt.ArrowCursor if not self.polygon_mode else Qt.BlankCursor)
+        elif self.is_dragging_polygon:
+            # End polygon body-drag. Undo snapshot was pushed on the
+            # first movement; nothing else to persist here.
+            self.is_dragging_polygon = False
+            self._polygon_drag_last_world = None
+            self._polygon_drag_did_snapshot = False
+            self.setCursor(Qt.ArrowCursor)
         elif self.is_dragging_control_point:
             # When control-point dragging finishes in mandala mode, mirror
             # the move into every sibling copy (same parent_shape by
@@ -1320,25 +1436,37 @@ class Canvas(QWidget):
             self.setCursor(Qt.ArrowCursor if not self.polygon_mode else Qt.BlankCursor)
     
     def wheelEvent(self, event):
-        """Handle mouse wheel events for zooming"""
-        # Get mouse position before zoom
+        """Wheel behaviour matches duplicator.py:
+          - If a polygon is SELECTED → rotate it (and mandala siblings)
+            by 5° per wheel notch, direction from angleDelta sign.
+          - Otherwise → the existing cursor-anchored zoom.
+        Deselect (Esc or click empty space) to zoom while a polygon is
+        selected."""
+        # Rotate the selected polygon (+ mandala siblings). No cursor-
+        # inside check — as long as a polygon is selected, wheel rotates.
+        idx = self.selected_polygon_index
+        if idx is not None and 0 <= idx < len(self.polygons):
+            self._push_undo_snapshot()
+            step_deg = 5.0 if event.angleDelta().y() > 0 else -5.0
+            self._rotate_selected_polygon(math.radians(step_deg))
+            event.accept()
+            return
+
+        # Fall through: cursor-anchored zoom.
         mouse_pos = event.pos()
-        old_world_x, old_world_y = self.screen_to_world(mouse_pos.x(), mouse_pos.y())
-        
-        # Update zoom factor
+        old_world_x, old_world_y = self.screen_to_world(
+            mouse_pos.x(), mouse_pos.y(),
+        )
         zoom_in = event.angleDelta().y() > 0
         zoom_factor = 1.25 if zoom_in else 0.8
-        
-        # Limit zoom range
         new_zoom = self.zoom_factor * zoom_factor
         if 0.1 <= new_zoom <= 10.0:
             self.zoom_factor = new_zoom
-            
-            # Adjust pan offset to keep mouse position fixed
-            new_screen_x, new_screen_y = self.world_to_screen(old_world_x, old_world_y)
+            new_screen_x, new_screen_y = self.world_to_screen(
+                old_world_x, old_world_y,
+            )
             self.pan_offset_x += mouse_pos.x() - new_screen_x
             self.pan_offset_y += mouse_pos.y() - new_screen_y
-            
             self.update()
     
     def keyPressEvent(self, event):
@@ -1700,7 +1828,7 @@ class Canvas(QWidget):
                     sx_l, sy_t = self.world_to_screen(sq_left_w, sq_top_w)
                     sx_r, sy_b = self.world_to_screen(sq_right_w, sq_bottom_w)
 
-                    painter.setPen(QPen(QColor(200, 0, 100), 2))    # magenta, solid
+                    painter.setPen(QPen(QColor(255, 0, 0), 2))      # red, solid
                     painter.setBrush(QBrush(Qt.NoBrush))
                     painter.drawRect(int(sx_l), int(sy_t),
                                      int(sx_r - sx_l), int(sy_b - sy_t))
@@ -1718,7 +1846,7 @@ class Canvas(QWidget):
                     # Draw a small white halo so the label stays readable on busy mosaics.
                     painter.setPen(QPen(QColor(255, 255, 255), 3))
                     painter.drawText(text_x, text_y, label_text)
-                    painter.setPen(QPen(QColor(200, 0, 100)))
+                    painter.setPen(QPen(QColor(255, 0, 0)))
                     painter.drawText(text_x, text_y, label_text)
                     # Restore font for any later drawing.
                     painter.setFont(QFont())
@@ -1885,6 +2013,89 @@ class Canvas(QWidget):
             half_size = dot_size // 2
             painter.drawEllipse(int(screen_x - half_size), int(screen_y - half_size),
                               dot_size, dot_size)
+
+    def _translate_selected_polygon(self, dx: float, dy: float) -> None:
+        """Translate the currently-selected polygon by (dx, dy) in world
+        units. If in mandala mode and the polygon has a parent_shape,
+        propagate the same move to every sibling that shares that
+        parent_shape — each sibling's delta is (dx, dy) rotated by
+        (sibling_rotation - primary_rotation) around the origin, so the
+        mandala symmetry is preserved. Called from mouseMoveEvent while
+        dragging."""
+        idx = self.selected_polygon_index
+        if idx is None or idx < 0 or idx >= len(self.polygons):
+            return
+        primary = self.polygons[idx]
+        primary_angle_deg = float(primary.get("rotation_angle", 0.0))
+        parent = primary.get("parent_shape")
+        # Move the primary.
+        primary["points"] = [
+            (x + dx, y + dy) for x, y in primary["points"]
+        ]
+        # Propagate to mandala siblings only in mandala mode + when the
+        # polygon actually belongs to a group with a shared parent_shape.
+        if not self.mandala_mode or parent is None:
+            self.update()
+            return
+        for i, poly in enumerate(self.polygons):
+            if i == idx:
+                continue
+            if poly.get("parent_shape") is not parent:
+                continue
+            sibling_angle_deg = float(poly.get("rotation_angle", 0.0))
+            delta_rad = math.radians(sibling_angle_deg - primary_angle_deg)
+            cos_a = math.cos(delta_rad)
+            sin_a = math.sin(delta_rad)
+            # Rotate the delta VECTOR by (θ_sibling − θ_primary). No
+            # translation — just a rotation of the direction of motion.
+            rot_dx = dx * cos_a - dy * sin_a
+            rot_dy = dx * sin_a + dy * cos_a
+            poly["points"] = [
+                (x + rot_dx, y + rot_dy) for x, y in poly["points"]
+            ]
+        self.update()
+
+    def _rotate_selected_polygon(self, angle_rad: float) -> None:
+        """Rotate the currently-selected polygon around ITS OWN centroid
+        by angle_rad. If in mandala mode and the polygon has a
+        parent_shape, rotate every sibling around ITS OWN centroid by
+        the same amount — preserves mandala symmetry (each copy of the
+        shape rotates identically in its own local frame). Called from
+        wheelEvent when the cursor is over the selected polygon."""
+        idx = self.selected_polygon_index
+        if idx is None or idx < 0 or idx >= len(self.polygons):
+            return
+        primary = self.polygons[idx]
+        parent = primary.get("parent_shape")
+
+        def rotate_around_centroid(pts, ang):
+            n = len(pts)
+            if n < 1:
+                return pts
+            cx = sum(p[0] for p in pts) / n
+            cy = sum(p[1] for p in pts) / n
+            ca, sa = math.cos(ang), math.sin(ang)
+            return [
+                (cx + (x - cx) * ca - (y - cy) * sa,
+                 cy + (x - cx) * sa + (y - cy) * ca)
+                for x, y in pts
+            ]
+
+        primary["points"] = rotate_around_centroid(
+            primary["points"], angle_rad,
+        )
+        if not self.mandala_mode or parent is None:
+            self.update()
+            return
+        for i, poly in enumerate(self.polygons):
+            if i == idx:
+                continue
+            if poly.get("parent_shape") is not parent:
+                continue
+            poly["points"] = rotate_around_centroid(
+                poly["points"], angle_rad,
+            )
+        self.update()
 
     def update_corresponding_points_in_copies(self, new_world_x, new_world_y):
         """Propagate a control-point drag on the SELECTED polygon to all
@@ -2268,6 +2479,27 @@ class SidePanel(QFrame):
             load_bg_button.clicked.connect(self.load_background)
             layout.addWidget(load_bg_button)
 
+            # Background Scale (%): percentage is ALWAYS relative to the
+            # image's original loaded size (not incremental). Entering
+            # 100 restores; 50 always halves the original; 200 always
+            # doubles it. Handler re-scales from a stored snapshot on
+            # every value change so values don't compound.
+            layout.addWidget(QLabel("Background Scale (%):"))
+            self.bg_scale_input = QLineEdit()
+            self.bg_scale_input.setText("100")
+            self.bg_scale_input.setPlaceholderText(
+                "% of original (100 = as loaded)"
+            )
+            self.bg_scale_input.setToolTip(
+                "Scale the background image to this percentage of its "
+                "ORIGINAL loaded size. Always absolute — 100 restores, "
+                "50 halves the original, 200 doubles it. Not incremental."
+            )
+            self.bg_scale_input.textChanged.connect(
+                self.on_bg_scale_changed,
+            )
+            layout.addWidget(self.bg_scale_input)
+
             # Undo the last polygon-list mutation (draw, erase, repaint,
             # line-draw). Also bound to Ctrl+Z globally (see main()).
             self.undo_button = QPushButton("Undo (Ctrl+Z)")
@@ -2326,6 +2558,22 @@ class SidePanel(QFrame):
             self.eraser_checkbox = QCheckBox("Eraser Mode")
             self.eraser_checkbox.toggled.connect(self.on_eraser_toggled)
             layout.addWidget(self.eraser_checkbox)
+
+            # Paint mode: when checked, left-click on any polygon fills
+            # it with the palette colour. In mandala mode the entire
+            # group is repainted so radial copies stay in sync with the
+            # clicked polygon. Same behaviour as the existing right-click
+            # paint, just triggered by left-click instead.
+            self.paint_checkbox = QCheckBox("Paint")
+            self.paint_checkbox.setToolTip(
+                "Left-click any polygon to fill it with the currently-"
+                "selected palette colour (Left Panel). With Mandala "
+                "checked, all radial copies of the clicked polygon are "
+                "repainted too. Untick to return to normal click "
+                "behaviour (selection / drag)."
+            )
+            self.paint_checkbox.toggled.connect(self.on_paint_toggled)
+            layout.addWidget(self.paint_checkbox)
             
             # Add circle checkbox and diameter input
             self.circle_checkbox = QCheckBox("Circle")
@@ -2345,6 +2593,62 @@ class SidePanel(QFrame):
             self.outer_circle_diameter_input = QLineEdit("1500")
             self.outer_circle_diameter_input.textChanged.connect(self.on_outer_circle_diameter_changed)
             layout.addWidget(self.outer_circle_diameter_input)
+
+            # ── Move circles: 4-arrow grid + step-size input ─────────────
+            # Nudges the mandala circles (inner + outer share the same
+            # centre) by ±step in world units per click. Centre button
+            # resets the offset so the circles return to the canvas centre.
+            layout.addWidget(QLabel("Move circles:"))
+            arrows_grid = QGridLayout()
+            arrows_grid.setSpacing(2)
+
+            up_btn = QPushButton("↑")     # ↑
+            up_btn.setFixedSize(36, 28)
+            up_btn.setToolTip("Move circles up by the step below.")
+            up_btn.clicked.connect(lambda: self._on_circle_arrow(0, -1))
+            arrows_grid.addWidget(up_btn, 0, 1)
+
+            left_btn = QPushButton("←")   # ←
+            left_btn.setFixedSize(36, 28)
+            left_btn.setToolTip("Move circles left by the step below.")
+            left_btn.clicked.connect(lambda: self._on_circle_arrow(-1, 0))
+            arrows_grid.addWidget(left_btn, 1, 0)
+
+            reset_btn = QPushButton("○")  # ○
+            reset_btn.setFixedSize(36, 28)
+            reset_btn.setToolTip(
+                "Reset the circle centre offset to the canvas centre."
+            )
+            reset_btn.clicked.connect(self._on_circle_reset)
+            arrows_grid.addWidget(reset_btn, 1, 1)
+
+            right_btn = QPushButton("→")  # →
+            right_btn.setFixedSize(36, 28)
+            right_btn.setToolTip("Move circles right by the step below.")
+            right_btn.clicked.connect(lambda: self._on_circle_arrow(1, 0))
+            arrows_grid.addWidget(right_btn, 1, 2)
+
+            down_btn = QPushButton("↓")   # ↓
+            down_btn.setFixedSize(36, 28)
+            down_btn.setToolTip("Move circles down by the step below.")
+            down_btn.clicked.connect(lambda: self._on_circle_arrow(0, 1))
+            arrows_grid.addWidget(down_btn, 2, 1)
+
+            layout.addLayout(arrows_grid)
+
+            # Step size input — pixels moved per arrow click.
+            step_row = QHBoxLayout()
+            step_row.addWidget(QLabel("Step (px):"))
+            self.circle_step_input = QLineEdit()
+            self.circle_step_input.setText("10")
+            self.circle_step_input.setPlaceholderText("px per click")
+            self.circle_step_input.setToolTip(
+                "Pixels the circles move per arrow click (world units)."
+            )
+            self.circle_step_input.setFixedWidth(60)
+            step_row.addWidget(self.circle_step_input)
+            step_row.addStretch(1)
+            layout.addLayout(step_row)
 
             # Detect polygons in the ring between the inner + outer circles
             # using mosaic_to_csv.py's adaptive-threshold + connected-
@@ -2435,7 +2739,60 @@ class SidePanel(QFrame):
             else:
                 # User cancelled size dialog, load with original size
                 self.canvas.set_background_image(file_path)
-    
+            # New original = new 100 % reference. Reset the spinbox to
+            # 100 without firing textChanged, so a stale value from the
+            # previous image doesn't immediately downscale/upscale the
+            # newly-loaded one.
+            if hasattr(self, "bg_scale_input"):
+                self.bg_scale_input.blockSignals(True)
+                self.bg_scale_input.setText("100")
+                self.bg_scale_input.blockSignals(False)
+
+    def on_bg_scale_changed(self, text: str):
+        """Sidebar Background Scale (%) handler — parse the input, clamp
+        to a sensible range, and re-scale the background from the stored
+        original snapshot. Ignores mid-typing invalid text so the user
+        can freely edit before committing."""
+        if not self.canvas:
+            return
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            pct = float(text)
+        except (ValueError, TypeError):
+            return
+        # Clamp to [1, 2000] — stops a stray "0" or huge value from
+        # blowing up memory / crashing.
+        pct = max(1.0, min(2000.0, pct))
+        self.canvas.set_background_scale(pct)
+
+    def _current_circle_step(self) -> float:
+        """Read the sidebar's Step (px) field and clamp to a sensible
+        range. Falls back to 10 px for empty / invalid text."""
+        text = (
+            self.circle_step_input.text().strip()
+            if hasattr(self, "circle_step_input") else "10"
+        )
+        try:
+            step = float(text) if text else 10.0
+        except (ValueError, TypeError):
+            step = 10.0
+        return max(0.1, min(10000.0, step))
+
+    def _on_circle_arrow(self, dx: int, dy: int) -> None:
+        """Arrow button handler — move the circles by (dx, dy) × step
+        world units. dx/dy are direction integers (-1, 0, +1)."""
+        if not self.canvas:
+            return
+        step = self._current_circle_step()
+        self.canvas.move_circles(dx * step, dy * step)
+
+    def _on_circle_reset(self) -> None:
+        """Centre-of-arrows button — reset the circle offset to (0, 0)."""
+        if self.canvas:
+            self.canvas.reset_circle_offset()
+
     def on_undo_clicked(self):
         """Undo button handler — pops the top of the canvas undo stack."""
         if self.canvas:
@@ -2487,6 +2844,13 @@ class SidePanel(QFrame):
         if self.canvas:
             self.canvas.set_mandala_mode(checked)
     
+    def on_paint_toggled(self, checked):
+        """Paint checkbox handler — flips canvas.paint_mode. When ON,
+        left-click on any polygon fills it (and its mandala copies)
+        with the palette colour."""
+        if self.canvas:
+            self.canvas.paint_mode = bool(checked)
+
     def on_eraser_toggled(self, checked):
         """Handle eraser mode checkbox toggle"""
         if self.canvas:
