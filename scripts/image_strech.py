@@ -1053,7 +1053,7 @@ class ImageCanvas(QWidget):
         
         # Draw grid if enabled
         if self.show_grid and self.image and self.grid_size_percent > 0:
-            painter.setPen(QPen(QColor(173, 216, 230), self.grid_line_thickness))  # Light blue
+            painter.setPen(QPen(QColor(255, 105, 180), self.grid_line_thickness))  # Pink
 
             # Get image dimensions
             img_width = self.image.width()

@@ -2680,6 +2680,10 @@ class SidePanel(QFrame):
             save_array_button.clicked.connect(self.save_array)
             layout.addWidget(save_array_button)
 
+            save_top_pie_button = QPushButton("Save Top Pie")
+            save_top_pie_button.clicked.connect(self.save_top_pie)
+            layout.addWidget(save_top_pie_button)
+
             load_array_button = QPushButton("Load Array")
             load_array_button.clicked.connect(self.load_array)
             layout.addWidget(load_array_button)
@@ -3184,7 +3188,124 @@ class SidePanel(QFrame):
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save array: {str(e)}")
-    
+
+    def save_top_pie(self):
+        """Save only the polygons whose majority area falls inside the top
+        wedge — the annulus sector centered on 12 o'clock, half-width 180°/N.
+
+        Requires: a canvas with polygons, both circles enabled (inner + outer
+        radii available on the canvas), mandala mode with num_copies > 0, and
+        outer_diameter > inner_diameter.
+        """
+        canvas = self.canvas
+        if not canvas or not canvas.polygons:
+            QMessageBox.warning(self, "Warning", "No polygons to save.")
+            return
+
+        cx = canvas.mandala_center_world_x
+        cy = canvas.mandala_center_world_y
+        if cx is None or cy is None:
+            QMessageBox.warning(self, "Warning", "Mandala center is not set.")
+            return
+
+        inner_r = canvas.circle_diameter / 2.0
+        outer_r = canvas.outer_circle_diameter / 2.0
+        n = canvas.num_copies
+        if not canvas.mandala_mode or n <= 0 or outer_r <= inner_r:
+            QMessageBox.warning(
+                self, "Warning",
+                "Enable Mandala mode with N > 0 copies and outer > inner circle."
+            )
+            return
+
+        try:
+            from shapely.geometry import Polygon as _ShpPolygon
+        except ImportError:
+            QMessageBox.critical(
+                self, "Error",
+                "shapely is required for Save Top Pie. Run: pip install shapely"
+            )
+            return
+
+        # Build top-wedge geometry in world coords. Screen-y grows downward,
+        # so "up" is -Y. The wedge is the intersection of:
+        #   annulus:  inner_r <= r <= outer_r  (centered at (cx, cy))
+        #   sector :  angle centered on -90° with half-width 180/N
+        hw_deg  = 180.0 / n
+        hw_rad  = math.radians(hw_deg)
+        # Approximate arcs with segments.
+        arc_steps = max(24, int(2 * hw_deg))   # ~1° per step, at least 24
+        angles = [math.radians(-90.0) + (-hw_rad + 2 * hw_rad * i / arc_steps)
+                  for i in range(arc_steps + 1)]
+
+        outer_pts = [(cx + outer_r * math.cos(a), cy + outer_r * math.sin(a))
+                     for a in angles]
+        inner_pts = [(cx + inner_r * math.cos(a), cy + inner_r * math.sin(a))
+                     for a in reversed(angles)]
+        wedge = _ShpPolygon(outer_pts + inner_pts)
+        if not wedge.is_valid:
+            wedge = wedge.buffer(0)
+
+        # Filter polygons: keep those with > 50% of their area inside the wedge.
+        selected = []
+        for poly in canvas.polygons:
+            pts = poly.get('points', [])
+            if len(pts) < 3:
+                continue
+            try:
+                shp = _ShpPolygon([(float(x), float(y)) for x, y in pts])
+                if not shp.is_valid:
+                    shp = shp.buffer(0)
+                if shp.is_empty or shp.area <= 0:
+                    continue
+                inter = shp.intersection(wedge)
+                if inter.is_empty:
+                    continue
+                if inter.area / shp.area > 0.5:
+                    selected.append(poly)
+            except Exception:
+                continue
+
+        if not selected:
+            QMessageBox.information(
+                self, "Save Top Pie",
+                "No polygons have >50% of their area inside the top wedge."
+            )
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Top Pie as CSV", "top_pie.csv",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not filename:
+            return
+
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['polygon_id', 'coordinates',
+                                 'color_r', 'color_g', 'color_b', 'color_a'])
+                for i, polygon_data in enumerate(selected):
+                    points = polygon_data['points']
+                    color  = polygon_data['color']
+                    coords_json = json.dumps(
+                        [[float(x), float(y)] for x, y in points]
+                    )
+                    r = color.red()   / 255.0
+                    g = color.green() / 255.0
+                    b = color.blue()  / 255.0
+                    a = color.alpha() / 255.0
+                    writer.writerow([i, coords_json, r, g, b, a])
+
+            QMessageBox.information(
+                self, "Success",
+                f"Saved {len(selected)} / {len(canvas.polygons)} polygons "
+                f"(top wedge) to {filename}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error",
+                                 f"Failed to save top pie: {str(e)}")
+
     def load_array(self):
         """Load polygons from CSV file compatible with mosaic_editor_pyqt"""
         if not self.canvas:
