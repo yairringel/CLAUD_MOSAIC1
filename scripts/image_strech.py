@@ -1,5 +1,9 @@
 import sys
 import cv2
+import csv
+import io
+import json
+import zipfile
 import numpy as np
 import pickle
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -1732,6 +1736,17 @@ class MainWindow(QMainWindow):
         self.save_tile_btn.clicked.connect(self.save_tile_image)
         self.save_tile_btn.setToolTip("Save C3 tile as JPEG")
         right_sidebar_layout.addWidget(self.save_tile_btn)
+
+        self.save_mosaic_btn = QPushButton("Save Mosaic")
+        self.save_mosaic_btn.clicked.connect(self.save_mosaic)
+        self.save_mosaic_btn.setToolTip(
+            "Save a .mosaic ZIP containing polygons.csv (same format as "
+            "Save Array — color columns are 0,0,0,0 signalling 'fill from "
+            "image') and background.png at full resolution. Loading "
+            "software can rebuild each polygon by masking the background "
+            "with the polygon shape."
+        )
+        right_sidebar_layout.addWidget(self.save_mosaic_btn)
         
         right_sidebar_layout.addStretch()
 
@@ -2162,6 +2177,136 @@ class MainWindow(QMainWindow):
             reverse=True,
         )
         return non_frame[0][0]
+
+    def save_mosaic(self):
+        """Save a self-contained .mosaic ZIP for reconstruction elsewhere.
+
+        Contents:
+          * polygons.csv   — same schema as save_array in the sibling
+            scripts: polygon_id, coordinates (JSON [[x,y],...]),
+            color_r, color_g, color_b, color_a. This file has no real
+            color per polygon, so the four color columns are 0,0,0,0
+            (fully transparent) — a signal to the receiver that the
+            fill should come from the background image, not a solid
+            color.
+          * background.png — full-resolution PNG of the canvas'
+            self.cv_image (never downscaled).
+
+        The receiver rebuilds the mosaic by masking background.png with
+        each polygon shape from polygons.csv — no per-polygon PNGs are
+        stored, so the file stays small and the coordinates + image
+        remain independently editable."""
+        if self.canvas.cv_image is None:
+            QMessageBox.warning(
+                self, "Save Mosaic",
+                "No background image loaded — nothing to save."
+            )
+            return
+        if not self.canvas.polygons:
+            QMessageBox.warning(
+                self, "Save Mosaic",
+                "No polygons on the canvas — nothing to save."
+            )
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Mosaic", "mosaic.mosaic",
+            "Mosaic bundle (*.mosaic);;ZIP archive (*.zip);;All Files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            # ── Coordinate reconciliation ────────────────────────────
+            # Two mismatches to bake into the saved file so the receiver
+            # (mosaic_editor.py or any tool that assumes "polygon (0,0)
+            # = image pixel (0,0)") gets a correctly aligned mosaic:
+            #
+            #   1. Effects layer:
+            #      paintEvent draws self.canvas.display_image (which has
+            #      tilt / warp / sharpness applied), NOT cv_image. The
+            #      polygons were drawn on top of display_image, so save
+            #      display_image as the background.
+            #
+            #   2. Grid pan offset:
+            #      paintEvent shifts the image by (grid_offset_x,
+            #      grid_offset_y) but leaves the polygons at their raw
+            #      world coords. So a polygon vertex stored as (px, py)
+            #      actually visually overlays image pixel
+            #      (px - grid_offset_x, py - grid_offset_y). Subtract
+            #      the grid offset before writing.
+
+            bg_source = (self.canvas.display_image
+                         if self.canvas.display_image is not None
+                         else self.canvas.cv_image)
+            gox = float(self.canvas.grid_offset_x)
+            goy = float(self.canvas.grid_offset_y)
+
+            # 1. Build polygons.csv in memory (save_array-compatible schema).
+            csv_buf = io.StringIO()
+            writer  = csv.writer(csv_buf)
+            writer.writerow([
+                'polygon_id', 'coordinates',
+                'color_r', 'color_g', 'color_b', 'color_a',
+            ])
+            for i, pts in enumerate(self.canvas.polygons):
+                if not pts or len(pts) < 3:
+                    continue
+                coords_json = json.dumps(
+                    [[float(x) - gox, float(y) - goy] for x, y in pts]
+                )
+                # Color columns kept for schema compatibility; 0,0,0,0
+                # tells the receiver to fill from the background image.
+                writer.writerow([i, coords_json, 0.0, 0.0, 0.0, 0.0])
+
+            # 2. Encode background as PNG (RGB numpy → PNG bytes).
+            #    cv2.imencode expects BGR, but display_image / cv_image
+            #    are stored as RGB throughout this file — swap once
+            #    before encoding so the PNG has the correct colors.
+            bgr = cv2.cvtColor(bg_source, cv2.COLOR_RGB2BGR)
+            ok, png_buf = cv2.imencode('.png', bgr)
+            if not ok:
+                raise RuntimeError("PNG encode of background image failed.")
+            png_bytes = png_buf.tobytes()
+
+            # 3. Small manifest for receivers that prefer JSON over CSV.
+            h, w = bg_source.shape[:2]
+            manifest = {
+                "version": 1,
+                "background": "background.png",
+                "background_size": [int(w), int(h)],
+                "polygons_csv": "polygons.csv",
+                "polygon_count": sum(
+                    1 for p in self.canvas.polygons if p and len(p) >= 3
+                ),
+                "notes": (
+                    "polygons.csv schema matches save_array in the "
+                    "sibling scripts. Colors are 0,0,0,0 — the intended "
+                    "fill is a sample from background.png masked by "
+                    "each polygon's shape. Coordinates are in native "
+                    "image-pixel space (grid pan offset already "
+                    "subtracted; tilt / warp already baked into the "
+                    "saved background image)."
+                ),
+            }
+
+            # 4. Write the ZIP.
+            with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('polygons.csv', csv_buf.getvalue())
+                zf.writestr('background.png', png_bytes)
+                zf.writestr('manifest.json',
+                            json.dumps(manifest, indent=2))
+
+            QMessageBox.information(
+                self, "Save Mosaic",
+                f"Saved {manifest['polygon_count']} polygon(s) + "
+                f"background ({w}×{h} px) to:\n{path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save Mosaic",
+                f"Failed to save mosaic: {type(e).__name__}: {e}"
+            )
 
     def save_tile_image(self):
         """Open a grid-selection popup then save chosen tiles as JPEG files,
