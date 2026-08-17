@@ -203,6 +203,89 @@ def scale_polygons(polygons, max_downscale_pct):
     return result
 
 
+def scale_all_polygons(polygons, factor):
+    """Uniformly scale every polygon around its OWN centroid by `factor`.
+    factor 1.0 = unchanged, 1.2 = 20% larger, 0.8 = 20% smaller. Returns
+    a NEW list parallel to the input; entries that fail validation
+    become None."""
+    if factor == 1.0:
+        return list(polygons)
+    out = []
+    for poly in polygons:
+        if poly is None or not hasattr(poly, 'exterior'):
+            out.append(poly)
+            continue
+        cx, cy = poly.centroid.x, poly.centroid.y
+        new_coords = [
+            (cx + (x - cx) * factor, cy + (y - cy) * factor)
+            for x, y in poly.exterior.coords[:-1]
+        ]
+        try:
+            p = Polygon(new_coords)
+            if not p.is_valid:
+                p = make_valid(p)
+            out.append(p if isinstance(p, Polygon) else None)
+        except Exception:
+            out.append(None)
+    return out
+
+
+def fix_polygon_overlaps(polygons):
+    """Pairwise overlap cleanup: for every (i, j) with i < j where poly[j]
+    overlaps poly[i], subtract poly[i] from poly[j] via shapely
+    difference — so EARLIER polygons keep their full shape and LATER
+    ones absorb the clip. MultiPolygon results are reduced to their
+    largest Polygon component. Returns (new_list, modified_count).
+    List length is preserved (Nones for polygons swallowed entirely)."""
+    result = list(polygons)
+    modified = 0
+    for j in range(1, len(result)):
+        pj = result[j]
+        if pj is None or not hasattr(pj, 'exterior') or pj.is_empty:
+            continue
+        changed = False
+        for i in range(j):
+            pi = result[i]
+            if pi is None or not hasattr(pi, 'exterior') or pi.is_empty:
+                continue
+            if not pj.intersects(pi):
+                continue
+            inter = pj.intersection(pi)
+            if inter.is_empty or inter.area <= 1e-9:
+                continue
+            try:
+                pj = pj.difference(pi)
+            except Exception:
+                continue
+            changed = True
+            if pj.is_empty:
+                break
+            if not isinstance(pj, Polygon):
+                if hasattr(pj, 'geoms'):
+                    cs = [g for g in pj.geoms if isinstance(g, Polygon)]
+                    pj = max(cs, key=lambda g: g.area) if cs else None
+                else:
+                    pj = None
+            if pj is None:
+                break
+        if changed:
+            if (pj is not None and hasattr(pj, 'exterior')
+                    and not pj.is_empty):
+                if not pj.is_valid:
+                    pj = make_valid(pj)
+                    if not isinstance(pj, Polygon):
+                        if hasattr(pj, 'geoms'):
+                            cs = [g for g in pj.geoms if isinstance(g, Polygon)]
+                            pj = max(cs, key=lambda g: g.area) if cs else None
+                        else:
+                            pj = None
+                result[j] = pj
+            else:
+                result[j] = None
+            modified += 1
+    return result, modified
+
+
 def rotate_polygons(polygons, max_rotation_deg):
     """Independently rotate each polygon around its centroid by a random angle
     in [-max_rotation_deg, +max_rotation_deg].  Run AFTER scale_polygons so
@@ -1056,6 +1139,38 @@ class ControlPanel(QWidget):
 
         layout.addWidget(rand_group)
 
+        # ── Scale-all group ────────────────────────────────────────────
+        # Uniformly scale every polygon around its own centroid by the
+        # given percentage. When scaling UP causes adjacent polygons to
+        # overlap along their shared edges, the fix clips later polygons
+        # against earlier ones via shapely difference. Reset to Original
+        # (above) still restores the CSV-load state.
+        scale_group  = QGroupBox("Scale All")
+        scale_layout = QVBoxLayout(scale_group)
+        scale_layout.setSpacing(4)
+        scale_layout.setContentsMargins(6, 8, 6, 6)
+
+        scale_layout.addWidget(QLabel("Scale (%):"))
+        self.scale_all_spin = QDoubleSpinBox()
+        self.scale_all_spin.setRange(1.0, 500.0)
+        self.scale_all_spin.setValue(100.0)
+        self.scale_all_spin.setSingleStep(1.0)
+        self.scale_all_spin.setDecimals(1)
+        self.scale_all_spin.setToolTip(
+            "Scale every polygon around its own centroid by this percentage.\n"
+            "100 = unchanged; 120 = 20% larger; 80 = 20% smaller.\n"
+            "Upscaling overlaps are resolved by clipping later polygons\n"
+            "against earlier ones (shapely difference)."
+        )
+        scale_layout.addWidget(self.scale_all_spin)
+
+        self.scale_all_btn = QPushButton("Scale All Polygons")
+        self.scale_all_btn.setEnabled(False)
+        self.scale_all_btn.clicked.connect(self.on_scale_all_clicked)
+        scale_layout.addWidget(self.scale_all_btn)
+
+        layout.addWidget(scale_group)
+
         # Save CSV button (writes current polygons + colors, post-randomization)
         self.save_csv_btn = QPushButton("Save CSV")
         self.save_csv_btn.setEnabled(False)
@@ -1097,6 +1212,7 @@ class ControlPanel(QWidget):
                 # Enable randomization + save-csv now that we have data.
                 self.randomize_btn.setEnabled(True)
                 self.reset_rand_btn.setEnabled(True)
+                self.scale_all_btn.setEnabled(True)
                 self.save_csv_btn.setEnabled(True)
                 self.save_png_btn.setEnabled(True)
             else:
@@ -1195,6 +1311,66 @@ class ControlPanel(QWidget):
         # Tiles / Save Boxes require Cut to be re-run on the new geometry.
         self.tiles_btn.setEnabled(False)
         self.save_boxes_btn.setEnabled(False)
+
+    def on_scale_all_clicked(self):
+        """Scale every polygon around its own centroid by the sidebar's
+        percentage. When scaling UP causes overlaps (adjacent polygons
+        that shared edges now cross into each other), resolve them by
+        clipping later polygons against earlier ones via shapely
+        difference — earlier polygons keep their full shape."""
+        if not self.canvas or not self.canvas.polygons:
+            return
+        pct = self.scale_all_spin.value()
+        if abs(pct - 100.0) < 1e-9:
+            QMessageBox.information(
+                self, "Scale All", "100% is a no-op — no change applied."
+            )
+            return
+        factor = pct / 100.0
+
+        try:
+            scaled = scale_all_polygons(self.canvas.polygons, factor)
+            if factor > 1.0:
+                scaled, modified = fix_polygon_overlaps(scaled)
+            else:
+                modified = 0
+        except Exception as e:
+            QMessageBox.critical(self, "Scale All Error", str(e))
+            return
+
+        # Filter Nones, keep the color list aligned with survivors.
+        old_colors = list(self.canvas.colors)
+        new_polys, new_colors = [], []
+        for i, p in enumerate(scaled):
+            if p is None or not hasattr(p, 'exterior') or p.is_empty:
+                continue
+            new_polys.append(p)
+            new_colors.append(
+                old_colors[i] if i < len(old_colors) else QColor(200, 200, 200)
+            )
+
+        dropped = len(self.canvas.polygons) - len(new_polys)
+        self.canvas.polygons        = new_polys
+        self.canvas.colors          = new_colors
+        self.canvas.edge_colors     = [QColor(0, 0, 0) for _ in new_polys]
+        self.canvas.original_colors = list(new_colors)
+        # Scaling invalidates any prior Cut/Tiles state.
+        self.canvas.tile_polygons       = {}
+        self.canvas.boxes_with_polygons = set()
+        self.canvas.filled_box_index    = -1
+        self.canvas.invalidate_cache()
+        self.canvas.calculate_bounds()
+        self.canvas.update()
+
+        # Tiles / Save Boxes need Cut re-run on the new geometry.
+        self.tiles_btn.setEnabled(False)
+        self.save_boxes_btn.setEnabled(False)
+
+        msg = (f"Scaled {len(new_polys)} polygon(s) to {pct:.1f}%.\n"
+               f"Fixed {modified} overlap(s) by clipping.")
+        if dropped:
+            msg += f"\nDropped {dropped} polygon(s) that were fully swallowed."
+        QMessageBox.information(self, "Scale All", msg)
 
     def on_reset_clicked(self):
         """Restore the original polygons and colors loaded from the CSV."""

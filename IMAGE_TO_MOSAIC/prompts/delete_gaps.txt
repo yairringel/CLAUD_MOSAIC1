@@ -1,0 +1,17 @@
+The supplied image is a mosaic — many small stone tesserae separated by dark grout lines. Re-render it as a very densely-packed mosaic where the stones touch directly, with NO visible dark grout between them.
+
+What to keep:
+- The overall subject and composition of the mosaic.
+- Each stone's dominant color and rough position.
+- The natural stone character: subtle marble veining, mild internal color variation, small chips.
+- Even, diffuse top-down lighting; same aspect ratio and framing.
+
+What to change:
+- Remove the dark grout between stones. Adjacent stones butt up against each other edge-to-edge. Where two stones meet, the seam is a hairline color transition, not a dark line.
+- If two adjacent stones share a similar color, the seam may become almost invisible — that is fine.
+
+Style:
+- Result should look like a single continuous stone-mosaic surface — dense, gap-less, sharp — as if the tesserae were laid with the tightest possible fit.
+- Matte surface, no highlights, no shadows, no perspective.
+
+Output the same image, just gap-less.

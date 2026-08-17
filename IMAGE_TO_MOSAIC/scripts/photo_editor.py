@@ -1510,7 +1510,19 @@ class PhotoEditor(QMainWindow):
             )
             return
 
-        prompt_with_sizes = self._build_final_prompt()
+        # Prompts flagged as "lightweight" bypass every prompt-addendum
+        # (size overrides, subject-rendering rules, max-tile-count
+        # ceiling, red-square marker, background-fill). Those addenda
+        # bring a lot of "self-check → regenerate" language that pushes
+        # the image model past Gemini's per-request deadline. delete_gaps
+        # is a simple restyle, not a per-tile edit, so it doesn't need
+        # any of them.
+        stem = (self.current_prompt_path.stem.lower()
+                if self.current_prompt_path is not None else "")
+        if stem in {"delete_gaps"}:
+            prompt_with_sizes = self.current_prompt_text or ""
+        else:
+            prompt_with_sizes = self._build_final_prompt()
         src_for_aspect = self.source_pane.pil_image
 
         # If the "Use red square as tile size" checkbox is on, burn the BLACK
@@ -1540,9 +1552,22 @@ class PhotoEditor(QMainWindow):
             aspect = closest_aspect_ratio(src_for_aspect.width, src_for_aspect.height)
         else:
             aspect = GENERATION_ASPECT
+
+        # Per-prompt output-size override: certain prompts (currently
+        # delete_gaps) do fine-grained local editing that regularly
+        # blows past the Gemini per-request deadline at 4K. Drop them
+        # to 2K for reliability. Every other prompt keeps the default
+        # GENERATION_IMAGE_SIZE ("4K").
+        image_size = GENERATION_IMAGE_SIZE
+        if self.current_prompt_path is not None:
+            stem = self.current_prompt_path.stem.lower()
+            if stem in {"delete_gaps"}:
+                image_size = "2K"
+
         self.worker = GenerationWorker(
             src_for_aspect, prompt_with_sizes, DEFAULT_MODEL,
             aspect_ratio=aspect,
+            image_size=image_size,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_ok.connect(self._on_generated)

@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QFrame, QLabel, QPushButton, QFileDialog, QCheckBox, QSpinBox, QLineEdit, QInputDialog, QMessageBox,
     QSizePolicy, QSlider, QColorDialog
 )
-from PyQt5.QtCore import Qt, QPoint, QTimer, pyqtSignal, QBuffer, QByteArray
+from PyQt5.QtCore import Qt, QPoint, QTimer, QSize, pyqtSignal, QBuffer, QByteArray
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QBrush, QFont, QPolygon, QCursor, QLinearGradient
 
 class ContinuousButton(QPushButton):
@@ -2024,11 +2024,120 @@ class Canvas(QWidget):
             area -= points[j][0] * points[i][1]
         return abs(area) / 2
     
+    def keep_only_top_middle_gridbox(self):
+        """Delete every polygon whose MAJORITY area is not inside the
+        top-middle cell of the 3×3 grid — a polygon is kept only when
+        > 50% of its area lies within the box (so shapes that only
+        clip the box are dropped even if their centroid squeaks past
+        the boundary). Snapshots undo first. Returns (kept, removed).
+
+        Top-middle cell in world coords:
+            x ∈ [grid_offset_x + grid_size,  grid_offset_x + 2*grid_size]
+            y ∈ [grid_offset_y,              grid_offset_y + grid_size]
+        (Y grows downward → row 0 is the top row.)"""
+        if not self.polygons:
+            return (0, 0)
+
+        gs = self.grid_size
+        x_min = self.grid_offset_x + gs
+        x_max = self.grid_offset_x + 2 * gs
+        y_min = self.grid_offset_y
+        y_max = self.grid_offset_y + gs
+
+        # Prefer shapely for a real area intersection; fall back to a
+        # "polygon area ≈ intersection area estimated by point sampling"
+        # so the check still works if shapely isn't installed.
+        try:
+            from shapely.geometry import Polygon as _ShpPolygon, box as _shp_box
+            box = _shp_box(x_min, y_min, x_max, y_max)
+            use_shapely = True
+        except ImportError:
+            box = (x_min, y_min, x_max, y_max)
+            use_shapely = False
+
+        def _shoelace_area(pts):
+            n = len(pts)
+            if n < 3:
+                return 0.0
+            s = 0.0
+            for i in range(n):
+                x1, y1 = pts[i]
+                x2, y2 = pts[(i + 1) % n]
+                s += x1 * y2 - x2 * y1
+            return abs(s) * 0.5
+
+        def _majority_in_box_sampled(pts):
+            # Grid-sample the polygon's bbox; count how many samples fall
+            # inside the polygon and, of those, how many are also inside
+            # the box. Return inside_box / inside_poly > 0.5.
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            bx0, bx1 = min(xs), max(xs)
+            by0, by1 = min(ys), max(ys)
+            if bx0 == bx1 or by0 == by1:
+                return False
+            N = 20
+            inside_poly = 0; inside_box_and_poly = 0
+            for iy in range(N):
+                for ix in range(N):
+                    sx = bx0 + (bx1 - bx0) * (ix + 0.5) / N
+                    sy = by0 + (by1 - by0) * (iy + 0.5) / N
+                    if not self.point_in_polygon(sx, sy, pts):
+                        continue
+                    inside_poly += 1
+                    if x_min <= sx <= x_max and y_min <= sy <= y_max:
+                        inside_box_and_poly += 1
+            if inside_poly == 0:
+                return False
+            return inside_box_and_poly / inside_poly > 0.5
+
+        kept, removed = [], 0
+        for poly in self.polygons:
+            pts = poly.get('points', [])
+            if len(pts) < 3:
+                removed += 1
+                continue
+            try:
+                if use_shapely:
+                    shp = _ShpPolygon([(float(x), float(y)) for x, y in pts])
+                    if not shp.is_valid:
+                        shp = shp.buffer(0)
+                    if shp.is_empty or shp.area <= 0:
+                        removed += 1
+                        continue
+                    inter = shp.intersection(box)
+                    if inter.is_empty or inter.area / shp.area <= 0.5:
+                        removed += 1
+                        continue
+                    kept.append(poly)
+                else:
+                    if _shoelace_area(pts) <= 0:
+                        removed += 1
+                        continue
+                    if _majority_in_box_sampled(pts):
+                        kept.append(poly)
+                    else:
+                        removed += 1
+            except Exception:
+                removed += 1
+
+        if removed == 0:
+            return (len(kept), 0)
+
+        self.save_state()
+        self.polygons = kept
+        # Reset any selection that would now point to a stale index.
+        if hasattr(self, 'selected_polygon_index'):
+            self.selected_polygon_index = -1
+        if hasattr(self, 'selected_polygon_indices'):
+            self.selected_polygon_indices = set()
+        self.update()
+        return (len(kept), removed)
+
     def point_in_polygon(self, x, y, polygon_points):
         """Check if a point is inside a polygon using ray casting algorithm"""
         if len(polygon_points) < 3:
             return False
-        
+
         inside = False
         j = len(polygon_points) - 1
         
@@ -2834,6 +2943,21 @@ class SidePanel(QFrame):
             self.random_checkbox = QCheckBox("Random")
             self.random_checkbox.toggled.connect(self.on_random_toggled)
             layout.addWidget(self.random_checkbox)
+
+            # Keep Top Middle Only — destructive. Deletes every polygon
+            # whose centroid is NOT inside the top-middle grid cell of
+            # the 3×3 grid, leaving only the copies that live there.
+            # Confirms first; undoable via Ctrl+Z (save_state snapshot).
+            self.keep_top_middle_btn = QPushButton("Keep Top Middle Only")
+            self.keep_top_middle_btn.setToolTip(
+                "Delete every polygon whose centroid falls outside the "
+                "top-middle cell of the 3×3 grid. Only the copies inside "
+                "the top-middle box remain. Undoable with Ctrl+Z."
+            )
+            self.keep_top_middle_btn.clicked.connect(
+                self.on_keep_top_middle_clicked
+            )
+            layout.addWidget(self.keep_top_middle_btn)
             
             # Add duplicate button
             duplicate_button = QPushButton("Duplicate")
@@ -3112,7 +3236,35 @@ class SidePanel(QFrame):
         """Handle random mode checkbox toggle"""
         if self.canvas:
             self.canvas.random_mode = checked
-    
+
+    def on_keep_top_middle_clicked(self):
+        """Confirm, then keep only polygons whose centroid is inside the
+        top-middle cell of the 3×3 grid. Destructive — undoable via
+        Ctrl+Z (the canvas method snapshots first)."""
+        if not self.canvas:
+            return
+        total = len(self.canvas.polygons)
+        if total == 0:
+            QMessageBox.information(
+                self, "Keep Top Middle Only",
+                "No polygons to filter."
+            )
+            return
+        reply = QMessageBox.question(
+            self, "Keep Top Middle Only",
+            f"Delete every polygon outside the top-middle grid cell?\n"
+            f"({total} polygon(s) currently on the canvas. Undoable with "
+            f"Ctrl+Z.)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        kept, removed = self.canvas.keep_only_top_middle_gridbox()
+        QMessageBox.information(
+            self, "Keep Top Middle Only",
+            f"Kept {kept} polygon(s), removed {removed}."
+        )
+
     def remove_mandala_click_markings(self):
         """Remove green fill from polygons that were marked in mandala click mode"""
         if not self.canvas:
@@ -3177,26 +3329,66 @@ class SidePanel(QFrame):
         self.color_picker.color_changed.connect(self._saved_palette.fill_armed_slot)
         layout.addWidget(self._saved_palette)
 
-        # Replace-color row
+        # Replace-color rows — two clearly-labeled swatches so it's
+        # obvious which color is being replaced (From) and which color
+        # will replace it (To = the currently-chosen picker color).
         self._replace_from_color = None
+        layout.addWidget(QLabel('Replace color:'))
+
         replace_row = QHBoxLayout()
         replace_row.setSpacing(4)
-        replace_row.addWidget(QLabel('Replace:'))
+
+        # "From:" — the color that will be replaced. Sampled from a
+        # polygon via the Pick button.
+        replace_row.addWidget(QLabel('From:'))
         self._replace_from_box = QLabel()
         self._replace_from_box.setFixedSize(36, 22)
-        self._replace_from_box.setStyleSheet('background-color: transparent; border: 2px dashed #888;')
-        self._replace_from_box.setToolTip('Source color to replace — use ⊕ to sample from canvas')
+        self._replace_from_box.setStyleSheet(
+            'background-color: transparent; border: 2px dashed #888;'
+        )
+        self._replace_from_box.setToolTip(
+            'The color that will be replaced. Click Pick, then click any '
+            'polygon on the canvas to sample its color into here.'
+        )
         replace_row.addWidget(self._replace_from_box)
-        self._replace_sample_btn = QPushButton('⊕')
-        self._replace_sample_btn.setFixedSize(22, 22)
-        self._replace_sample_btn.setToolTip('Click then click a polygon to set source color')
+
+        self._replace_sample_btn = QPushButton('Pick')
+        self._replace_sample_btn.setFixedSize(42, 22)
+        self._replace_sample_btn.setToolTip(
+            'Enter sampling mode — the next canvas click sets the "From" '
+            'color to that polygon\'s color.'
+        )
         self._replace_sample_btn.setCheckable(True)
         self._replace_sample_btn.clicked.connect(self._on_replace_sample_btn_clicked)
         replace_row.addWidget(self._replace_sample_btn)
-        replace_row.addWidget(QLabel('→ current color'))
+
+        # Big arrow makes direction obvious at a glance.
+        arrow_lbl = QLabel(' → ')
+        arrow_lbl.setStyleSheet('font-weight: bold; font-size: 14px;')
+        replace_row.addWidget(arrow_lbl)
+
+        # "To:" — always mirrors the currently-chosen picker color.
+        replace_row.addWidget(QLabel('To:'))
+        self._replace_to_box = QLabel()
+        self._replace_to_box.setFixedSize(36, 22)
+        r0 = self.selected_color.red()
+        g0 = self.selected_color.green()
+        b0 = self.selected_color.blue()
+        self._replace_to_box.setStyleSheet(
+            f'background-color: rgb({r0},{g0},{b0}); border: 2px solid #555;'
+        )
+        self._replace_to_box.setToolTip(
+            'The color that will REPLACE the "From" color. Always tracks '
+            'the currently-chosen color in the picker above.'
+        )
+        replace_row.addWidget(self._replace_to_box)
+
         self._replace_apply_btn = QPushButton('Apply')
-        self._replace_apply_btn.setFixedSize(40, 22)
-        self._replace_apply_btn.setToolTip('Replace all polygons with source color → current color')
+        self._replace_apply_btn.setFixedSize(48, 22)
+        self._replace_apply_btn.setToolTip(
+            'Replace every polygon whose color matches "From" with the '
+            '"To" color.'
+        )
         self._replace_apply_btn.clicked.connect(self._apply_replace_color)
         replace_row.addWidget(self._replace_apply_btn)
         replace_row.addStretch()
@@ -3250,31 +3442,66 @@ class SidePanel(QFrame):
             self.canvas.update()
 
     def _on_replace_sample_btn_clicked(self, checked):
-        """Toggle replace-source eyedropper via its button."""
+        """Toggle replace-source eyedropper via its button. While active,
+        highlight both the Pick button and the "From:" swatch in orange
+        so it's unmistakable which color is being picked."""
         if checked:
             if self.canvas:
                 self.canvas.replace_eyedropper_mode = True
                 self.canvas.setCursor(Qt.CrossCursor)
-            self._replace_sample_btn.setStyleSheet('background-color: #f90; border: 2px solid #c60;')
+            self._replace_sample_btn.setStyleSheet(
+                'background-color: #f90; border: 2px solid #c60;'
+            )
+            # Flash the From box border so the user sees where the
+            # sampled color will land.
+            cur = self._replace_from_box.styleSheet()
+            # Prepend an orange border override, keep the fill.
+            if 'background-color' in cur and 'transparent' not in cur:
+                fill = cur.split('background-color')[1].split(';')[0]
+                self._replace_from_box.setStyleSheet(
+                    f'background-color{fill}; border: 3px solid #f90;'
+                )
+            else:
+                self._replace_from_box.setStyleSheet(
+                    'background-color: transparent; border: 3px solid #f90;'
+                )
         else:
             if self.canvas:
                 self.canvas.replace_eyedropper_mode = False
                 self.canvas.setCursor(Qt.ArrowCursor)
             self._replace_sample_btn.setStyleSheet('')
+            # Restore the From box border to normal (keep its fill).
+            self._restore_from_box_style()
+
+    def _restore_from_box_style(self):
+        """Repaint the From box using its current color (or empty look)."""
+        col = self._replace_from_color
+        if col is None:
+            self._replace_from_box.setStyleSheet(
+                'background-color: transparent; border: 2px dashed #888;'
+            )
+        else:
+            r, g, b = col.red(), col.green(), col.blue()
+            self._replace_from_box.setStyleSheet(
+                f'background-color: rgb({r},{g},{b}); border: 2px solid #555;'
+            )
 
     def receive_replace_source_color(self, color):
         """Called by Canvas after replace-source eyedropper samples a polygon."""
         self._replace_from_color = color
-        r, g, b = color.red(), color.green(), color.blue()
-        self._replace_from_box.setStyleSheet(
-            f'background-color: rgb({r},{g},{b}); border: 2px solid #555;'
-        )
+        self._restore_from_box_style()
         self._replace_sample_btn.setChecked(False)
         self._replace_sample_btn.setStyleSheet('')
 
     def _apply_replace_color(self):
-        """Replace all polygons matching the source color with the current selected color."""
+        """Replace all polygons matching the "From" color with the "To"
+        color (the currently-chosen picker color)."""
         if self._replace_from_color is None or not self.canvas:
+            QMessageBox.information(
+                self, "Replace color",
+                "Sample a source color first: click Pick, then click a "
+                "polygon on the canvas."
+            )
             return
         src = self._replace_from_color
         dst = self.selected_color
@@ -3282,11 +3509,18 @@ class SidePanel(QFrame):
         self.canvas.save_state()
         for polygon in self.canvas.polygons:
             c = polygon.get('color')
-            if c is not None and c.red() == src.red() and c.green() == src.green() and c.blue() == src.blue():
+            if (c is not None and c.red() == src.red()
+                    and c.green() == src.green() and c.blue() == src.blue()):
                 polygon['color'] = QColor(dst)
                 count += 1
         self.canvas.update()
         print(f'[replace] replaced {count} polygons')
+        QMessageBox.information(
+            self, "Replace color",
+            f"Replaced {count} polygon(s):\n"
+            f"  From rgb({src.red()},{src.green()},{src.blue()})\n"
+            f"  To   rgb({dst.red()},{dst.green()},{dst.blue()})"
+        )
 
     def _apply_color_variance(self):
         """Randomly shift each polygon's color by up to variance per channel."""
@@ -3336,6 +3570,11 @@ class SidePanel(QFrame):
         self._chosen_color_box.setStyleSheet(
             f'background-color: rgb({r},{g},{b}); border: 2px solid #555;'
         )
+        # Keep "To:" swatch of the replace row in sync with the picker.
+        if hasattr(self, '_replace_to_box'):
+            self._replace_to_box.setStyleSheet(
+                f'background-color: rgb({r},{g},{b}); border: 2px solid #555;'
+            )
         # If a palette slot is armed, fill it with the sampled color
         self._saved_palette.fill_armed_slot(color)
         self._eyedropper_btn.setChecked(False)
@@ -3359,6 +3598,10 @@ class SidePanel(QFrame):
         self._chosen_color_box.setStyleSheet(
             f'background-color: rgb({r},{g},{b}); border: 2px solid #555;'
         )
+        if hasattr(self, '_replace_to_box'):
+            self._replace_to_box.setStyleSheet(
+                f'background-color: rgb({r},{g},{b}); border: 2px solid #555;'
+            )
 
     def _on_picker_color_changed(self, color):
         """Update selected_color and chosen color box when the picker changes."""
@@ -3367,6 +3610,10 @@ class SidePanel(QFrame):
         self._chosen_color_box.setStyleSheet(
             f'background-color: rgb({r},{g},{b}); border: 2px solid #555;'
         )
+        if hasattr(self, '_replace_to_box'):
+            self._replace_to_box.setStyleSheet(
+                f'background-color: rgb({r},{g},{b}); border: 2px solid #555;'
+            )
     
     def duplicate_all_polygons(self):
         """Create 8 copies of all existing polygons using duplicate offsets"""
@@ -4083,6 +4330,255 @@ class SidePanel(QFrame):
             self.cursor_position_label.setText(f'Cursor: ({x:.1f}, {y:.1f})')
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Default 256-color mosaic palette. 64 curated base pigments spanning reds,
+# oranges, yellows, greens, blues, purples, browns, greys, and cream/whites —
+# each expanded into 4 close tonal variants for a total of 256. Wider hue
+# coverage than the earlier 12-base × 21-shade version so users see more
+# distinct colors and fewer near-duplicates.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_default_mosaic_palette():
+    base_colors = [
+        # Reds / warm — 8
+        (155,  62,  40), (128,  33,  30), (170,  55,  55), (140,  60,  35),
+        (190, 100,  80), (200, 130, 110), (110,  20,  30), (180,  40,  40),
+        # Oranges — 6
+        (200, 110,  50), (170,  95,  55), (220, 150,  70), (220, 170, 130),
+        (180,  90,  40), (150,  75,  30),
+        # Yellows — 6
+        (232, 204, 148), (198, 155,  73), (200, 180,  80), (230, 200, 120),
+        (220, 210, 160), (160, 150,  60),
+        # Greens — 10
+        (112, 118,  60), ( 90, 110,  60), (130, 145, 100), ( 50,  80,  50),
+        (170, 190, 155), ( 80, 130, 105), ( 60, 100,  90), ( 40,  70,  40),
+        (140, 140,  90), ( 90, 100,  60),
+        # Blues — 10
+        ( 30,  50,  90), ( 92, 105, 120), ( 76, 100,  95), ( 90, 130, 170),
+        (120, 140, 190), ( 90, 110, 145), ( 40,  70, 130), ( 60,  40, 110),
+        ( 70, 130, 170), (180, 200, 220),
+        # Purples — 4
+        ( 90,  60,  90), (140, 100, 130), (110,  70, 100), ( 80,  40,  70),
+        # Browns — 8
+        ( 96,  55,  35), (110,  70,  40), ( 60,  40,  25), ( 50,  30,  20),
+        (150, 130, 100), ( 90,  60,  40), (120,  60,  40), (190, 155, 110),
+        # Greys — 4
+        ( 55,  55,  50), (140, 140, 135), (180, 180, 175), (110, 110, 105),
+        # Whites / creams — 4
+        (245, 240, 225), (240, 235, 210), (250, 245, 230), (230, 225, 210),
+        # Extras to reach 64 bases — 4
+        (200, 160, 160),   # dusty rose
+        (200, 220, 170),   # celery green
+        (100, 130, 155),   # steel blue
+        (150,  90,  55),   # cinnamon
+    ]
+    out = []
+    shades_per_base = 4                 # narrow tonal spread per base
+    for (r, g, b) in base_colors:
+        qbase = QColor(r, g, b)
+        h, s, base_v, _a = qbase.getHsv()
+        for k in range(shades_per_base):
+            # scale V from 0.65 * base to 1.20 * base — a tight band so
+            # each base's shades stay recognizable as that hue while
+            # remaining distinguishable from each other.
+            scale = 0.65 + 0.55 * (k / (shades_per_base - 1))
+            v = int(max(15, min(255, base_v * scale)))
+            c = QColor.fromHsv(max(0, h), s, v)
+            out.append((c.red(), c.green(), c.blue()))
+    return out[:256]
+
+
+MOSAIC_PALETTE_256 = _build_default_mosaic_palette()
+
+
+class _PaletteStrip(QWidget):
+    """Wrap-around grid of palette swatches — as many rows as the widget's
+    current width requires to show every color. Click to pick a color.
+    Cross cursor matches the left picker."""
+
+    def __init__(self, bar):
+        super().__init__(bar)
+        self.bar = bar
+        self.setMinimumHeight(bar.SWATCH + 2)
+        # SizePolicy: expanding width, minimum height (heightForWidth-driven).
+        sp = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
+        self.setCursor(Qt.CrossCursor)
+
+    def _cols(self, w=None):
+        sw = self.bar.SWATCH
+        w  = self.width() if w is None else w
+        return max(1, w // sw)
+
+    def _rows(self, w=None):
+        return max(1, (len(self.bar.colors) + self._cols(w) - 1)
+                   // self._cols(w))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        sw = self.bar.SWATCH
+        cols = max(1, w // sw)
+        rows = max(1, (len(self.bar.colors) + cols - 1) // cols)
+        return rows * sw
+
+    def sizeHint(self):
+        return QSize(self.bar.SWATCH * 32, self.heightForWidth(self.width()))
+
+    def minimumSizeHint(self):
+        return QSize(self.bar.SWATCH, self.bar.SWATCH)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        # Row count depends on width — notify parent so the top-level
+        # window relayouts its total height.
+        self.updateGeometry()
+
+    def paintEvent(self, _ev):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(48, 48, 48))
+        sw   = self.bar.SWATCH
+        cols = self._cols()
+        painter.setPen(QPen(QColor(30, 30, 30), 1))
+        for i, (r, g, b) in enumerate(self.bar.colors):
+            row = i // cols
+            col = i % cols
+            x = col * sw
+            y = row * sw
+            painter.setBrush(QBrush(QColor(int(r), int(g), int(b))))
+            painter.drawRect(x, y, sw, sw)
+
+    def mousePressEvent(self, ev):
+        if ev.button() != Qt.LeftButton:
+            return
+        sw = self.bar.SWATCH
+        cols = self._cols()
+        col = ev.x() // sw
+        row = ev.y() // sw
+        if col < 0 or col >= cols or row < 0:
+            return
+        idx = row * cols + col
+        self.bar._on_swatch_picked(int(idx))
+
+
+class PaletteBar(QWidget):
+    """Top-of-window color palette. All colors are shown in a wrap-around
+    grid of 15×15 swatches (as many rows as needed given the current
+    width). Click a swatch to set it as the active color on the linked
+    left panel — routed through the same handler as the eyedropper so
+    the picker, chosen-color box, and selected_color all update.
+
+    Load Palette button reads .txt/.csv/.pal files:
+      * one #RRGGBB per line, or
+      * one r,g,b per line (0-255 or 0-1 auto-detected)."""
+
+    SWATCH = 15
+
+    def __init__(self, left_panel=None, colors=None, parent=None):
+        super().__init__(parent)
+        self.left_panel = left_panel
+        self.colors     = list(colors) if colors else list(MOSAIC_PALETTE_256)
+
+        self.setStyleSheet("background-color: #303030;")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 4, 6, 4)
+        outer.setSpacing(2)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+        self.load_btn = QPushButton("Load Palette")
+        self.load_btn.setFixedWidth(100)
+        self.load_btn.clicked.connect(self._on_load_clicked)
+        row1.addWidget(self.load_btn)
+
+        self.strip = _PaletteStrip(self)
+        row1.addWidget(self.strip, 1)
+        outer.addLayout(row1)
+
+    def set_colors(self, colors):
+        self.colors = list(colors)
+        self.strip.updateGeometry()
+        self.strip.update()
+
+    def _on_swatch_picked(self, idx):
+        if idx < 0 or idx >= len(self.colors):
+            return
+        r, g, b = self.colors[idx]
+        col = QColor(int(r), int(g), int(b))
+        if self.left_panel is None:
+            return
+        # Prefer the eyedropper handler — it updates selected_color, the
+        # HSV picker, and the "chosen color" box on the left bar all at
+        # once, so a top-bar pick is visually identical to sampling.
+        if hasattr(self.left_panel, "receive_eyedropper_color"):
+            try:
+                self.left_panel.receive_eyedropper_color(col)
+                return
+            except Exception:
+                pass
+        # Fallback: at least set the active color.
+        self.left_panel.selected_color = col
+        if hasattr(self.left_panel, "color_picker"):
+            try:
+                self.left_panel.color_picker._apply_color(col)
+            except Exception:
+                pass
+
+    def _on_load_clicked(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Palette", "",
+            "Palette files (*.txt *.csv *.pal);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            colors = self._parse_palette_file(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Palette Load Failed", str(e))
+            return
+        if not colors:
+            QMessageBox.warning(self, "Palette", "No colors found in file.")
+            return
+        self.set_colors(colors)
+
+    @staticmethod
+    def _parse_palette_file(path):
+        out = []
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith('#') and len(s) < 4:
+                    continue
+                hx = s.lstrip('#')
+                if len(hx) == 6 and all(c in '0123456789abcdefABCDEF'
+                                        for c in hx):
+                    out.append((int(hx[0:2], 16),
+                                int(hx[2:4], 16),
+                                int(hx[4:6], 16)))
+                    continue
+                sep = ',' if ',' in s else (';' if ';' in s else None)
+                if sep:
+                    parts = [p.strip() for p in s.split(sep)]
+                    if len(parts) >= 3:
+                        try:
+                            fs = [float(parts[i]) for i in range(3)]
+                            if max(fs) <= 1.0:
+                                r, g, b = (int(v * 255) for v in fs)
+                            else:
+                                r, g, b = (int(v) for v in fs)
+                            out.append((max(0, min(255, r)),
+                                        max(0, min(255, g)),
+                                        max(0, min(255, b))))
+                        except ValueError:
+                            pass
+        return out
+
+
 class MandalaMosaicWindow(QMainWindow):
     """Main application window"""
     
@@ -4098,27 +4594,39 @@ class MandalaMosaicWindow(QMainWindow):
         # Create central widget and main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
+        # Outer VBox: palette bar on top, then horizontal row with panels.
+        outer = QVBoxLayout()
+        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0)
+
         main_layout = QHBoxLayout()
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(10, 10, 10, 10)
-        
+
         # Create central canvas
         self.canvas = Canvas()
-        
+
         # Create left panel (with reference to canvas for overlap functions)
         self.left_panel = SidePanel("Left Panel", self.canvas)
         main_layout.addWidget(self.left_panel)
-        
+
         main_layout.addWidget(self.canvas, 1)  # Give canvas stretch factor of 1
-        
+
         # Create right panel (with reference to canvas for background loading)
         self.right_panel = SidePanel("Right Panel", self.canvas)
         self.canvas.right_panel = self.right_panel  # Store reference for cursor position updates
         self.canvas.left_panel = self.left_panel   # Store reference for color palette access
         main_layout.addWidget(self.right_panel)
-        
-        central_widget.setLayout(main_layout)
+
+        # Top palette bar — 256 mosaic-typical colors by default (64 hues
+        # × 4 shades), slider to scroll, Load Palette to swap in a file
+        # from disk. Clicks feed the left panel's selected_color.
+        self.palette_bar = PaletteBar(left_panel=self.left_panel)
+        outer.addWidget(self.palette_bar)
+        outer.addLayout(main_layout, 1)
+
+        central_widget.setLayout(outer)
 
 
 def main():

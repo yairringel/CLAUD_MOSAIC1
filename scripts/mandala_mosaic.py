@@ -13,8 +13,8 @@ import random
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFrame, QGridLayout, QLabel, QPushButton, QFileDialog, QCheckBox,
-    QSpinBox, QLineEdit, QInputDialog, QMessageBox, QSizePolicy, QSlider,
-    QColorDialog,
+    QSpinBox, QDoubleSpinBox, QGroupBox, QLineEdit,
+    QMessageBox, QSizePolicy, QSlider, QColorDialog,
 )
 from PyQt5.QtCore import Qt, QPoint, QTimer, QBuffer, QByteArray, pyqtSignal
 from PyQt5.QtGui import (
@@ -22,6 +22,148 @@ from PyQt5.QtGui import (
     QLinearGradient, QImage,
 )
 import numpy as np
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Randomiser: pure functions ported from mosaic_studio.py, adapted to work on
+# this file's polygon representation (list of dicts with a 'points' list of
+# (x, y) tuples). Shared edges/vertices are matched by snap-key so adjacent
+# polygons always move together and can't be pulled apart.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RAND_SNAP_TOL = 1e-3
+
+
+def _rand_vkey(x, y):
+    return (round(x / _RAND_SNAP_TOL), round(y / _RAND_SNAP_TOL))
+
+
+def _rand_ekey(p1, p2):
+    k1, k2 = _rand_vkey(*p1), _rand_vkey(*p2)
+    return (k1, k2) if k1 < k2 else (k2, k1)
+
+
+def _rand_subdivide(points, edge_ctrl_map):
+    n = len(points)
+    out = []
+    for i in range(n):
+        p1 = points[i]
+        p2 = points[(i + 1) % n]
+        n_ctrl = edge_ctrl_map.get(_rand_ekey(p1, p2), 0)
+        out.append(p1)
+        for k in range(1, n_ctrl + 1):
+            t = k / (n_ctrl + 1)
+            out.append((p1[0] + t * (p2[0] - p1[0]),
+                        p1[1] + t * (p2[1] - p1[1])))
+    return out
+
+
+def randomize_point_lists(point_lists, n_ctrl_max, strength):
+    """Subdivide + perturb.  point_lists is a list of list-of-(x,y).
+    Returns a parallel list of new point lists.  Shared edges/vertices move
+    together.  Entries with <3 points pass through unchanged."""
+    # Per-edge control-point count.
+    edge_ctrl_map = {}
+    for pts in point_lists:
+        if not pts or len(pts) < 3:
+            continue
+        n = len(pts)
+        for i in range(n):
+            ek = _rand_ekey(pts[i], pts[(i + 1) % n])
+            if ek not in edge_ctrl_map:
+                edge_ctrl_map[ek] = random.randint(0, n_ctrl_max)
+
+    # Expand each polygon.
+    expanded = []
+    for pts in point_lists:
+        if not pts or len(pts) < 3:
+            expanded.append(list(pts) if pts else pts)
+            continue
+        expanded.append(_rand_subdivide(pts, edge_ctrl_map))
+
+    # Original-corner keys get a stronger min displacement.
+    corner_keys = set()
+    for pts in point_lists:
+        if not pts or len(pts) < 3:
+            continue
+        for x, y in pts:
+            corner_keys.add(_rand_vkey(x, y))
+
+    # One random displacement per unique vertex position.
+    displacements = {}
+    for coords in expanded:
+        if not coords or len(coords) < 3:
+            continue
+        for x, y in coords:
+            k = _rand_vkey(x, y)
+            if k not in displacements:
+                angle = random.uniform(0.0, 2.0 * math.pi)
+                if k in corner_keys:
+                    mag = random.uniform(strength * 0.3, strength)
+                else:
+                    mag = random.uniform(0.0, strength)
+                displacements[k] = (mag * math.cos(angle),
+                                    mag * math.sin(angle))
+
+    result = []
+    for coords in expanded:
+        if not coords or len(coords) < 3:
+            result.append(coords)
+            continue
+        moved = []
+        for x, y in coords:
+            dx, dy = displacements[_rand_vkey(x, y)]
+            moved.append((x + dx, y + dy))
+        result.append(moved)
+    return result
+
+
+def _centroid(pts):
+    if not pts:
+        return (0.0, 0.0)
+    sx = sum(p[0] for p in pts) / len(pts)
+    sy = sum(p[1] for p in pts) / len(pts)
+    return (sx, sy)
+
+
+def scale_point_lists(point_lists, max_downscale_pct):
+    """Downscale each polygon toward its centroid by a random amount in
+    [0, max_downscale_pct]%.  Only creates gaps, never overlaps."""
+    if max_downscale_pct <= 0:
+        return [list(p) for p in point_lists]
+    result = []
+    for pts in point_lists:
+        if not pts or len(pts) < 3:
+            result.append(pts)
+            continue
+        scale = random.uniform(1.0 - max_downscale_pct / 100.0, 1.0)
+        cx, cy = _centroid(pts)
+        result.append([(cx + (x - cx) * scale, cy + (y - cy) * scale)
+                       for x, y in pts])
+    return result
+
+
+def rotate_point_lists(point_lists, max_rotation_deg):
+    """Rotate each polygon around its centroid by a random angle in
+    [-max_rotation_deg, +max_rotation_deg].  Apply AFTER scale_point_lists."""
+    if max_rotation_deg <= 0:
+        return [list(p) for p in point_lists]
+    result = []
+    for pts in point_lists:
+        if not pts or len(pts) < 3:
+            result.append(pts)
+            continue
+        angle_rad = math.radians(random.uniform(-max_rotation_deg,
+                                                max_rotation_deg))
+        cosA = math.cos(angle_rad)
+        sinA = math.sin(angle_rad)
+        cx, cy = _centroid(pts)
+        result.append([
+            (cx + (x - cx) * cosA - (y - cy) * sinA,
+             cy + (x - cx) * sinA + (y - cy) * cosA)
+            for x, y in pts
+        ])
+    return result
 
 
 class Canvas(QWidget):
@@ -44,6 +186,10 @@ class Canvas(QWidget):
         self.polygon_points = []  # Points for the current polygon being drawn
         self.polygon_cursor_size = 10  # Size of the square cursor in pixels
         self.polygons = []  # List of completed polygons
+        # When True, paintEvent draws each polygon with NoBrush — outlines
+        # only, no fill — so the background image shows through. Toggled
+        # by the sidebar's "Transparent Polygons" checkbox.
+        self.polygons_transparent = False
 
         # Line drawing mode (mirrors duplicator.py). Click + drag to trace a
         # path; on release we place rotated squares of `line_polygon_size`
@@ -238,6 +384,21 @@ class Canvas(QWidget):
         self.center_offset_x = 0
         self.center_offset_y = 0
         self.update_mandala_center()
+        self.update()
+
+    def move_background(self, dx: float, dy: float) -> None:
+        """Nudge the background image position by (dx, dy) in world units.
+        Adjusts image_offset_x/y so the loaded image shifts under the
+        polygons + circles. Called by the sidebar arrows when the
+        'Background' checkbox is active."""
+        self.image_offset_x += float(dx)
+        self.image_offset_y += float(dy)
+        self.update()
+
+    def reset_background_offset(self) -> None:
+        """Zero the background image position — image_offset_x/y = 0."""
+        self.image_offset_x = 0
+        self.image_offset_y = 0
         self.update()
 
     def set_outer_circle_diameter(self, diameter):
@@ -490,121 +651,6 @@ class Canvas(QWidget):
     def set_line_polygon_size(self, size):
         """Set the size (world-px) of each square placed along the line."""
         self.line_polygon_size = max(1, int(size))
-
-    @staticmethod
-    def _qimage_to_numpy_rgb(qimg):
-        """Convert a QImage OR QPixmap to an (H, W, 3) uint8 numpy array
-        in RGB order. `background_image` in this app is a QPixmap (see
-        set_background_image); accept it directly so the caller doesn't
-        need to know."""
-        if qimg is None:
-            return None
-        # QPixmap has no .format() — bounce through QImage first.
-        if isinstance(qimg, QPixmap):
-            qimg = qimg.toImage()
-        if qimg.isNull():
-            return None
-        if qimg.format() != QImage.Format_RGB888:
-            qimg = qimg.convertToFormat(QImage.Format_RGB888)
-        w = qimg.width()
-        h = qimg.height()
-        stride = qimg.bytesPerLine()
-        ptr = qimg.constBits()
-        ptr.setsize(h * stride)
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, stride)
-        # bytesPerLine may include stride padding — trim to w*3 bytes per row.
-        return arr[:, : w * 3].reshape(h, w, 3).copy()
-
-    def detect_polygons_between_circles(self):
-        """Detect polygons in the ring between the inner and outer circles
-        using mosaic_to_csv.py's adaptive-threshold + connected-components
-        + Douglas-Peucker pipeline. Each detected tile is added to
-        self.polygons as a standalone polygon filled with its mean colour.
-
-        Returns the number of polygons added."""
-        if self.background_image is None or self.background_image.isNull():
-            raise RuntimeError("No background image loaded.")
-
-        # Lazy import so mosaic_to_csv is only loaded when Detect is clicked
-        # (it pulls in ~a full Qt/PIL toolchain).
-        import sys as _sys
-        from pathlib import Path as _Path
-        mtc_dir = (_Path(__file__).resolve().parent.parent
-                   / "IMAGE_TO_MOSAIC" / "scripts")
-        if str(mtc_dir) not in _sys.path:
-            _sys.path.insert(0, str(mtc_dir))
-        from mosaic_to_csv import detect_tiles
-
-        # Convert background QImage → numpy RGB (image-pixel coords).
-        img_rgb = self._qimage_to_numpy_rgb(self.background_image)
-        if img_rgb is None:
-            raise RuntimeError("Background image conversion failed.")
-        h, w = img_rgb.shape[:2]
-
-        # Circle geometry in image-pixel coords. World coords for the
-        # background are offset by image_offset_x/y — subtract to reach
-        # pixel space.
-        self.initialize_mandala_center()
-        cx_px = float(self.mandala_center_world_x) - float(self.image_offset_x)
-        cy_px = float(self.mandala_center_world_y) - float(self.image_offset_y)
-        r_in = float(self.circle_diameter) / 2.0
-        r_out = float(self.outer_circle_diameter) / 2.0
-        if r_in <= 0 or r_out <= r_in:
-            raise RuntimeError(
-                "Circle geometry is invalid — need inner < outer, both > 0.",
-            )
-
-        # Ring mask: True inside the ring. Apply to the input as black
-        # outside the ring so adaptive-threshold + connected-components
-        # can only find tiles between the two circles.
-        Y, X = np.ogrid[:h, :w]
-        dist_sq = (X - cx_px) ** 2 + (Y - cy_px) ** 2
-        ring_mask = (dist_sq >= r_in ** 2) & (dist_sq <= r_out ** 2)
-        masked = np.where(ring_mask[..., None], img_rgb, 0).astype(np.uint8)
-
-        # Detection using the same defaults as mosaic_to_csv.py's GUI
-        # (block_size=51, C=5, min_area=200, epsilon_ratio=0.02). Colours
-        # sampled from the ORIGINAL background so tiles keep their real
-        # colour instead of a mask-dimmed one.
-        tiles = detect_tiles(
-            masked,
-            block_size=51, C=5, min_area=200, epsilon_ratio=0.02,
-            color_source_rgb=img_rgb,
-        )
-        if not tiles:
-            return 0
-
-        # Undo checkpoint before adding.
-        self._push_undo_snapshot()
-
-        added = 0
-        offx = float(self.image_offset_x)
-        offy = float(self.image_offset_y)
-        for pts, mean_rgb in tiles:
-            # Defensive: centroid must be inside the ring — detect_tiles
-            # already drops border-touching components, but a tile that
-            # straddles the mask edge could still land partly outside.
-            cxp = float(pts[:, 0].mean())
-            cyp = float(pts[:, 1].mean())
-            d_sq = (cxp - cx_px) ** 2 + (cyp - cy_px) ** 2
-            if d_sq < r_in ** 2 or d_sq > r_out ** 2:
-                continue
-
-            r255 = max(0, min(255, int(round(mean_rgb[0] * 255))))
-            g255 = max(0, min(255, int(round(mean_rgb[1] * 255))))
-            b255 = max(0, min(255, int(round(mean_rgb[2] * 255))))
-            polygon_data = {
-                'points': [(float(p[0]) + offx, float(p[1]) + offy)
-                           for p in pts],
-                'color': QColor(r255, g255, b255),
-                'is_single': True,
-                'is_detected': True,
-            }
-            self.polygons.append(polygon_data)
-            added += 1
-
-        self.update()
-        return added
 
     def set_line_polygon_gap(self, gap):
         """Set the gap (world-px) between consecutive squares."""
@@ -1749,7 +1795,10 @@ class Canvas(QWidget):
                     # Draw normal thin black border
                     painter.setPen(QPen(QColor(0, 0, 0), 1))  # Thin black pen for border
                 
-                painter.setBrush(QBrush(color))
+                if self.polygons_transparent:
+                    painter.setBrush(QBrush(Qt.NoBrush))
+                else:
+                    painter.setBrush(QBrush(color))
                 painter.drawPolygon(qpolygon)
         
         # Draw control points for the primary selected polygon
@@ -2471,6 +2520,73 @@ class SidePanel(QFrame):
             layout.addWidget(QLabel('Color Palette:'))
             self.selected_color = QColor(0, 0, 0)
             self.create_color_palette(layout)
+
+            # ── Randomization group (ported from mosaic_studio.py) ──
+            # Perturbs the current polygon geometry. First press snapshots
+            # the pre-randomize state; every subsequent press re-runs from
+            # that snapshot so results don't compound. Reset restores it.
+            self._random_snapshot = None   # list of {'points', 'color'} dicts
+
+            rand_group  = QGroupBox("Randomization")
+            rand_layout = QVBoxLayout(rand_group)
+            rand_layout.setSpacing(4)
+            rand_layout.setContentsMargins(6, 8, 6, 6)
+
+            rand_layout.addWidget(QLabel("Max ctrl pts / edge:"))
+            self.rand_ctrl_spin = QSpinBox()
+            self.rand_ctrl_spin.setRange(0, 30)
+            self.rand_ctrl_spin.setValue(5)
+            self.rand_ctrl_spin.setToolTip(
+                "Each edge picks a random number of extra vertices in [0, max].\n"
+                "Shared edges always use the same count so polygons can't overlap."
+            )
+            rand_layout.addWidget(self.rand_ctrl_spin)
+
+            rand_layout.addWidget(QLabel("Strength (world units):"))
+            self.rand_strength_spin = QDoubleSpinBox()
+            self.rand_strength_spin.setRange(0.0, 1_000_000.0)
+            self.rand_strength_spin.setValue(1.0)
+            self.rand_strength_spin.setSingleStep(1.0)
+            self.rand_strength_spin.setDecimals(2)
+            self.rand_strength_spin.setToolTip(
+                "Maximum vertex displacement distance.\n"
+                "Set relative to polygon size (e.g. 5–20 for a 300-unit grid)."
+            )
+            rand_layout.addWidget(self.rand_strength_spin)
+
+            rand_layout.addWidget(QLabel("Max downscale (%):"))
+            self.rand_downscale_spin = QDoubleSpinBox()
+            self.rand_downscale_spin.setRange(0.0, 99.0)
+            self.rand_downscale_spin.setValue(5.0)
+            self.rand_downscale_spin.setSingleStep(1.0)
+            self.rand_downscale_spin.setDecimals(1)
+            self.rand_downscale_spin.setToolTip(
+                "Each polygon is independently scaled down by a random amount\n"
+                "between 0% and this value (toward its centroid). 0 = no scaling."
+            )
+            rand_layout.addWidget(self.rand_downscale_spin)
+
+            rand_layout.addWidget(QLabel("Max rotation (°):"))
+            self.rand_rotation_spin = QDoubleSpinBox()
+            self.rand_rotation_spin.setRange(0.0, 45.0)
+            self.rand_rotation_spin.setValue(0.0)
+            self.rand_rotation_spin.setSingleStep(1.0)
+            self.rand_rotation_spin.setDecimals(1)
+            self.rand_rotation_spin.setToolTip(
+                "Each polygon is independently rotated around its centroid by a\n"
+                "random angle in [-max, +max] degrees. Applied AFTER downscale."
+            )
+            rand_layout.addWidget(self.rand_rotation_spin)
+
+            self.randomize_btn = QPushButton("Randomize")
+            self.randomize_btn.clicked.connect(self.on_randomize_clicked)
+            rand_layout.addWidget(self.randomize_btn)
+
+            self.reset_rand_btn = QPushButton("Reset to Original")
+            self.reset_rand_btn.clicked.connect(self.on_reset_random_clicked)
+            rand_layout.addWidget(self.reset_rand_btn)
+
+            layout.addWidget(rand_group)
             layout.addStretch()
 
         # Add buttons for right panel
@@ -2594,11 +2710,29 @@ class SidePanel(QFrame):
             self.outer_circle_diameter_input.textChanged.connect(self.on_outer_circle_diameter_changed)
             layout.addWidget(self.outer_circle_diameter_input)
 
-            # ── Move circles: 4-arrow grid + step-size input ─────────────
-            # Nudges the mandala circles (inner + outer share the same
-            # centre) by ±step in world units per click. Centre button
-            # resets the offset so the circles return to the canvas centre.
-            layout.addWidget(QLabel("Move circles:"))
+            # ── Move circles / background: 4-arrow grid + step-size input ─
+            # Nudges either the mandala circles (inner + outer share the same
+            # centre) OR the background image by ±step in world units per
+            # click, depending on which of the two mutually-exclusive
+            # checkboxes below is active. Centre (reset) button clears the
+            # active target's offset.
+            layout.addWidget(QLabel("Arrows move:"))
+            target_row = QHBoxLayout()
+            self.arrow_target_circles_cb = QCheckBox("Circles")
+            self.arrow_target_circles_cb.setChecked(True)
+            self.arrow_target_bg_cb      = QCheckBox("Background")
+            self.arrow_target_bg_cb.setChecked(False)
+            self.arrow_target_circles_cb.toggled.connect(
+                self._on_arrow_target_circles_toggled
+            )
+            self.arrow_target_bg_cb.toggled.connect(
+                self._on_arrow_target_bg_toggled
+            )
+            target_row.addWidget(self.arrow_target_circles_cb)
+            target_row.addWidget(self.arrow_target_bg_cb)
+            target_row.addStretch(1)
+            layout.addLayout(target_row)
+
             arrows_grid = QGridLayout()
             arrows_grid.setSpacing(2)
 
@@ -2650,39 +2784,35 @@ class SidePanel(QFrame):
             step_row.addStretch(1)
             layout.addLayout(step_row)
 
-            # Detect polygons in the ring between the inner + outer circles
-            # using mosaic_to_csv.py's adaptive-threshold + connected-
-            # components + Douglas-Peucker pipeline. Results are added to
-            # the canvas as standalone polygons filled with each tile's
-            # mean colour.
-            self.detect_polys_btn = QPushButton("Detect Polygons in Ring")
-            self.detect_polys_btn.setToolTip(
-                "Detect tesserae in the ring between the inner and outer "
-                "circles from the background image, using the same "
-                "algorithm as mosaic_to_csv.py (adaptive Gaussian "
-                "threshold + connected components + Douglas-Peucker "
-                "simplification). Each detected polygon is added to the "
-                "canvas filled with its mean colour."
-            )
-            self.detect_polys_btn.clicked.connect(
-                self.on_detect_polygons_between_circles,
-            )
-            layout.addWidget(self.detect_polys_btn)
-            
             # Add show image checkbox
             self.show_image_checkbox = QCheckBox("Show Image")
             self.show_image_checkbox.setChecked(True)  # Checked by default
             self.show_image_checkbox.toggled.connect(self.on_show_image_toggled)
             layout.addWidget(self.show_image_checkbox)
+
+            # Transparent Polygons — when checked, polygons render as
+            # outlines only (no fill), so the background image shows
+            # through. Useful for seeing how the array aligns with the
+            # underlying photo/reference.
+            self.transparent_polys_checkbox = QCheckBox("Transparent Polygons")
+            self.transparent_polys_checkbox.setChecked(False)
+            self.transparent_polys_checkbox.setToolTip(
+                "Draw polygons as outlines only (no fill), so the background "
+                "image shows through."
+            )
+            self.transparent_polys_checkbox.toggled.connect(
+                self.on_transparent_polys_toggled
+            )
+            layout.addWidget(self.transparent_polys_checkbox)
             
             # Add save and load array buttons
             save_array_button = QPushButton("Save Array")
             save_array_button.clicked.connect(self.save_array)
             layout.addWidget(save_array_button)
 
-            save_top_pie_button = QPushButton("Save Top Pie")
-            save_top_pie_button.clicked.connect(self.save_top_pie)
-            layout.addWidget(save_top_pie_button)
+            save_pies_button = QPushButton("Save Pies")
+            save_pies_button.clicked.connect(self.save_pies)
+            layout.addWidget(save_pies_button)
 
             load_array_button = QPushButton("Load Array")
             load_array_button.clicked.connect(self.load_array)
@@ -2727,22 +2857,8 @@ class SidePanel(QFrame):
         )
         
         if file_path:
-            # Ask for desired size of the longer side
-            size, ok = QInputDialog.getInt(
-                self,
-                "Image Size",
-                "Enter the desired length for the longer side (pixels):",
-                value=1000,  # Default value
-                min=100,     # Minimum value
-                max=10000,   # Maximum value
-                step=100     # Step size
-            )
-            
-            if ok:
-                self.canvas.set_background_image(file_path, desired_size=size)
-            else:
-                # User cancelled size dialog, load with original size
-                self.canvas.set_background_image(file_path)
+            # Always load at full resolution — no downscale, no size prompt.
+            self.canvas.set_background_image(file_path)
             # New original = new 100 % reference. Reset the spinbox to
             # 100 without firing textChanged, so a stale value from the
             # previous image doesn't immediately downscale/upscale the
@@ -2784,23 +2900,138 @@ class SidePanel(QFrame):
             step = 10.0
         return max(0.1, min(10000.0, step))
 
+    def _on_arrow_target_circles_toggled(self, checked: bool) -> None:
+        """Mutually exclusive with the Background checkbox."""
+        if checked and hasattr(self, 'arrow_target_bg_cb') \
+                and self.arrow_target_bg_cb.isChecked():
+            self.arrow_target_bg_cb.blockSignals(True)
+            self.arrow_target_bg_cb.setChecked(False)
+            self.arrow_target_bg_cb.blockSignals(False)
+        elif (not checked
+              and hasattr(self, 'arrow_target_bg_cb')
+              and not self.arrow_target_bg_cb.isChecked()):
+            # Prevent both from being off — snap this one back on.
+            self.arrow_target_circles_cb.blockSignals(True)
+            self.arrow_target_circles_cb.setChecked(True)
+            self.arrow_target_circles_cb.blockSignals(False)
+
+    def _on_arrow_target_bg_toggled(self, checked: bool) -> None:
+        """Mutually exclusive with the Circles checkbox."""
+        if checked and hasattr(self, 'arrow_target_circles_cb') \
+                and self.arrow_target_circles_cb.isChecked():
+            self.arrow_target_circles_cb.blockSignals(True)
+            self.arrow_target_circles_cb.setChecked(False)
+            self.arrow_target_circles_cb.blockSignals(False)
+        elif (not checked
+              and hasattr(self, 'arrow_target_circles_cb')
+              and not self.arrow_target_circles_cb.isChecked()):
+            self.arrow_target_bg_cb.blockSignals(True)
+            self.arrow_target_bg_cb.setChecked(True)
+            self.arrow_target_bg_cb.blockSignals(False)
+
     def _on_circle_arrow(self, dx: int, dy: int) -> None:
-        """Arrow button handler — move the circles by (dx, dy) × step
-        world units. dx/dy are direction integers (-1, 0, +1)."""
+        """Arrow button handler — move either the circles OR the background
+        image by (dx, dy) × step world units, depending on which
+        'Arrows move:' checkbox is active. dx/dy are direction integers
+        (-1, 0, +1)."""
         if not self.canvas:
             return
         step = self._current_circle_step()
-        self.canvas.move_circles(dx * step, dy * step)
+        if hasattr(self, 'arrow_target_bg_cb') \
+                and self.arrow_target_bg_cb.isChecked():
+            self.canvas.move_background(dx * step, dy * step)
+        else:
+            self.canvas.move_circles(dx * step, dy * step)
 
     def _on_circle_reset(self) -> None:
-        """Centre-of-arrows button — reset the circle offset to (0, 0)."""
-        if self.canvas:
+        """Centre-of-arrows button — reset the active target's offset to
+        (0, 0). Circles OR Background depending on the active checkbox."""
+        if not self.canvas:
+            return
+        if hasattr(self, 'arrow_target_bg_cb') \
+                and self.arrow_target_bg_cb.isChecked():
+            self.canvas.reset_background_offset()
+        else:
             self.canvas.reset_circle_offset()
 
     def on_undo_clicked(self):
         """Undo button handler — pops the top of the canvas undo stack."""
         if self.canvas:
             self.canvas.undo_last()
+
+    # ── Randomizer slots (ported from mosaic_studio.py) ──────────────────
+    def _snapshot_polygons_for_random(self):
+        """Deep-copy the current canvas polygons into self._random_snapshot
+        so Randomize can always start from the same source."""
+        if not self.canvas:
+            return
+        self._random_snapshot = [
+            {'points': [(float(x), float(y)) for x, y in p['points']],
+             'color':  QColor(p['color']),
+             'parent_shape': p.get('parent_shape', None)}
+            for p in self.canvas.polygons
+        ]
+
+    def on_randomize_clicked(self):
+        """Snapshot on first press, then apply subdivide+perturb, downscale,
+        and rotate to the snapshot — matches mosaic_studio.py exactly."""
+        if not self.canvas or not self.canvas.polygons:
+            QMessageBox.warning(self, "Randomize", "No polygons to randomize.")
+            return
+        if self._random_snapshot is None:
+            self._snapshot_polygons_for_random()
+
+        n_ctrl   = self.rand_ctrl_spin.value()
+        strength = self.rand_strength_spin.value()
+        ds_pct   = self.rand_downscale_spin.value()
+        rot_deg  = self.rand_rotation_spin.value()
+
+        src_lists = [list(p['points']) for p in self._random_snapshot]
+        try:
+            new_pts = randomize_point_lists(src_lists, n_ctrl, strength)
+            new_pts = scale_point_lists(new_pts, ds_pct)
+            new_pts = rotate_point_lists(new_pts, rot_deg)
+        except Exception as e:
+            QMessageBox.critical(self, "Randomization Error", str(e))
+            return
+
+        # Save undo point BEFORE mutating.
+        if hasattr(self.canvas, '_push_undo_snapshot'):
+            self.canvas._push_undo_snapshot()
+
+        new_polys = []
+        for src, pts in zip(self._random_snapshot, new_pts):
+            if not pts or len(pts) < 3:
+                continue
+            new_polys.append({
+                'points': pts,
+                'color':  QColor(src['color']),
+                'parent_shape': src.get('parent_shape', None),
+            })
+        self.canvas.polygons = new_polys
+        self.canvas.selected_polygon_index = -1
+        self.canvas.update()
+
+    def on_reset_random_clicked(self):
+        """Restore the snapshot captured on the first Randomize press."""
+        if not self.canvas:
+            return
+        if self._random_snapshot is None:
+            QMessageBox.information(
+                self, "Reset",
+                "Nothing to reset — Randomize hasn't been pressed yet."
+            )
+            return
+        if hasattr(self.canvas, '_push_undo_snapshot'):
+            self.canvas._push_undo_snapshot()
+        self.canvas.polygons = [
+            {'points': [(float(x), float(y)) for x, y in p['points']],
+             'color':  QColor(p['color']),
+             'parent_shape': p.get('parent_shape', None)}
+            for p in self._random_snapshot
+        ]
+        self.canvas.selected_polygon_index = -1
+        self.canvas.update()
 
     def on_polygon_toggled(self, checked):
         """Handle polygon checkbox toggle"""
@@ -2874,24 +3105,6 @@ class SidePanel(QFrame):
             except ValueError:
                 pass   # ignore mid-typing invalid text
 
-    def on_detect_polygons_between_circles(self):
-        """Detect-Polygons-in-Ring button handler — delegates to the canvas
-        method which does the actual detection + polygon insertion."""
-        if not self.canvas:
-            return
-        try:
-            n = self.canvas.detect_polygons_between_circles()
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Detection failed", f"{type(e).__name__}: {e}",
-            )
-            return
-        QMessageBox.information(
-            self, "Detection complete",
-            f"Detected {n} polygon(s) in the ring between the inner and "
-            f"outer circles. They are now on the canvas.",
-        )
-
     def on_circle_diameter_changed(self, text):
         """Handle circle diameter input change"""
         if self.canvas:
@@ -2906,7 +3119,13 @@ class SidePanel(QFrame):
         """Handle show image checkbox toggle"""
         if self.canvas:
             self.canvas.set_image_visible(checked)
-    
+
+    def on_transparent_polys_toggled(self, checked):
+        """Toggle polygon fills — outlines only when checked."""
+        if self.canvas:
+            self.canvas.polygons_transparent = bool(checked)
+            self.canvas.update()
+
     def on_copies_changed(self):
         """Handle copies input text changes"""
         if self.canvas:
@@ -3189,13 +3408,14 @@ class SidePanel(QFrame):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save array: {str(e)}")
 
-    def save_top_pie(self):
-        """Save only the polygons whose majority area falls inside the top
-        wedge — the annulus sector centered on 12 o'clock, half-width 180°/N.
+    def save_pies(self):
+        """Save one CSV per wedge into per-pie subfolders under a chosen
+        parent folder. Wedge k spans the annulus sector centered on
+        -90° + k * (360°/N), half-width 180°/N. Pie 1 = the top (12 o'clock)
+        wedge; pies are numbered clockwise from there.
 
-        Requires: a canvas with polygons, both circles enabled (inner + outer
-        radii available on the canvas), mandala mode with num_copies > 0, and
-        outer_diameter > inner_diameter.
+        Requires: canvas with polygons, mandala mode on, num_copies > 0,
+        and outer_diameter > inner_diameter.
         """
         canvas = self.canvas
         if not canvas or not canvas.polygons:
@@ -3223,88 +3443,103 @@ class SidePanel(QFrame):
         except ImportError:
             QMessageBox.critical(
                 self, "Error",
-                "shapely is required for Save Top Pie. Run: pip install shapely"
+                "shapely is required for Save Pies. Run: pip install shapely"
             )
             return
 
-        # Build top-wedge geometry in world coords. Screen-y grows downward,
-        # so "up" is -Y. The wedge is the intersection of:
-        #   annulus:  inner_r <= r <= outer_r  (centered at (cx, cy))
-        #   sector :  angle centered on -90° with half-width 180/N
-        hw_deg  = 180.0 / n
-        hw_rad  = math.radians(hw_deg)
-        # Approximate arcs with segments.
+        parent_dir = QFileDialog.getExistingDirectory(
+            self, "Choose folder to save pies into", ""
+        )
+        if not parent_dir:
+            return
+
+        # Announce resource impact before writing anything (project rule).
+        # Wedge geometry: build each wedge k in [0, N-1] as an annulus sector
+        # centered on -90° + k * (360°/N), half-width 180°/N.
+        hw_deg   = 180.0 / n
+        hw_rad   = math.radians(hw_deg)
+        step_rad = math.radians(360.0 / n)
         arc_steps = max(24, int(2 * hw_deg))   # ~1° per step, at least 24
-        angles = [math.radians(-90.0) + (-hw_rad + 2 * hw_rad * i / arc_steps)
-                  for i in range(arc_steps + 1)]
 
-        outer_pts = [(cx + outer_r * math.cos(a), cy + outer_r * math.sin(a))
-                     for a in angles]
-        inner_pts = [(cx + inner_r * math.cos(a), cy + inner_r * math.sin(a))
-                     for a in reversed(angles)]
-        wedge = _ShpPolygon(outer_pts + inner_pts)
-        if not wedge.is_valid:
-            wedge = wedge.buffer(0)
-
-        # Filter polygons: keep those with > 50% of their area inside the wedge.
-        selected = []
+        # Pre-build every polygon's Shapely geometry once.
+        shp_polys = []
         for poly in canvas.polygons:
             pts = poly.get('points', [])
             if len(pts) < 3:
+                shp_polys.append(None)
                 continue
             try:
                 shp = _ShpPolygon([(float(x), float(y)) for x, y in pts])
                 if not shp.is_valid:
                     shp = shp.buffer(0)
                 if shp.is_empty or shp.area <= 0:
+                    shp_polys.append(None)
                     continue
-                inter = shp.intersection(wedge)
-                if inter.is_empty:
-                    continue
-                if inter.area / shp.area > 0.5:
-                    selected.append(poly)
+                shp_polys.append(shp)
             except Exception:
-                continue
+                shp_polys.append(None)
 
-        if not selected:
-            QMessageBox.information(
-                self, "Save Top Pie",
-                "No polygons have >50% of their area inside the top wedge."
-            )
-            return
-
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Save Top Pie as CSV", "top_pie.csv",
-            "CSV Files (*.csv);;All Files (*)"
-        )
-        if not filename:
-            return
-
+        import os
+        written = []
         try:
-            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['polygon_id', 'coordinates',
-                                 'color_r', 'color_g', 'color_b', 'color_a'])
-                for i, polygon_data in enumerate(selected):
-                    points = polygon_data['points']
-                    color  = polygon_data['color']
-                    coords_json = json.dumps(
-                        [[float(x), float(y)] for x, y in points]
-                    )
-                    r = color.red()   / 255.0
-                    g = color.green() / 255.0
-                    b = color.blue()  / 255.0
-                    a = color.alpha() / 255.0
-                    writer.writerow([i, coords_json, r, g, b, a])
+            for k in range(n):
+                a_center = math.radians(-90.0) + k * step_rad
+                angles = [a_center + (-hw_rad + 2 * hw_rad * i / arc_steps)
+                          for i in range(arc_steps + 1)]
+                outer_pts = [(cx + outer_r * math.cos(a),
+                              cy + outer_r * math.sin(a)) for a in angles]
+                inner_pts = [(cx + inner_r * math.cos(a),
+                              cy + inner_r * math.sin(a))
+                             for a in reversed(angles)]
+                wedge = _ShpPolygon(outer_pts + inner_pts)
+                if not wedge.is_valid:
+                    wedge = wedge.buffer(0)
 
+                selected = []
+                for poly, shp in zip(canvas.polygons, shp_polys):
+                    if shp is None:
+                        continue
+                    try:
+                        inter = shp.intersection(wedge)
+                        if inter.is_empty:
+                            continue
+                        if inter.area / shp.area > 0.5:
+                            selected.append(poly)
+                    except Exception:
+                        continue
+
+                pie_dir = os.path.join(parent_dir, f"pie{k + 1}")
+                os.makedirs(pie_dir, exist_ok=True)
+                csv_path = os.path.join(pie_dir, f"pie{k + 1}.csv")
+
+                with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(['polygon_id', 'coordinates',
+                                     'color_r', 'color_g', 'color_b', 'color_a'])
+                    for i, polygon_data in enumerate(selected):
+                        points = polygon_data['points']
+                        color  = polygon_data['color']
+                        coords_json = json.dumps(
+                            [[float(x), float(y)] for x, y in points]
+                        )
+                        r = color.red()   / 255.0
+                        g = color.green() / 255.0
+                        b = color.blue()  / 255.0
+                        a = color.alpha() / 255.0
+                        writer.writerow([i, coords_json, r, g, b, a])
+                written.append((k + 1, len(selected), csv_path))
+
+            summary = "\n".join(
+                f"pie{k}: {count} polygons → {path}"
+                for k, count, path in written
+            )
             QMessageBox.information(
                 self, "Success",
-                f"Saved {len(selected)} / {len(canvas.polygons)} polygons "
-                f"(top wedge) to {filename}"
+                f"Saved {n} pies under {parent_dir}\n\n{summary}"
             )
         except Exception as e:
             QMessageBox.critical(self, "Error",
-                                 f"Failed to save top pie: {str(e)}")
+                                 f"Failed to save pies: {str(e)}")
 
     def load_array(self):
         """Load polygons from CSV file compatible with mosaic_editor_pyqt"""
@@ -3597,11 +3832,11 @@ class MandalaMosaicWindow(QMainWindow):
         # Create central widget and main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         main_layout = QHBoxLayout()
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(10, 10, 10, 10)
-        
+
         # Create central canvas first so the left panel can hook into it
         canvas = Canvas()
 
