@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QFrame, QLabel, QPushButton, QFileDialog, QCheckBox,
     QSpinBox, QDoubleSpinBox, QMessageBox, QScrollArea, QColorDialog,
 )
-from PyQt5.QtCore import Qt, QRectF, QBuffer
+from PyQt5.QtCore import Qt, QRectF, QPointF, QBuffer
 from PyQt5.QtGui import (
     QPainter, QColor, QPen, QBrush, QPixmap, QImage, QPolygonF,
 )
@@ -357,6 +357,14 @@ class MosaicCanvas(QWidget):
         # Screen-space hit radius for control-point handles.
         self._vertex_hit_radius = 8
 
+        # Eraser tool — when active, LMB drag sweeps a circular
+        # cursor over the canvas and every polygon in an affected
+        # layer that intersects the circle gets deleted.
+        self.eraser_mode           = False
+        self.eraser_radius         = 20.0        # world units
+        self._eraser_pressed       = False
+        self._eraser_mouse_screen  = (0, 0)      # last known cursor pos
+
         # Undo — bounded stack of state snapshots. Each snapshot is a
         # dict with deep-copies of polygons + groups + canvas-bg fields.
         # Callers push a snapshot BEFORE mutating; undo() pops and
@@ -666,6 +674,7 @@ class MosaicCanvas(QWidget):
                         p.get('orig_fill_qimg')
                     ),
                     'orig_fill_bbox': p.get('orig_fill_bbox'),
+                    'image_zoom':     float(p.get('image_zoom', 1.0)),
                     'group_id':  p['group_id'],
                 } for p in self.polygons
             ],
@@ -691,6 +700,143 @@ class MosaicCanvas(QWidget):
         }
         with open(path, 'wb') as f:
             pickle.dump(data, f)
+
+    def save_mosaic(self, path: str) -> tuple[int, int, int]:
+        """Flatten the current canvas into a portable .mosaic bundle:
+        one PNG that is the composite of the shared canvas background
+        (if any) + every visible polygon's fill, and a polygons.csv
+        listing each polygon's outline in that PNG's coordinate space.
+        Returns (polygons_written, bg_width, bg_height).
+
+        Semantics vs save_project():
+          * Save Project (.mep) preserves per-layer geometry, image
+            fills, warp references, image_zoom, etc. — for re-editing.
+          * Save Mosaic (.mosaic) is FLATTENED — receivers only see
+            the composite PNG + one flat polygon list, exactly the
+            format image_strech.py's Save Mosaic writes."""
+        if not self.polygons and self.canvas_background is None:
+            raise RuntimeError("Canvas is empty — nothing to save.")
+
+        # ── 1. Union bounding box of everything visible on canvas ──
+        xs: list[float] = []
+        ys: list[float] = []
+        if self.canvas_background is not None:
+            bg   = self.canvas_background
+            bg_w = bg.width()  * self.bg_scale
+            bg_h = bg.height() * self.bg_scale
+            xs += [self.bg_offset_x, self.bg_offset_x + bg_w]
+            ys += [self.bg_offset_y, self.bg_offset_y + bg_h]
+        gid_visible = {g['id']: g['visible'] for g in self.groups}
+        visible_polys = [
+            p for p in self.polygons
+            if gid_visible.get(p['group_id'], True)
+            and p.get('points') and len(p['points']) >= 3
+        ]
+        for p in visible_polys:
+            for (x, y) in p['points']:
+                xs.append(float(x)); ys.append(float(y))
+        if not xs:
+            raise RuntimeError("Nothing visible to save.")
+        x0 = min(xs); y0 = min(ys)
+        x1 = max(xs); y1 = max(ys)
+        w  = max(1, int(round(x1 - x0)))
+        h  = max(1, int(round(y1 - y0)))
+
+        # ── 2. Composite everything into one RGBA image ──
+        composite = QImage(w, h, QImage.Format_ARGB32)
+        composite.fill(Qt.transparent)
+        painter = QPainter(composite)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # 2a. Canvas background (behind polygons).
+        if self.canvas_background is not None:
+            bg = self.canvas_background
+            sx = self.bg_offset_x - x0
+            sy = self.bg_offset_y - y0
+            sw = bg.width()  * self.bg_scale
+            sh = bg.height() * self.bg_scale
+            painter.drawPixmap(
+                QRectF(sx, sy, sw, sh), bg,
+                QRectF(0, 0, bg.width(), bg.height()),
+            )
+
+        # 2b. Every visible polygon with its fill.
+        for p in visible_polys:
+            pts = p['points']
+            qpoly = QPolygonF([QPointF(px - x0, py - y0)
+                               for (px, py) in pts])
+            if p['fill_type'] == 'image' and p.get('fill_qimg') is not None:
+                bx, by, bw, bh = p['fill_bbox']
+                painter.drawImage(
+                    QRectF(bx - x0, by - y0, bw, bh),
+                    p['fill_qimg'],
+                )
+            elif p['fill_type'] == 'solid':
+                painter.setBrush(QBrush(p['color']))
+                painter.setPen(Qt.NoPen)
+                painter.drawPolygon(qpoly)
+        painter.end()
+
+        # ── 3. Encode composite as PNG bytes ──
+        buf = QBuffer(); buf.open(QBuffer.WriteOnly)
+        composite.save(buf, "PNG")
+        png_bytes = bytes(buf.data())
+
+        # ── 4. Build polygons.csv (save_array-compatible schema) ──
+        # Coordinates are relative to the composite PNG's top-left,
+        # so opening the bundle in any receiver aligns polygon
+        # outlines to their baked-in pixel content 1:1.
+        csv_buf = io.StringIO()
+        writer  = csv.writer(csv_buf)
+        writer.writerow([
+            'polygon_id', 'coordinates',
+            'color_r', 'color_g', 'color_b', 'color_a',
+        ])
+        written = 0
+        for p in visible_polys:
+            coords_json = json.dumps(
+                [[float(px - x0), float(py - y0)] for (px, py) in p['points']]
+            )
+            # For image-filled polygons write 0,0,0,0 — the receiver
+            # should sample from the composite PNG, exactly like the
+            # convention image_strech.py's Save Mosaic uses.
+            if p['fill_type'] == 'image':
+                r = g = b = a = 0.0
+            else:
+                c = p.get('color') or QColor(0, 0, 0, 0)
+                r = c.red()   / 255.0
+                g = c.green() / 255.0
+                b = c.blue()  / 255.0
+                a = c.alpha() / 255.0
+            writer.writerow([written, coords_json, r, g, b, a])
+            written += 1
+
+        # ── 5. Manifest ──
+        manifest = {
+            "version": 1,
+            "background": "background.png",
+            "background_size": [int(w), int(h)],
+            "polygons_csv": "polygons.csv",
+            "polygon_count": written,
+            "notes": (
+                "Flattened mosaic saved by mosaic_editor.py. "
+                "background.png is the composite of the shared canvas "
+                "background plus every visible polygon's image fill "
+                "(image-filled polygons drawn from their orig_fill "
+                "or fill_qimg, solid-color polygons filled with their "
+                "own color). polygons.csv holds each polygon's outline "
+                "in the PNG's coordinate space (0,0 = top-left)."
+            ),
+        }
+
+        # ── 6. Write the ZIP ──
+        with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('polygons.csv',   csv_buf.getvalue())
+            zf.writestr('background.png', png_bytes)
+            zf.writestr('manifest.json',  json.dumps(manifest, indent=2))
+
+        return (written, w, h)
 
     def load_project(self, path: str) -> None:
         """Restore canvas state from a .mep pickle file. Replaces every
@@ -732,6 +878,7 @@ class MosaicCanvas(QWidget):
                 'orig_fill_bbox': (tuple(p['orig_fill_bbox'])
                                    if p.get('orig_fill_bbox') is not None
                                    else None),
+                'image_zoom': float(p.get('image_zoom', 1.0)),
                 'group_id':  int(p['group_id']),
             })
         self.polygons = polys
@@ -791,6 +938,7 @@ class MosaicCanvas(QWidget):
                                        if p.get('orig_fill_qimg') is not None
                                        else None),
                     'orig_fill_bbox': p.get('orig_fill_bbox'),
+                    'image_zoom':     float(p.get('image_zoom', 1.0)),
                     'group_id':  p['group_id'],
                 }
                 for p in self.polygons
@@ -877,6 +1025,19 @@ class MosaicCanvas(QWidget):
         # loaded on the canvas.
         if self.grid_enabled:
             self._draw_grid(painter)
+
+        # 4. Eraser cursor — drawn only while eraser mode is on. Sits
+        # on top of everything so the user always sees exactly how big
+        # the erase footprint is at the current zoom.
+        if self.eraser_mode:
+            cx, cy = self._eraser_mouse_screen
+            r_screen = self.eraser_radius * self.zoom_factor
+            painter.setBrush(QBrush(QColor(255, 60, 60, 60)))
+            painter.setPen(QPen(QColor(255, 60, 60), 2))
+            painter.drawEllipse(
+                QRectF(cx - r_screen, cy - r_screen,
+                       2 * r_screen, 2 * r_screen)
+            )
 
         painter.end()
 
@@ -983,6 +1144,14 @@ class MosaicCanvas(QWidget):
             self._pan_start_offset = (self.pan_x, self.pan_y)
             self.setCursor(Qt.ClosedHandCursor)
             return
+        # Eraser tool wins over everything else while active — LMB
+        # starts an erase pass, drag continues it.
+        if ev.button() == Qt.LeftButton and self.eraser_mode:
+            self._push_undo()
+            self._eraser_pressed = True
+            wx, wy = self.screen_to_world(ev.x(), ev.y())
+            self._erase_polygons_under(wx, wy)
+            return
         if ev.button() == Qt.LeftButton:
             # Priority: if a polygon is currently selected and the click
             # landed near one of its vertices, enter vertex-drag mode
@@ -1018,6 +1187,16 @@ class MosaicCanvas(QWidget):
             self.update()
 
     def mouseMoveEvent(self, ev):
+        # Track cursor for the eraser cursor circle even without any
+        # button held down — moving the mouse should update where the
+        # circle is drawn.
+        if self.eraser_mode:
+            self._eraser_mouse_screen = (ev.x(), ev.y())
+            if self._eraser_pressed:
+                wx, wy = self.screen_to_world(ev.x(), ev.y())
+                self._erase_polygons_under(wx, wy)
+            self.update()
+            return
         if self._panning:
             dx = ev.x() - self._pan_start_screen[0]
             dy = ev.y() - self._pan_start_screen[1]
@@ -1086,6 +1265,9 @@ class MosaicCanvas(QWidget):
             self.setCursor(Qt.ArrowCursor)
             return
         if ev.button() == Qt.LeftButton:
+            if self.eraser_mode and self._eraser_pressed:
+                self._eraser_pressed = False
+                return
             if self._dragging_vertex:
                 self._dragging_vertex = False
                 self._vertex_drag_idx = -1
@@ -1094,6 +1276,68 @@ class MosaicCanvas(QWidget):
             if self._dragging_polygon:
                 self._dragging_polygon = False
                 self.setCursor(Qt.ArrowCursor)
+
+    def set_eraser_mode(self, on: bool) -> None:
+        """Toggle the eraser tool. When on, the mouse cursor becomes a
+        blank pointer (we draw our own eraser-radius circle on top of
+        the canvas) and every LMB drag deletes any polygon in an
+        affected layer that intersects the circle."""
+        self.eraser_mode = bool(on)
+        if self.eraser_mode:
+            self.setCursor(Qt.CrossCursor)
+            self.setMouseTracking(True)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+            self._eraser_pressed = False
+        self.update()
+
+    def _erase_polygons_under(self, wx: float, wy: float) -> int:
+        """Delete every polygon in an *affected* layer whose centroid
+        OR any vertex is within `eraser_radius` world units of the
+        cursor. Returns how many were deleted. Undo is snapshotted by
+        the caller (mousePressEvent) so a full drag counts as ONE
+        undo step, not one per polygon."""
+        if not self.polygons:
+            return 0
+        affected_gids = {
+            g['id'] for g in self.groups if g.get('affected', True)
+        }
+        if not affected_gids:
+            return 0
+        r  = float(self.eraser_radius)
+        r2 = r * r
+        keep = []
+        removed = 0
+        for poly in self.polygons:
+            if poly['group_id'] not in affected_gids:
+                keep.append(poly)
+                continue
+            pts = poly.get('points') or []
+            if not pts:
+                keep.append(poly)
+                continue
+            # Centroid distance.
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            if (cx - wx) ** 2 + (cy - wy) ** 2 <= r2:
+                removed += 1
+                continue
+            # Any-vertex distance — catches polygons much larger than
+            # the eraser radius.
+            hit = False
+            for (px, py) in pts:
+                if (px - wx) ** 2 + (py - wy) ** 2 <= r2:
+                    hit = True
+                    break
+            if hit:
+                removed += 1
+            else:
+                keep.append(poly)
+        if removed:
+            self.polygons = keep
+            self.selected_index = -1
+            self.update()
+        return removed
 
     def keyPressEvent(self, ev):
         # Delete / Backspace removes the single currently-selected
@@ -1106,6 +1350,16 @@ class MosaicCanvas(QWidget):
             del self.polygons[self.selected_index]
             self.selected_index = -1
             self.update()
+            return
+        # P → zoom the image content of the selected polygon (shape
+        # stays put, pixels inside become a magnified centre-crop of
+        # the source fill). Shift+P zooms out — clamped so we never
+        # go below the original 1:1 sampling.
+        if ev.key() == Qt.Key_P:
+            factor = (1.0 / 1.25) if (ev.modifiers() & Qt.ShiftModifier) \
+                                   else 1.25
+            self.zoom_polygon_image(factor)
+            return
 
     def erase_affected(self) -> tuple[int, int]:
         """Delete every polygon that belongs to a layer whose ⇢
@@ -1173,10 +1427,27 @@ class MosaicCanvas(QWidget):
         nw = max(1, int(round(nx1 - nx0)))
         nh = max(1, int(round(ny1 - ny0)))
 
-        # 1. Bilinear-scale the original (already polygon-masked) fill
-        #    image into a fresh (nw × nh) QImage. `QImage.scaled` with
-        #    SmoothTransformation does the bilinear resample.
-        stretched = orig_qimg.scaled(
+        # 1a. If the polygon has an image_zoom > 1.0, crop a smaller
+        #     centred subregion of the ORIGINAL fill first. Cropping
+        #     less area then stretching to (nw × nh) is exactly what
+        #     "zoom in" means — the polygon shape doesn't move but the
+        #     visible pixels are a magnified view of the source.
+        img_zoom = float(poly.get('image_zoom', 1.0))
+        if img_zoom < 1.0:
+            img_zoom = 1.0
+        if img_zoom > 1.0:
+            ow, oh = orig_qimg.width(), orig_qimg.height()
+            crop_w = max(1, int(round(ow / img_zoom)))
+            crop_h = max(1, int(round(oh / img_zoom)))
+            crop_x = max(0, (ow - crop_w) // 2)
+            crop_y = max(0, (oh - crop_h) // 2)
+            src_img = orig_qimg.copy(crop_x, crop_y, crop_w, crop_h)
+        else:
+            src_img = orig_qimg
+
+        # 1b. Bilinear-scale that source (either the whole orig or a
+        #     centred crop) into a fresh (nw × nh) QImage.
+        stretched = src_img.scaled(
             nw, nh,
             Qt.IgnoreAspectRatio,
             Qt.SmoothTransformation,
@@ -1224,11 +1495,20 @@ class MosaicCanvas(QWidget):
         self.selected_index = int(poly_idx)
         self.setCursor(Qt.ClosedHandCursor)
         poly = self.polygons[poly_idx]
+        self._ensure_orig_fill_snapshot(poly)
+        has_img = poly.get('orig_fill_qimg') is not None
+        print(
+            f"[mosaic_editor] vertex-drag start: polygon #{poly_idx}, "
+            f"vertex #{vertex_idx}, image-fill={has_img}",
+            file=sys.stderr,
+        )
 
-        # Promote whatever fill state exists into the warp-reference
-        # slots so the stretch code has something to work from. This
-        # is a no-op when orig_* is already populated (from a fresh
-        # .mosaic load).
+    @staticmethod
+    def _ensure_orig_fill_snapshot(poly: dict) -> None:
+        """Promote whatever current fill state exists into the warp
+        reference slots. No-op when orig_* is already populated (fresh
+        .mosaic load) — used by both vertex-drag and image-zoom paths
+        so polygons loaded from older projects still stretch/zoom."""
         if poly.get('orig_points') is None:
             poly['orig_points'] = list(poly.get('points') or [])
         if (poly.get('orig_fill_qimg') is None
@@ -1237,12 +1517,28 @@ class MosaicCanvas(QWidget):
         if poly.get('orig_fill_bbox') is None:
             poly['orig_fill_bbox'] = poly.get('fill_bbox')
 
-        has_img = poly.get('orig_fill_qimg') is not None
-        print(
-            f"[mosaic_editor] vertex-drag start: polygon #{poly_idx}, "
-            f"vertex #{vertex_idx}, image-fill={has_img}",
-            file=sys.stderr,
-        )
+    def zoom_polygon_image(self, factor: float) -> bool:
+        """Zoom the image content of the currently selected polygon by
+        `factor` (>1 zooms IN, <1 zooms out; clamped at min 1.0 so we
+        never sample outside the source polygon). The polygon shape
+        stays exactly where it is; only the pixels visible inside
+        change to show a smaller cropped-and-stretched region of the
+        original fill. Returns True on success."""
+        if not (0 <= self.selected_index < len(self.polygons)):
+            return False
+        poly = self.polygons[self.selected_index]
+        self._ensure_orig_fill_snapshot(poly)
+        if poly.get('orig_fill_qimg') is None:
+            return False
+        old = float(poly.get('image_zoom', 1.0))
+        new = max(1.0, old * float(factor))
+        if abs(new - old) < 1e-9:
+            return False
+        self._push_undo()
+        poly['image_zoom'] = new
+        self._restretch_fill_to_current_shape(poly)
+        self.update()
+        return True
 
     def _pick_polygon_at(self, wx: float, wy: float) -> int:
         # Iterate from top (last drawn) to bottom, respecting group vis.
@@ -1464,6 +1760,22 @@ class MosaicEditorWindow(QMainWindow):
         btn_load_project.clicked.connect(self.on_load_project)
         sb.addWidget(btn_load_project)
 
+        # Save Mosaic — flatten everything on the canvas into one
+        # portable .mosaic bundle (composite PNG + polygon CSV).
+        # Same format image_strech.py's Save Mosaic writes, so the
+        # result can be reopened here or in any other tool that
+        # reads the shared schema.
+        btn_save_mosaic = QPushButton("Save Mosaic")
+        btn_save_mosaic.setToolTip(
+            "Combine every array on the canvas into a single "
+            ".mosaic bundle: background.png is the flattened "
+            "composite of all polygon fills + canvas background, "
+            "polygons.csv holds every polygon's outline in that "
+            "PNG's coordinate space."
+        )
+        btn_save_mosaic.clicked.connect(self.on_save_mosaic)
+        sb.addWidget(btn_save_mosaic)
+
         sb.addSpacing(8)
         sb.addWidget(self._section_label("View"))
         btn_reset_view = QPushButton("Reset Zoom / Pan")
@@ -1602,9 +1914,47 @@ class MosaicEditorWindow(QMainWindow):
         self.layers_panel = LayersPanel(self.canvas)
         sb.addWidget(self.layers_panel, 1)
 
+        # ── right-side canvas toolbar ─────────────────────────────
+        # Tool buttons for direct-manipulation modes on the canvas.
+        # Currently just Delete (eraser) but scales with more tools.
+        right_bar = QFrame()
+        right_bar.setFrameStyle(QFrame.StyledPanel)
+        right_bar.setFixedWidth(72)
+        rb = QVBoxLayout(right_bar)
+        rb.setContentsMargins(6, 6, 6, 6)
+        rb.setSpacing(6)
+
+        self.delete_tool_btn = QPushButton("Delete")
+        self.delete_tool_btn.setCheckable(True)
+        self.delete_tool_btn.setFixedHeight(40)
+        self.delete_tool_btn.setToolTip(
+            "Eraser tool. When active, the cursor becomes a red circle;\n"
+            "click / drag over polygons to delete them. Only polygons\n"
+            "in ⇢-checked layers are erased. Ctrl+Z to undo."
+        )
+        self.delete_tool_btn.toggled.connect(self.on_delete_tool_toggled)
+        rb.addWidget(self.delete_tool_btn)
+
+        rb.addWidget(QLabel("Radius:"))
+        self.eraser_radius_spin = QDoubleSpinBox()
+        self.eraser_radius_spin.setRange(1.0, 10000.0)
+        self.eraser_radius_spin.setDecimals(0)
+        self.eraser_radius_spin.setValue(self.canvas.eraser_radius)
+        self.eraser_radius_spin.setSuffix(" px")
+        self.eraser_radius_spin.setToolTip(
+            "Eraser radius in world units."
+        )
+        self.eraser_radius_spin.valueChanged.connect(
+            self.on_eraser_radius_changed
+        )
+        rb.addWidget(self.eraser_radius_spin)
+
+        rb.addStretch(1)
+
         # ── assemble ──────────────────────────────────────────────────
         main.addWidget(sidebar)
         main.addWidget(canvas_frame, 1)
+        main.addWidget(right_bar)
 
         # Ctrl+Z → undo. Attached at the main-window scope so it fires
         # regardless of which widget has focus (sidebar spinbox,
@@ -1706,6 +2056,21 @@ class MosaicEditorWindow(QMainWindow):
         pct = float(self.scale_spin.value())
         self.canvas.scale_affected(pct)
 
+    def on_delete_tool_toggled(self, checked: bool) -> None:
+        """Toggle the on-canvas eraser tool from the right toolbar."""
+        self.canvas.set_eraser_mode(checked)
+        if checked:
+            self.statusBar().showMessage(
+                "Eraser tool ON — drag over polygons in ⇢-checked "
+                "layers to delete. Ctrl+Z to undo."
+            )
+        else:
+            self.statusBar().showMessage("Eraser tool off.")
+
+    def on_eraser_radius_changed(self, v: float) -> None:
+        self.canvas.eraser_radius = float(v)
+        self.canvas.update()
+
     def on_erase_affected(self) -> None:
         """Confirm, then delete every polygon in every ⇢-checked
         layer (and remove those layers). Destructive but undoable."""
@@ -1746,6 +2111,35 @@ class MosaicEditorWindow(QMainWindow):
             self.statusBar().showMessage("Undo")
         else:
             self.statusBar().showMessage("Nothing to undo.")
+
+    def on_save_mosaic(self) -> None:
+        """Flatten the whole canvas into one portable .mosaic bundle
+        (composite PNG + polygon CSV). Same format image_strech.py's
+        Save Mosaic writes; loadable in this app via Load .mosaic."""
+        if not self.canvas.polygons and self.canvas.canvas_background is None:
+            QMessageBox.information(
+                self, "Save Mosaic",
+                "Canvas is empty — nothing to save."
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Mosaic", "canvas.mosaic",
+            "Mosaic bundle (*.mosaic *.zip);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            n, w, h = self.canvas.save_mosaic(path)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save Mosaic",
+                f"Failed to save mosaic: {type(e).__name__}: {e}"
+            )
+            return
+        self.statusBar().showMessage(
+            f"Mosaic saved: {Path(path).name}  "
+            f"({n} polygon(s), {w}×{h} composite)"
+        )
 
     def on_save_project(self) -> None:
         if not self.canvas.polygons and self.canvas.canvas_background is None:
