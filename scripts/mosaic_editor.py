@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QGridLayout, QFrame, QLabel, QPushButton, QFileDialog, QCheckBox,
     QSpinBox, QDoubleSpinBox, QMessageBox, QScrollArea, QColorDialog,
+    QInputDialog,
 )
 from PyQt5.QtCore import Qt, QRectF, QPointF, QBuffer
 from PyQt5.QtGui import (
@@ -364,6 +365,14 @@ class MosaicCanvas(QWidget):
         self.eraser_radius         = 20.0        # world units
         self._eraser_pressed       = False
         self._eraser_mouse_screen  = (0, 0)      # last known cursor pos
+
+        # Origin-picker tool — when active, LMB click snaps to the
+        # nearest gridline intersection and hands (x, y) in world
+        # coords to a stored callback. Used by Save Array so the
+        # exported CSV's (0,0) is a user-chosen grid intersection.
+        self._picking_origin        = False
+        self._picking_hover_screen  = (0, 0)
+        self._origin_pick_callback  = None
 
         # Undo — bounded stack of state snapshots. Each snapshot is a
         # dict with deep-copies of polygons + groups + canvas-bg fields.
@@ -700,6 +709,72 @@ class MosaicCanvas(QWidget):
         }
         with open(path, 'wb') as f:
             pickle.dump(data, f)
+
+    def _polygon_mean_color(self, poly: dict) -> QColor:
+        """Best guess at a polygon's "dominant" color for CSV writers
+        that expect one solid color per polygon. Rules:
+          * solid → polygon['color'] unchanged.
+          * image → mean RGB of fill_qimg over alpha>0 pixels.
+          * none  → opaque white."""
+        ft = poly.get('fill_type', 'none')
+        if ft == 'solid':
+            c = poly.get('color')
+            if c is not None:
+                return QColor(c)
+        if ft == 'image' and poly.get('fill_qimg') is not None:
+            arr = _qimage_to_numpy_rgba(poly['fill_qimg'])
+            if arr is not None:
+                mask = arr[:, :, 3] > 0
+                if mask.any():
+                    r = int(round(arr[mask, 0].mean()))
+                    g = int(round(arr[mask, 1].mean()))
+                    b = int(round(arr[mask, 2].mean()))
+                    return QColor(r, g, b, 255)
+        return QColor(255, 255, 255, 255)
+
+    def save_array_csv(self, path: str, scale: float = 1.0,
+                       origin: tuple = (0.0, 0.0)) -> int:
+        """Write every visible polygon to a CSV using the shared
+        save_array schema (same 11 columns image_strech.py writes).
+        Each vertex is transformed as:
+              new = (world - origin) * scale
+        so `origin` becomes (0, 0) in the exported coordinate system
+        and one output unit equals one target grid box. Color columns
+        are written as 0,0,0,0 (no color fill — just polygon points).
+        Returns the number of polygons written."""
+        if not self.polygons:
+            return 0
+        ox, oy = float(origin[0]), float(origin[1])
+        gid_visible = {g['id']: g['visible'] for g in self.groups}
+        with open(path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                'polygon_id', 'coordinates',
+                'color_r', 'color_g', 'color_b', 'color_a',
+                'frame_r', 'frame_g', 'frame_b', 'frame_a',
+                'group_id',
+            ])
+            written = 0
+            for poly in self.polygons:
+                # Skip hidden layers so the CSV matches "what I see".
+                if not gid_visible.get(poly['group_id'], True):
+                    continue
+                pts = poly.get('points') or []
+                if len(pts) < 3:
+                    continue
+                coords_json = json.dumps([
+                    [(float(x) - ox) * scale,
+                     (float(y) - oy) * scale]
+                    for (x, y) in pts
+                ])
+                writer.writerow([
+                    written, coords_json,
+                    0.0, 0.0, 0.0, 0.0,           # no color fill
+                    0.0, 0.0, 0.0, 0.0,           # no frame fill
+                    int(poly.get('group_id', 0)),
+                ])
+                written += 1
+        return written
 
     def save_mosaic(self, path: str) -> tuple[int, int, int]:
         """Flatten the current canvas into a portable .mosaic bundle:
@@ -1039,6 +1114,22 @@ class MosaicCanvas(QWidget):
                        2 * r_screen, 2 * r_screen)
             )
 
+        # 5. Origin-pick snap marker — bright-green cross at the
+        # gridline intersection nearest the cursor while picking.
+        if self._picking_origin:
+            hx, hy = self._picking_hover_screen
+            wx, wy = self.screen_to_world(hx, hy)
+            ox, oy = self._snap_to_grid_intersection(wx, wy)
+            sx, sy = self.world_to_screen(ox, oy)
+            painter.setPen(QPen(QColor(0, 200, 0), 3))
+            painter.setBrush(QBrush(QColor(0, 200, 0, 90)))
+            r = 10
+            painter.drawEllipse(QRectF(sx - r, sy - r, 2 * r, 2 * r))
+            painter.drawLine(int(sx - r * 1.6), int(sy),
+                             int(sx + r * 1.6), int(sy))
+            painter.drawLine(int(sx), int(sy - r * 1.6),
+                             int(sx), int(sy + r * 1.6))
+
         painter.end()
 
     def _draw_grid(self, painter: QPainter) -> None:
@@ -1144,6 +1235,16 @@ class MosaicCanvas(QWidget):
             self._pan_start_offset = (self.pan_x, self.pan_y)
             self.setCursor(Qt.ClosedHandCursor)
             return
+        # Origin-picker has the HIGHEST priority — while it's active,
+        # LMB is exclusively for choosing a gridline intersection.
+        if ev.button() == Qt.LeftButton and self._picking_origin:
+            wx, wy = self.screen_to_world(ev.x(), ev.y())
+            ox, oy = self._snap_to_grid_intersection(wx, wy)
+            cb = self._origin_pick_callback
+            self.cancel_origin_pick()
+            if cb is not None:
+                cb(ox, oy)
+            return
         # Eraser tool wins over everything else while active — LMB
         # starts an erase pass, drag continues it.
         if ev.button() == Qt.LeftButton and self.eraser_mode:
@@ -1187,6 +1288,11 @@ class MosaicCanvas(QWidget):
             self.update()
 
     def mouseMoveEvent(self, ev):
+        # Origin-picker hover — updates the green snap marker.
+        if self._picking_origin:
+            self._picking_hover_screen = (ev.x(), ev.y())
+            self.update()
+            return
         # Track cursor for the eraser cursor circle even without any
         # button held down — moving the mouse should update where the
         # circle is drawn.
@@ -1277,6 +1383,47 @@ class MosaicCanvas(QWidget):
                 self._dragging_polygon = False
                 self.setCursor(Qt.ArrowCursor)
 
+    def _grid_cell_world(self) -> float:
+        """Current grid cell size in world units — matches how the
+        grid is actually drawn (see _draw_grid)."""
+        if self.canvas_background is not None:
+            return max(
+                1.0,
+                self.canvas_background.width()
+                * (self.grid_size_percent / 100.0),
+            )
+        return max(1.0, self.grid_size_world)
+
+    def _snap_to_grid_intersection(self, wx: float, wy: float) -> tuple:
+        """Return the nearest gridline intersection to (wx, wy) in
+        world coords."""
+        cell = self._grid_cell_world()
+        ox = self.grid_offset_x
+        oy = self.grid_offset_y
+        i = round((wx - ox) / cell)
+        j = round((wy - oy) / cell)
+        return (ox + i * cell, oy + j * cell)
+
+    def start_origin_pick(self, callback) -> None:
+        """Enter origin-picking mode. The next LMB click on the canvas
+        snaps to the nearest gridline intersection and invokes
+        `callback(world_x, world_y)`. Escape cancels."""
+        self.cancel_origin_pick()   # in case one is already in flight
+        self._picking_origin       = True
+        self._origin_pick_callback = callback
+        self.setCursor(Qt.CrossCursor)
+        self.setMouseTracking(True)
+        self.setFocus()             # so Escape reaches keyPressEvent
+        self.update()
+
+    def cancel_origin_pick(self) -> None:
+        """Exit origin-picking mode without firing the callback."""
+        if self._picking_origin:
+            self._picking_origin       = False
+            self._origin_pick_callback = None
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+
     def set_eraser_mode(self, on: bool) -> None:
         """Toggle the eraser tool. When on, the mouse cursor becomes a
         blank pointer (we draw our own eraser-radius circle on top of
@@ -1340,6 +1487,11 @@ class MosaicCanvas(QWidget):
         return removed
 
     def keyPressEvent(self, ev):
+        # Escape cancels an origin-pick in progress. Highest priority
+        # so nothing else swallows the key while picking.
+        if ev.key() == Qt.Key_Escape and self._picking_origin:
+            self.cancel_origin_pick()
+            return
         # Delete / Backspace removes the single currently-selected
         # polygon. The sidebar's "Erase Affected" button erases whole
         # layers instead — that's a heavier operation, so it's not
@@ -1776,6 +1928,16 @@ class MosaicEditorWindow(QMainWindow):
         btn_save_mosaic.clicked.connect(self.on_save_mosaic)
         sb.addWidget(btn_save_mosaic)
 
+        btn_save_array = QPushButton("Save Array")
+        btn_save_array.setToolTip(
+            "Write every visible polygon to a CSV in the shared "
+            "save_array schema (11 columns matching image_strech.py). "
+            "Asks for a target grid-box size and scales every "
+            "polygon coordinate by (target / current)."
+        )
+        btn_save_array.clicked.connect(self.on_save_array)
+        sb.addWidget(btn_save_array)
+
         sb.addSpacing(8)
         sb.addWidget(self._section_label("View"))
         btn_reset_view = QPushButton("Reset Zoom / Pan")
@@ -2111,6 +2273,92 @@ class MosaicEditorWindow(QMainWindow):
             self.statusBar().showMessage("Undo")
         else:
             self.statusBar().showMessage("Nothing to undo.")
+
+    def on_save_array(self) -> None:
+        """Save all visible polygons to a CSV in the shared save_array
+        schema. 3 steps:
+          1. Ask for the target grid-box size (scale = target /
+             current).
+          2. Ask the user to click a gridline intersection — that
+             point becomes (0, 0) in the exported coordinate system.
+          3. Prompt for a save path and write the CSV with no color
+             fill (just polygon points)."""
+        if not self.canvas.polygons:
+            QMessageBox.information(
+                self, "Save Array",
+                "No polygons on the canvas — nothing to save."
+            )
+            return
+        # Step 1: current gridbox size in world/pixel units.
+        if self.canvas.canvas_background is not None:
+            current_cell_px = max(
+                1.0,
+                self.canvas.canvas_background.width()
+                * (self.canvas.grid_size_percent / 100.0),
+            )
+        else:
+            current_cell_px = max(1.0, self.canvas.grid_size_world)
+
+        new_cell_px, ok = QInputDialog.getDouble(
+            self,
+            "Calibrate Grid Box Size",
+            f"Current grid box is {current_cell_px:.2f} px.\n"
+            "Enter the target grid box size in pixels.\n"
+            "All coordinates will be scaled by (target / current):",
+            value=round(current_cell_px, 2),
+            min=0.01,
+            max=100000.0,
+            decimals=2,
+        )
+        if not ok:
+            return
+        scale = new_cell_px / current_cell_px
+
+        # Turn the grid on if it isn't already so the user can see
+        # the intersections they're picking from.
+        if not self.canvas.grid_enabled:
+            self.canvas.grid_enabled = True
+            self.grid_cb.blockSignals(True)
+            self.grid_cb.setChecked(True)
+            self.grid_cb.blockSignals(False)
+            self.canvas.update()
+
+        # Step 2: enter origin-pick mode. Step 3 fires from the
+        # callback once the user clicks a gridline intersection.
+        self.statusBar().showMessage(
+            "Save Array — click a gridline intersection to set it as "
+            "(0, 0) for the exported array. Press Esc to cancel."
+        )
+        self.canvas.start_origin_pick(
+            lambda ox, oy: self._save_array_finish(scale, ox, oy)
+        )
+
+    def _save_array_finish(self, scale: float,
+                           origin_x: float, origin_y: float) -> None:
+        """Step 3 of on_save_array — prompt for a save path and
+        write the CSV using the scale + origin the user chose."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Array as CSV", "polygons.csv",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            self.statusBar().showMessage("Save Array cancelled.")
+            return
+        try:
+            n = self.canvas.save_array_csv(
+                path, scale=scale, origin=(origin_x, origin_y),
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save Array",
+                f"Failed to save array: {type(e).__name__}: {e}"
+            )
+            return
+        self.statusBar().showMessage(
+            f"Array saved: {Path(path).name}  "
+            f"({n} polygon(s), origin=({origin_x:.1f}, {origin_y:.1f}), "
+            f"scale × {scale:.3f})"
+        )
 
     def on_save_mosaic(self) -> None:
         """Flatten the whole canvas into one portable .mosaic bundle
