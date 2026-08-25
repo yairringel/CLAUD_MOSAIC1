@@ -13,6 +13,7 @@ import sys
 import os
 import csv
 import math
+import pickle
 import random
 import numpy as np
 import cv2
@@ -1183,6 +1184,20 @@ class ControlPanel(QWidget):
         self.save_png_btn.clicked.connect(self.on_save_png_clicked)
         layout.addWidget(self.save_png_btn)
 
+        # Project save / load — pickles the WHOLE canvas state (polygons,
+        # colors, tile_polygons + boxes_with_polygons from Cut, grid
+        # settings, view, etc.). Called at any point in the workflow;
+        # so if the user runs Cut and then Save Project, the pickle
+        # captures the post-Cut state and Load Project restores it
+        # exactly. Available even before a CSV is loaded.
+        self.save_project_btn = QPushButton("Save Project")
+        self.save_project_btn.clicked.connect(self.on_save_project)
+        layout.addWidget(self.save_project_btn)
+
+        self.load_project_btn = QPushButton("Load Project")
+        self.load_project_btn.clicked.connect(self.on_load_project)
+        layout.addWidget(self.load_project_btn)
+
         # Add stretch to push everything to the top
         layout.addStretch()
 
@@ -1541,6 +1556,165 @@ class ControlPanel(QWidget):
         painter.end()
         if not image.save(filename, "PNG"):
             raise IOError(f"QImage.save returned False for {filename}")
+
+    # ── Project save / load ───────────────────────────────────────────
+    _PROJECT_EXT = "mstudio"
+
+    def on_save_project(self):
+        """Pickle the FULL canvas + control-panel state to a .mstudio
+        file. Snapshots whatever is on screen right now — including
+        post-Cut `tile_polygons` / `boxes_with_polygons` / recoloured
+        polygons — so re-loading later resumes the session at the
+        exact same point."""
+        if not self.canvas or not self.canvas.polygons:
+            QMessageBox.warning(
+                self, "Save Project",
+                "Nothing to save — load a CSV first."
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Mosaic Studio Project",
+            f"project.{self._PROJECT_EXT}",
+            f"Mosaic Studio Project (*.{self._PROJECT_EXT});;All Files (*)"
+        )
+        if not path:
+            return
+
+        c = self.canvas
+        data = {
+            'version':               1,
+            # Canvas — geometry
+            'polygons':              list(c.polygons),
+            'colors':                list(c.colors),
+            'edge_colors':           list(c.edge_colors),
+            'original_colors':       list(c.original_colors),
+            # Canvas — Cut state
+            'tile_polygons':         dict(c.tile_polygons),
+            'boxes_with_polygons':   set(c.boxes_with_polygons),
+            'filled_box_index':      c.filled_box_index,
+            # Canvas — grid
+            'show_grid':             c.show_grid,
+            'grid_size':             c.grid_size,
+            'grid_offset_x':         c.grid_offset_x,
+            'grid_offset_y':         c.grid_offset_y,
+            # Canvas — visual settings
+            'background_color':      c.background_color,
+            'edge_color':            c.edge_color,
+            'edge_width':            c.edge_width,
+            'transparent_fill':      c.transparent_fill,
+            # Canvas — view
+            'scale_factor':          c.scale_factor,
+            'pan_x':                 c.pan_x,
+            'pan_y':                 c.pan_y,
+            # Bounds — recomputed on load but included for safety
+            'min_x': c.min_x, 'max_x': c.max_x,
+            'min_y': c.min_y, 'max_y': c.max_y,
+            # Control panel — original snapshots so Reset still works
+            'polygons_orig':         list(self._polygons_orig),
+            'colors_orig':           list(self._colors_orig),
+        }
+        try:
+            with open(path, 'wb') as f:
+                pickle.dump(data, f)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save Project",
+                f"Failed to save project: {type(e).__name__}: {e}"
+            )
+            return
+        QMessageBox.information(
+            self, "Save Project",
+            f"Saved {sum(1 for p in c.polygons if p is not None)} polygon(s), "
+            f"{len(c.tile_polygons)} tile(s), grid size {c.grid_size}.\n\n"
+            f"File: {path}"
+        )
+
+    def on_load_project(self):
+        """Restore a project pickled by on_save_project. Replaces every
+        canvas + control-panel field so the session picks up exactly
+        where it left off (including any Cut-time state)."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Mosaic Studio Project", "",
+            f"Mosaic Studio Project (*.{self._PROJECT_EXT});;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Load Project",
+                f"Failed to load project: {type(e).__name__}: {e}"
+            )
+            return
+        if not isinstance(data, dict) or 'polygons' not in data:
+            QMessageBox.critical(
+                self, "Load Project",
+                "Not a valid mosaic_studio project file."
+            )
+            return
+
+        c = self.canvas
+        # Canvas — geometry
+        c.polygons            = list(data.get('polygons', []))
+        c.colors              = list(data.get('colors', []))
+        c.edge_colors         = list(data.get('edge_colors', []))
+        c.original_colors     = list(data.get('original_colors', c.colors))
+        # Canvas — Cut state
+        c.tile_polygons       = dict(data.get('tile_polygons', {}))
+        c.boxes_with_polygons = set (data.get('boxes_with_polygons', set()))
+        c.filled_box_index    = int (data.get('filled_box_index', -1))
+        # Canvas — grid
+        c.show_grid           = bool(data.get('show_grid', False))
+        c.grid_size           = int (data.get('grid_size', c.grid_size))
+        c.grid_offset_x       = float(data.get('grid_offset_x', 0.0))
+        c.grid_offset_y       = float(data.get('grid_offset_y', 0.0))
+        # Canvas — visual settings
+        c.background_color    = data.get('background_color',  c.background_color)
+        c.edge_color          = data.get('edge_color',        c.edge_color)
+        c.edge_width          = float(data.get('edge_width',  c.edge_width))
+        c.transparent_fill    = bool (data.get('transparent_fill', False))
+        # Canvas — view
+        c.scale_factor        = float(data.get('scale_factor', 1.0))
+        c.pan_x               = float(data.get('pan_x',        0.0))
+        c.pan_y               = float(data.get('pan_y',        0.0))
+        # Bounds recomputed anyway; use saved as a hint.
+        c.min_x = float(data.get('min_x', c.min_x))
+        c.max_x = float(data.get('max_x', c.max_x))
+        c.min_y = float(data.get('min_y', c.min_y))
+        c.max_y = float(data.get('max_y', c.max_y))
+
+        # Control-panel snapshots so Reset-to-original still works.
+        self._polygons_orig = list(data.get('polygons_orig', c.polygons))
+        self._colors_orig   = list(data.get('colors_orig',   c.colors))
+
+        # Refresh caches + view.
+        c.invalidate_cache()
+        c.calculate_bounds()
+        c.update()
+
+        # Enable the buttons that depend on having polygons on screen.
+        has_polys = bool(c.polygons)
+        self.cut_btn.setEnabled(has_polys)
+        self.randomize_btn.setEnabled(has_polys)
+        self.reset_rand_btn.setEnabled(has_polys)
+        self.scale_all_btn.setEnabled(has_polys)
+        self.save_csv_btn.setEnabled(has_polys)
+        self.save_png_btn.setEnabled(has_polys)
+        # Tiles / Save Boxes require a fresh Cut on this geometry only
+        # if the saved project didn't include Cut state. If it did,
+        # boxes_with_polygons is populated and the two buttons stay on.
+        cut_done = bool(c.tile_polygons) or bool(c.boxes_with_polygons)
+        self.tiles_btn.setEnabled(cut_done)
+        self.save_boxes_btn.setEnabled(cut_done)
+
+        QMessageBox.information(
+            self, "Load Project",
+            f"Loaded {sum(1 for p in c.polygons if p is not None)} polygon(s), "
+            f"{len(c.tile_polygons)} tile(s), grid size {c.grid_size}.\n\n"
+            f"File: {path}"
+        )
 
     def on_cut_clicked(self):
         """Handle Cut button click - assign colors based on grid boxes"""

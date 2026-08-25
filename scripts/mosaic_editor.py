@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QGridLayout, QFrame, QLabel, QPushButton, QFileDialog, QCheckBox,
     QSpinBox, QDoubleSpinBox, QMessageBox, QScrollArea, QColorDialog,
-    QInputDialog,
+    QInputDialog, QDialog, QDialogButtonBox,
 )
 from PyQt5.QtCore import Qt, QRectF, QPointF, QBuffer
 from PyQt5.QtGui import (
@@ -2111,6 +2111,49 @@ class MosaicEditorWindow(QMainWindow):
         )
         rb.addWidget(self.eraser_radius_spin)
 
+        rb.addSpacing(10)
+
+        # Save Tile Image — cut each selected tile from the composite
+        # canvas using the OFFSET boundary in its box_<label>.dxf
+        # (same DXF-driven workflow as image_strech.py).
+        self.save_tile_btn = QPushButton("Save Tile\nImage")
+        self.save_tile_btn.setFixedHeight(48)
+        self.save_tile_btn.setToolTip(
+            "Save selected grid cells as print-ready PNGs cut with "
+            "their box_<label>.dxf offset boundary. Steps: 1) click "
+            "a gridline intersection for origin, 2) pick cells from "
+            "the 6×6 dialog, 3) choose a DXF root folder, 4) enter "
+            "the target grid box size you used at Save Array time. "
+            "Tile size (mm) and DPI come from the fields below."
+        )
+        self.save_tile_btn.clicked.connect(self.on_save_tile_image)
+        rb.addWidget(self.save_tile_btn)
+
+        rb.addWidget(QLabel("Grid box mm:"))
+        self.tile_size_spin = QDoubleSpinBox()
+        self.tile_size_spin.setRange(1.0, 10000.0)
+        self.tile_size_spin.setDecimals(1)
+        self.tile_size_spin.setValue(200.0)
+        self.tile_size_spin.setSuffix(" mm")
+        self.tile_size_spin.setToolTip(
+            "Physical size of ONE GRID BOX in the output print.\n"
+            "This is NOT the final PNG size — the PNG scales with the "
+            "DXF polygon's world-coord width relative to one grid box, "
+            "so an offset polygon slightly bigger than a grid box comes "
+            "out slightly bigger than this value at the given DPI. Same "
+            "convention as image_strech.py's Save Tile Image."
+        )
+        rb.addWidget(self.tile_size_spin)
+
+        rb.addWidget(QLabel("DPI:"))
+        self.dpi_spin = QSpinBox()
+        self.dpi_spin.setRange(72, 2400)
+        self.dpi_spin.setValue(300)
+        self.dpi_spin.setToolTip(
+            "Print DPI baked into each PNG's pHYs metadata."
+        )
+        rb.addWidget(self.dpi_spin)
+
         rb.addStretch(1)
 
         # ── assemble ──────────────────────────────────────────────────
@@ -2217,6 +2260,424 @@ class MosaicEditorWindow(QMainWindow):
         """Scale every affected element by the sidebar's percentage."""
         pct = float(self.scale_spin.value())
         self.canvas.scale_affected(pct)
+
+    # ── Save Tile Image chain ─────────────────────────────────────────
+    # Multi-step flow triggered by the right-toolbar "Save Tile Image"
+    # button:  origin-pick → 6×6 tile checkbox dialog → target folder →
+    # tile size (mm) → DPI → render + save. Each step's callback runs
+    # via a Qt event, so state (origin, selected cells, folder) is
+    # threaded through method args rather than kept as instance state.
+
+    def on_save_tile_image(self) -> None:
+        """Step 1: guard + start origin pick."""
+        if not self.canvas.polygons and self.canvas.canvas_background is None:
+            QMessageBox.information(
+                self, "Save Tile Image",
+                "Canvas is empty — nothing to save."
+            )
+            return
+        # Force the grid on so the user sees the intersections.
+        if not self.canvas.grid_enabled:
+            self.canvas.grid_enabled = True
+            self.grid_cb.blockSignals(True)
+            self.grid_cb.setChecked(True)
+            self.grid_cb.blockSignals(False)
+            self.canvas.update()
+        self.statusBar().showMessage(
+            "Save Tile Image — click a gridline intersection to set the "
+            "top-left corner (A1) of the tile grid. Press Esc to cancel."
+        )
+        self.canvas.start_origin_pick(
+            lambda ox, oy: self._save_tile_pick_cells(ox, oy)
+        )
+
+    def _save_tile_pick_cells(self, ox: float, oy: float) -> None:
+        """Step 2: show a 6×6 checkbox dialog matching image_strech's UX
+        so the user picks which cells to export. On Ok, chain to folder
+        + tile-size prompts."""
+        ROWS = 6; COLS = 6
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select Tiles to Save")
+        dlg_layout = QVBoxLayout(dlg)
+
+        cell_world = self.canvas._grid_cell_world()
+        info = QLabel(
+            f"Origin: ({ox:.1f}, {oy:.1f})  ·  "
+            f"Cell size: {cell_world:.1f} world-units  ·  "
+            f"Grid: {ROWS} rows × {COLS} columns"
+        )
+        dlg_layout.addWidget(info)
+
+        # Select-all / deselect-all
+        sel_row = QHBoxLayout()
+        sel_all   = QPushButton("Select All")
+        desel_all = QPushButton("Deselect All")
+        sel_row.addWidget(sel_all); sel_row.addWidget(desel_all)
+        dlg_layout.addLayout(sel_row)
+
+        # Checkbox grid: rows A-F top→bottom, cols 1-6 left→right.
+        checkboxes: dict[tuple[int, int], QCheckBox] = {}
+        grid_holder = QWidget()
+        grid = QGridLayout(grid_holder)
+        grid.setSpacing(2)
+        # Column header row (1, 2, 3, ...) at grid row 0
+        for c in range(COLS):
+            hdr = QLabel(str(c + 1))
+            hdr.setAlignment(Qt.AlignCenter)
+            hdr.setStyleSheet("font-weight: bold;")
+            grid.addWidget(hdr, 0, c + 1)
+        for r in range(ROWS):
+            row_letter = chr(ord('A') + r)
+            row_hdr = QLabel(row_letter)
+            row_hdr.setAlignment(Qt.AlignCenter)
+            row_hdr.setStyleSheet("font-weight: bold;")
+            grid.addWidget(row_hdr, r + 1, 0)
+            for c in range(COLS):
+                cb = QCheckBox(f"{row_letter}{c + 1}")
+                grid.addWidget(cb, r + 1, c + 1)
+                checkboxes[(r, c)] = cb
+        dlg_layout.addWidget(grid_holder)
+
+        sel_all.clicked.connect(
+            lambda: [cb.setChecked(True) for cb in checkboxes.values()]
+        )
+        desel_all.clicked.connect(
+            lambda: [cb.setChecked(False) for cb in checkboxes.values()]
+        )
+
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        dlg_layout.addWidget(btn_box)
+
+        if dlg.exec_() != QDialog.Accepted:
+            self.statusBar().showMessage("Save Tile Image cancelled.")
+            return
+        selected = [(r, c) for (r, c), cb in checkboxes.items()
+                    if cb.isChecked()]
+        if not selected:
+            QMessageBox.information(
+                self, "Save Tile Image",
+                "No tiles selected."
+            )
+            return
+        self._save_tile_ask_dxf(ox, oy, selected)
+
+    def _save_tile_ask_dxf(self, ox: float, oy: float,
+                           selected: list) -> None:
+        """Step 3: pick the DXF root directory. It should contain a
+        subdirectory per box, each holding a `box_<label>.dxf` written
+        by mosaic_studio.py's save_boxes."""
+        dxf_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Choose DXF Directory (per-box subdirs with box_*.dxf inside)",
+        )
+        if not dxf_dir:
+            self.statusBar().showMessage("Save Tile Image cancelled.")
+            return
+        self._save_tile_ask_scale(ox, oy, selected, dxf_dir)
+
+    def _save_tile_ask_scale(self, ox: float, oy: float,
+                             selected: list, dxf_dir: str) -> None:
+        """Step 4 (single dialog, matching image_strech.py): ask for
+        the target grid box size the user entered at Save Array time.
+        Tile size (mm) + DPI come from the persistent right-toolbar
+        spinboxes, so we don't prompt for them here."""
+        current_cell_px = self.canvas._grid_cell_world()
+        target_cell_px, ok = QInputDialog.getDouble(
+            self,
+            "Un-scale DXF Coordinates",
+            "What target grid box size did you enter when you ran "
+            "'Save Array' to make the CSV that produced these DXFs?\n\n"
+            f"Current canvas grid box is {current_cell_px:.2f} px.\n"
+            "Enter the SAME value you entered at Save Array time.\n\n"
+            "DXF coords will be divided by (target / current) so they "
+            "land back on the canvas.",
+            value=round(current_cell_px, 2),
+            min=0.01, max=1_000_000.0, decimals=2,
+        )
+        if not ok:
+            self.statusBar().showMessage("Save Tile Image cancelled.")
+            return
+        inverse_scale = current_cell_px / max(1e-9, target_cell_px)
+
+        mm  = float(self.tile_size_spin.value())
+        dpi = int  (self.dpi_spin.value())
+        try:
+            saved, no_dxf, other = self._save_tiles_via_dxf(
+                ox, oy, selected, dxf_dir,
+                inverse_scale, current_cell_px, mm, dpi,
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save Tile Image",
+                f"Failed to save tiles: {type(e).__name__}: {e}"
+            )
+            return
+        msg = (
+            f"Saved {len(saved)} tile(s) into their per-box subfolders "
+            f"under:\n{dxf_dir}\n\n"
+            f"Each PNG sits next to its box_<label>.dxf, was cut with "
+            f"that file's OFFSET boundary (color 5), and carries "
+            f"DPI ({dpi}) in its pHYs metadata."
+        )
+        if no_dxf:
+            msg += (f"\n\nSkipped (no box_<label>.dxf found or unreadable): "
+                    f"{', '.join(no_dxf)}")
+        if other:
+            msg += (f"\n\nSkipped (out of bounds or write error): "
+                    f"{', '.join(other)}")
+        QMessageBox.information(self, "Save Tile Image", msg)
+
+    @staticmethod
+    def _read_tile_polygon_from_dxf(dxf_path: str):
+        """Read a `box_<label>.dxf` and return the OFFSET-BOUNDARY
+        polygon as an (N, 2) float32 numpy array in DXF-unit coords.
+        Returns None on failure. Same rule as image_strech.py: prefer
+        the color-5 offset polyline; fall back to largest non-frame."""
+        try:
+            import ezdxf
+        except Exception:
+            return None
+        try:
+            doc = ezdxf.readfile(str(dxf_path))
+        except Exception:
+            return None
+        candidates = []
+        for e in doc.modelspace().query("LWPOLYLINE"):
+            try:
+                colour = int(getattr(e.dxf, "color", 0))
+            except Exception:
+                colour = 0
+            pts = []
+            try:
+                for v in e.get_points():
+                    pts.append((float(v[0]), float(v[1])))
+            except Exception:
+                continue
+            if len(pts) < 3:
+                continue
+            candidates.append((np.asarray(pts, dtype=np.float32), colour))
+        if not candidates:
+            return None
+        offset_only = [(p, c) for (p, c) in candidates if c == 5]
+        if offset_only:
+            return offset_only[0][0]
+        non_frame = [(p, c) for (p, c) in candidates if c != 8]
+        if not non_frame:
+            non_frame = candidates
+        non_frame.sort(
+            key=lambda c: (
+                (c[0][:, 0].max() - c[0][:, 0].min())
+                * (c[0][:, 1].max() - c[0][:, 1].min())
+            ),
+            reverse=True,
+        )
+        return non_frame[0][0]
+
+    # Two distinct fill colors used by Save Tile Image:
+    #   _CANVAS_BACKDROP  — INSIDE the DXF offset polygon, wherever the
+    #                       canvas has no image content (matches the
+    #                       canvas backdrop the user sees while editing).
+    #   _BACKGROUND_FILL  — OUTSIDE the DXF offset polygon (white paper
+    #                       around the cut tile).
+    _CANVAS_BACKDROP = QColor(48, 48, 48)
+    _BACKGROUND_FILL = QColor(255, 255, 255)
+
+    def _render_canvas_region_rgb(self, wx0: float, wy0: float,
+                                  w: int, h: int,
+                                  out_w: int | None = None,
+                                  out_h: int | None = None) -> np.ndarray:
+        """Render the composite of canvas background + all visible
+        polygon fills within the world-coord rectangle (wx0, wy0,
+        w × h). If `out_w`/`out_h` are given, the QImage is created
+        at that pixel resolution and painter.scale() maps world coords
+        → output pixels so source content (canvas_bg pixmap, polygon
+        fill_qimg) is bilinear-sampled from its native resolution
+        directly into the output — much sharper than rendering at
+        world resolution and then upscaling. When both are None the
+        output size defaults to the world size (1 world-unit per
+        pixel), matching the previous behaviour."""
+        canvas = self.canvas
+        if out_w is None: out_w = max(1, w)
+        if out_h is None: out_h = max(1, h)
+        img = QImage(out_w, out_h, QImage.Format_ARGB32)
+        img.fill(self._CANVAS_BACKDROP)
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        # Map "world units" → "output pixels" via a painter scale so
+        # every drawImage/drawPixmap below can use world-coord offsets
+        # (existing `- wx0` / `- wy0` pattern) and Qt bilinear-samples
+        # source content directly from its native resolution into the
+        # output. Sharper than rendering at world resolution + upscaling.
+        painter.scale(out_w / max(1.0, float(w)),
+                      out_h / max(1.0, float(h)))
+
+        # Canvas background.
+        if canvas.canvas_background is not None:
+            bg = canvas.canvas_background
+            bg_w = bg.width()  * canvas.bg_scale
+            bg_h = bg.height() * canvas.bg_scale
+            sx = canvas.bg_offset_x - wx0
+            sy = canvas.bg_offset_y - wy0
+            painter.drawPixmap(
+                QRectF(sx, sy, bg_w, bg_h), bg,
+                QRectF(0, 0, bg.width(), bg.height()),
+            )
+
+        gid_visible = {g['id']: g['visible'] for g in canvas.groups}
+        wx1 = wx0 + w; wy1 = wy0 + h
+        for poly in canvas.polygons:
+            if not gid_visible.get(poly['group_id'], True):
+                continue
+            pts = poly.get('points') or []
+            if len(pts) < 3:
+                continue
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            if max(xs) < wx0 or min(xs) > wx1: continue
+            if max(ys) < wy0 or min(ys) > wy1: continue
+            qpoly = QPolygonF([QPointF(px - wx0, py - wy0)
+                               for (px, py) in pts])
+            if (poly['fill_type'] == 'image'
+                    and poly.get('fill_qimg') is not None):
+                bx, by, bw, bh = poly['fill_bbox']
+                painter.drawImage(
+                    QRectF(bx - wx0, by - wy0, bw, bh),
+                    poly['fill_qimg'],
+                )
+            elif poly['fill_type'] == 'solid':
+                painter.setBrush(QBrush(poly['color']))
+                painter.setPen(Qt.NoPen)
+                painter.drawPolygon(qpoly)
+        painter.end()
+
+        # QImage → numpy RGB.
+        arr = _qimage_to_numpy_rgba(img)
+        return np.ascontiguousarray(arr[:, :, :3])
+
+    def _save_tiles_via_dxf(self, ox: float, oy: float,
+                            selected: list, dxf_dir: str,
+                            inverse_scale: float,
+                            current_cell_px: float,
+                            tile_size_mm: float, dpi: int) -> tuple:
+        """Ports image_strech.py's Save Tile Image cutting logic to
+        this editor: for each (r, c) in `selected`, read
+        `<dxf_dir>/<label>/box_<label>.dxf`, un-scale + translate the
+        offset boundary into canvas world coords, render the composite
+        of canvas + polygons inside that polygon's bbox, mask outside
+        to white, resize proportionally to the requested mm + DPI, and
+        save the PNG next to the DXF.
+
+        Returns (saved, no_dxf, other) lists of tile labels."""
+        import os
+        from PIL import Image as _PILImage
+
+        # Same scale convention as image_strech.py:
+        #   target_w = tile_size_mm * dpi / 25.4  (output px per cell)
+        #   scale    = target_w / cell_w          (out_px per src_px)
+        target_w = int((tile_size_mm / 25.4) * dpi)
+        scale = target_w / max(1.0, current_cell_px)
+
+        saved: list = []
+        no_dxf: list = []
+        other: list = []
+
+        for (r, c) in selected:
+            row_letter = chr(ord('A') + r)
+            tile_name  = f"{row_letter}{c + 1}"
+
+            dxf_candidates = [
+                os.path.join(dxf_dir, tile_name, f"box_{tile_name}.dxf"),
+                os.path.join(dxf_dir, tile_name, f"Box_{tile_name}.dxf"),
+            ]
+            dxf_path = next(
+                (p for p in dxf_candidates if os.path.isfile(p)), None,
+            )
+            if dxf_path is None:
+                no_dxf.append(tile_name)
+                continue
+
+            polygon = self._read_tile_polygon_from_dxf(dxf_path)
+            if polygon is None or len(polygon) < 3:
+                no_dxf.append(tile_name)
+                continue
+
+            # DXF coord → canvas world coord:
+            #   world = dxf * inverse_scale + origin
+            polygon = polygon * inverse_scale
+            polygon = polygon + np.array([ox, oy], dtype=np.float32)
+
+            # Crop region = the DXF polygon's own bbox (so the whole
+            # offset boundary lives in the PNG — nothing gets clipped
+            # by the grid cell rectangle). `Grid box mm` is used only
+            # as a SCALING REFERENCE below: it defines the pixel size
+            # of one grid box at print, and the polygon is scaled by
+            # the same ratio, so a polygon 10 % larger than a grid
+            # box comes out 10 % larger than `Grid box mm` in the PNG.
+            x_min = float(np.floor(polygon[:, 0].min()))
+            y_min = float(np.floor(polygon[:, 1].min()))
+            x_max = float(np.ceil (polygon[:, 0].max()))
+            y_max = float(np.ceil (polygon[:, 1].max()))
+            w_crop = max(1, int(round(x_max - x_min)))
+            h_crop = max(1, int(round(y_max - y_min)))
+            if w_crop < 1 or h_crop < 1:
+                other.append(tile_name)
+                continue
+
+            # Output pixel dimensions — one grid box maps to target_w,
+            # so this polygon's world width × scale gives its PNG width.
+            out_w = max(1, int(round(w_crop * scale)))
+            out_h = max(1, int(round(h_crop * scale)))
+
+            # Composite canvas → RGB numpy DIRECTLY at output resolution.
+            # Rendering at output size (via QPainter transform inside
+            # _render_canvas_region_rgb) preserves source detail —
+            # canvas_bg pixmap and polygon fill_qimg get bilinear-sampled
+            # once from their native resolution to the output, instead
+            # of first being drawn at low world-coord resolution and
+            # then upscaled. This matches image_strech.py's effective
+            # quality: it crops from cv_image at native res and does
+            # one cv2.resize at the end.
+            rgb = self._render_canvas_region_rgb(
+                x_min, y_min, w_crop, h_crop,
+                out_w=out_w, out_h=out_h,
+            )
+
+            # DXF polygon → OUTPUT-pixel coords for masking (multiply
+            # local coords by scale). Outside the polygon → background
+            # fill; inside keeps the canvas content already rendered.
+            mask = np.zeros((out_h, out_w), dtype=np.uint8)
+            local_pts = polygon.copy()
+            local_pts[:, 0] = (local_pts[:, 0] - x_min) * scale
+            local_pts[:, 1] = (local_pts[:, 1] - y_min) * scale
+            cv2.fillPoly(mask, [local_pts.astype(np.int32)], 255)
+            outside = (
+                self._BACKGROUND_FILL.red(),
+                self._BACKGROUND_FILL.green(),
+                self._BACKGROUND_FILL.blue(),
+            )
+            rgb[mask == 0] = outside
+
+            # rgb is already at output resolution — no cv2.resize step.
+            tile_resized = rgb
+
+            # PNG saved beside the DXF, with DPI in pHYs.
+            out_path = os.path.join(
+                os.path.dirname(dxf_path), f"{tile_name}.png",
+            )
+            try:
+                _PILImage.fromarray(tile_resized).save(
+                    out_path, format="PNG",
+                    dpi=(float(dpi), float(dpi)),
+                )
+                saved.append(tile_name)
+            except Exception:
+                other.append(tile_name)
+        return saved, no_dxf, other
 
     def on_delete_tool_toggled(self, checked: bool) -> None:
         """Toggle the on-canvas eraser tool from the right toolbar."""
