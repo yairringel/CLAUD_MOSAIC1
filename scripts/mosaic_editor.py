@@ -2081,7 +2081,7 @@ class MosaicEditorWindow(QMainWindow):
         # Currently just Delete (eraser) but scales with more tools.
         right_bar = QFrame()
         right_bar.setFrameStyle(QFrame.StyledPanel)
-        right_bar.setFixedWidth(72)
+        right_bar.setFixedWidth(140)
         rb = QVBoxLayout(right_bar)
         rb.setContentsMargins(6, 6, 6, 6)
         rb.setSpacing(6)
@@ -2570,11 +2570,16 @@ class MosaicEditorWindow(QMainWindow):
         offset boundary into canvas world coords, render the composite
         of canvas + polygons inside that polygon's bbox, mask outside
         to white, resize proportionally to the requested mm + DPI, and
-        save the PNG next to the DXF.
+        save the PNG next to the DXF. Each PNG carries a PngInfo tEXt
+        chunk named `mosaic_box_corners` with a JSON blob giving the
+        four containing-box corners in PNG-pixel coords so
+        mosaic_aranger can place / scale the tile onto a target grid
+        box later.
 
         Returns (saved, no_dxf, other) lists of tile labels."""
         import os
         from PIL import Image as _PILImage
+        from PIL.PngImagePlugin import PngInfo as _PngInfo
 
         # Same scale convention as image_strech.py:
         #   target_w = tile_size_mm * dpi / 25.4  (output px per cell)
@@ -2665,7 +2670,50 @@ class MosaicEditorWindow(QMainWindow):
             # rgb is already at output resolution — no cv2.resize step.
             tile_resized = rgb
 
-            # PNG saved beside the DXF, with DPI in pHYs.
+            # ── Compute the containing-box corner metadata ────────
+            # Cell (r, c) occupies world rect anchored at the user-
+            # picked origin. Its four corners are:
+            #   TL: (ox + c*cell,       oy + r*cell)
+            #   TR: (ox + (c+1)*cell,   oy + r*cell)
+            #   BR: (ox + (c+1)*cell,   oy + (r+1)*cell)
+            #   BL: (ox + c*cell,       oy + (r+1)*cell)
+            # Convert each world corner to PNG-pixel coords:
+            #   png_px = (world - polygon_bbox_min) * scale
+            cell = current_cell_px
+            world_corners = [
+                (ox + c * cell,       oy + r * cell),         # TL
+                (ox + (c + 1) * cell, oy + r * cell),         # TR
+                (ox + (c + 1) * cell, oy + (r + 1) * cell),   # BR
+                (ox + c * cell,       oy + (r + 1) * cell),   # BL
+            ]
+            corners_px = [
+                [float(round((wx - x_min) * scale, 3)),
+                 float(round((wy - y_min) * scale, 3))]
+                for (wx, wy) in world_corners
+            ]
+
+            meta = {
+                "label":         tile_name,
+                "grid_box_mm":   float(tile_size_mm),
+                "dpi":           int(dpi),
+                "png_size_px":   [int(out_w), int(out_h)],
+                # Clockwise from top-left; each entry is [x_px, y_px]
+                # measured from the PNG's top-left corner (0, 0).
+                "corners_px":    corners_px,
+                "corner_order":  ["TL", "TR", "BR", "BL"],
+                "coord_system": (
+                    "PNG-pixel space, (0,0) = PNG top-left. Sub-pixel "
+                    "precision. Load the PNG, read the "
+                    "`mosaic_box_corners` PngInfo tEXt chunk, and warp "
+                    "these four points onto the target grid box's four "
+                    "corners to align the tile."
+                ),
+            }
+            pnginfo = _PngInfo()
+            pnginfo.add_text("mosaic_box_corners", json.dumps(meta))
+
+            # PNG saved beside the DXF, with DPI in pHYs and the box-
+            # corner metadata in tEXt.
             out_path = os.path.join(
                 os.path.dirname(dxf_path), f"{tile_name}.png",
             )
@@ -2673,6 +2721,7 @@ class MosaicEditorWindow(QMainWindow):
                 _PILImage.fromarray(tile_resized).save(
                     out_path, format="PNG",
                     dpi=(float(dpi), float(dpi)),
+                    pnginfo=pnginfo,
                 )
                 saved.append(tile_name)
             except Exception:
