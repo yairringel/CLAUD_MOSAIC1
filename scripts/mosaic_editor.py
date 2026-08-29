@@ -109,23 +109,42 @@ def load_mosaic_bundle(path: str):
 def build_image_fill(polygon_points, bg_rgba: np.ndarray):
     """Extract the polygon's pixels from the background bitmap and bake in
     a polygon-shaped alpha mask. Returns (fill_qimage, bbox_tuple) or
-    (None, None) if the polygon lies outside the image.
+    (None, None) if the polygon has no valid bbox.
+
+    Bbox is the polygon's REAL (unclamped) bbox — pixels outside the
+    background image simply stay transparent so Save Tile Image can
+    render the polygon in its full extent instead of a clipped strip.
 
     Mask is built with PIL's ImageDraw.polygon — reliable across Qt/PIL
     versions and doesn't depend on any painter-to-Grayscale8 support."""
     if bg_rgba is None or bg_rgba.size == 0:
         return None, None
     H, W = bg_rgba.shape[:2]
+
     xs = [p[0] for p in polygon_points]; ys = [p[1] for p in polygon_points]
     x0 = int(np.floor(min(xs))); y0 = int(np.floor(min(ys)))
     x1 = int(np.ceil (max(xs))); y1 = int(np.ceil (max(ys)))
-    x0 = max(0, x0); y0 = max(0, y0)
-    x1 = min(W, x1); y1 = min(H, y1)
     w, h = x1 - x0, y1 - y0
     if w <= 0 or h <= 0:
         return None, None
 
-    crop = bg_rgba[y0:y1, x0:x1].copy()
+    # Allocate the full polygon-bbox RGBA buffer up front — every pixel
+    # starts as fully transparent black. Any pixel outside the bg image
+    # STAYS transparent; pixels inside get filled from the background.
+    crop = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # Rectangle of overlap between polygon bbox and bg image (in bg
+    # image coords).
+    ix0 = max(0, x0); iy0 = max(0, y0)
+    ix1 = min(W, x1); iy1 = min(H, y1)
+    if ix1 > ix0 and iy1 > iy0:
+        # Where the overlap lands inside our local (0..w, 0..h) buffer.
+        lx0 = ix0 - x0; ly0 = iy0 - y0
+        lx1 = lx0 + (ix1 - ix0)
+        ly1 = ly0 + (iy1 - iy0)
+        crop[ly0:ly1, lx0:lx1] = bg_rgba[iy0:iy1, ix0:ix1]
+    # (else: polygon entirely off-image → buffer stays fully
+    # transparent; only the shape's mask survives after the next step)
 
     # Build a single-channel alpha mask via PIL. Polygon coords are
     # remapped into the crop's local (0..w, 0..h) space. ImageDraw
@@ -137,9 +156,12 @@ def build_image_fill(polygon_points, bg_rgba: np.ndarray):
     _ImageDraw.Draw(mask_img).polygon(poly_local, fill=255)
     mask_arr = np.array(mask_img, dtype=np.uint8)   # (h, w) uint8
 
-    # Multiply the crop's existing alpha channel by the mask. If the
-    # source background PNG had no alpha (fully opaque), this simply
-    # copies mask into the alpha channel.
+    # Multiply the crop's existing alpha channel by the mask. Pixels
+    # OUTSIDE the polygon shape become fully transparent. Pixels INSIDE
+    # the polygon but outside the bg image keep alpha 0 too (the
+    # `crop` buffer starts at zero everywhere), which prints as
+    # transparent-white when the tile is composited on the paper
+    # background later — same as never having a fill there.
     crop[:, :, 3] = (
         (crop[:, :, 3].astype(np.uint16) * mask_arr.astype(np.uint16)) // 255
     ).astype(np.uint8)
@@ -2154,6 +2176,20 @@ class MosaicEditorWindow(QMainWindow):
         )
         rb.addWidget(self.dpi_spin)
 
+        # Debug mode — when checked, Save Tile Image writes an extra
+        # `<label>_debug.png` (render + overlays of DXF polygon, grid
+        # cell, and every canvas polygon in the region) plus a
+        # `<label>_debug.txt` log next to every tile PNG.
+        self.debug_tile_chk = QCheckBox("Debug Tile")
+        self.debug_tile_chk.setToolTip(
+            "When checked, Save Tile Image writes an extra "
+            "<label>_debug.png (render + DXF polygon overlay + "
+            "polygon outlines) and <label>_debug.txt log next to "
+            "each PNG. Useful for diagnosing why a tile is missing "
+            "content."
+        )
+        rb.addWidget(self.debug_tile_chk)
+
         rb.addStretch(1)
 
         # ── assemble ──────────────────────────────────────────────────
@@ -2530,16 +2566,20 @@ class MosaicEditorWindow(QMainWindow):
             )
 
         gid_visible = {g['id']: g['visible'] for g in canvas.groups}
-        wx1 = wx0 + w; wy1 = wy0 + h
+        # NB: no vertex-bbox culling here. It used to skip polygons
+        # whose vertex bbox fell outside (wx0, wy0)–(wx1, wy1), but that
+        # missed content when the DXF's offset polygon (which drives
+        # the render region) was smaller than the actual mosaic
+        # coverage — e.g. polygons added after mosaic_studio generated
+        # the DXFs. QPainter clips out-of-range draws anyway, so the
+        # cost of iterating everything is negligible next to the
+        # correctness win.
         for poly in canvas.polygons:
             if not gid_visible.get(poly['group_id'], True):
                 continue
             pts = poly.get('points') or []
             if len(pts) < 3:
                 continue
-            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-            if max(xs) < wx0 or min(xs) > wx1: continue
-            if max(ys) < wy0 or min(ys) > wy1: continue
             qpoly = QPolygonF([QPointF(px - wx0, py - wy0)
                                for (px, py) in pts])
             if (poly['fill_type'] == 'image'
@@ -2726,7 +2766,180 @@ class MosaicEditorWindow(QMainWindow):
                 saved.append(tile_name)
             except Exception:
                 other.append(tile_name)
+
+            # ── Debug outputs (per-tile diagnostic) ────────────────
+            # Sidebar "Debug Tile" checkbox controls this. Writes:
+            #   <label>_debug.txt  — per-polygon log
+            #   <label>_debug.png  — render + overlays (DXF polygon,
+            #                        grid cell, canvas polygons)
+            if self.debug_tile_chk.isChecked():
+                try:
+                    self._write_tile_debug(
+                        os.path.dirname(dxf_path), tile_name,
+                        dxf_path, polygon,
+                        origin_x=ox, origin_y=oy,
+                        cell_world=current_cell_px,
+                        cell_r=r, cell_c=c,
+                        x_min=x_min, y_min=y_min,
+                        w_crop=w_crop, h_crop=h_crop,
+                        out_w=out_w, out_h=out_h,
+                        scale=scale, rgb=rgb,
+                    )
+                except Exception as e:
+                    print(
+                        f"[mosaic_editor] debug write failed for "
+                        f"{tile_name}: {type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
         return saved, no_dxf, other
+
+    def _write_tile_debug(self, out_dir: str, label: str,
+                          dxf_path: str, polygon_world,
+                          origin_x: float, origin_y: float,
+                          cell_world: float,
+                          cell_r: int, cell_c: int,
+                          x_min: float, y_min: float,
+                          w_crop: int, h_crop: int,
+                          out_w: int, out_h: int, scale: float,
+                          rgb) -> None:
+        """Emit `<label>_debug.txt` + `<label>_debug.png` next to the
+        saved tile PNG. The txt lists every canvas polygon plus its
+        state; the png draws the render (unmasked) with the DXF
+        polygon (red), grid cell (blue), and every polygon that
+        intersected the render region (green) overlaid on top. Only
+        called when the sidebar's `Debug Tile` checkbox is on."""
+        import os
+        from PIL import Image as _PILImage, ImageDraw as _ImageDraw
+
+        wx0, wy0 = float(x_min), float(y_min)
+        wx1, wy1 = wx0 + float(w_crop), wy0 + float(h_crop)
+
+        # Grid cell world corners.
+        cell_x0 = origin_x + cell_c * cell_world
+        cell_y0 = origin_y + cell_r * cell_world
+        cell_x1 = cell_x0 + cell_world
+        cell_y1 = cell_y0 + cell_world
+
+        # ── Text log ──────────────────────────────────────────────
+        lines: list[str] = []
+        lines.append(f"=== Debug: tile {label} (r={cell_r}, c={cell_c}) ===")
+        lines.append(f"DXF path:              {dxf_path}")
+        lines.append(f"Chosen origin (world): ({origin_x:.3f}, {origin_y:.3f})")
+        lines.append(f"Grid cell size (world): {cell_world:.3f}")
+        lines.append(f"Grid cell bbox (world): "
+                     f"({cell_x0:.2f}, {cell_y0:.2f}) → "
+                     f"({cell_x1:.2f}, {cell_y1:.2f})")
+        lines.append(f"DXF polygon (un-scaled + translated), "
+                     f"{len(polygon_world)} pts.")
+        px_min = float(polygon_world[:, 0].min())
+        py_min = float(polygon_world[:, 1].min())
+        px_max = float(polygon_world[:, 0].max())
+        py_max = float(polygon_world[:, 1].max())
+        lines.append(f"  bbox (world): ({px_min:.2f}, {py_min:.2f}) → "
+                     f"({px_max:.2f}, {py_max:.2f})")
+        lines.append(f"Render region (world): ({wx0:.2f}, {wy0:.2f}) → "
+                     f"({wx1:.2f}, {wy1:.2f})  "
+                     f"[{w_crop}×{h_crop} world units]")
+        lines.append(f"Output PNG size:       {out_w}×{out_h} px, "
+                     f"scale = {scale:.4f} px/world")
+        lines.append(f"Cell relative to DXF polygon bbox: "
+                     f"cell_inside_bbox="
+                     f"{px_min <= cell_x0 and py_min <= cell_y0 and px_max >= cell_x1 and py_max >= cell_y1}")
+
+        canvas = self.canvas
+        gid_visible = {g['id']: g['visible'] for g in canvas.groups}
+        gid_name = {g['id']: g.get('name', '?') for g in canvas.groups}
+
+        # Per-polygon breakdown, restricted to polygons whose bbox
+        # intersects either the render region or the grid cell.
+        lines.append(f"\n=== Polygons (visible + intersecting either "
+                     f"render region or grid cell) ===")
+        drawn_count = 0
+        in_cell_only = 0
+        in_region_only = 0
+        for i, poly in enumerate(canvas.polygons):
+            group_visible = gid_visible.get(poly['group_id'], True)
+            pts = poly.get('points') or []
+            if len(pts) < 3:
+                continue
+            pxs = [p[0] for p in pts]; pys = [p[1] for p in pts]
+            pbx0 = min(pxs); pby0 = min(pys)
+            pbx1 = max(pxs); pby1 = max(pys)
+            hits_region = (pbx1 >= wx0 and pbx0 <= wx1
+                           and pby1 >= wy0 and pby0 <= wy1)
+            hits_cell   = (pbx1 >= cell_x0 and pbx0 <= cell_x1
+                           and pby1 >= cell_y0 and pby0 <= cell_y1)
+            if not (hits_region or hits_cell):
+                continue
+            if group_visible and hits_region:
+                drawn_count += 1
+            if hits_cell and not hits_region:
+                in_cell_only += 1
+            if hits_region and not hits_cell:
+                in_region_only += 1
+            ft = poly.get('fill_type', '?')
+            fill_img = poly.get('fill_qimg')
+            fill_bbox = poly.get('fill_bbox')
+            fq_w = fill_img.size().width()  if fill_img is not None else 0
+            fq_h = fill_img.size().height() if fill_img is not None else 0
+            lines.append(
+                f"[{i}] group={poly['group_id']} "
+                f"({gid_name.get(poly['group_id'], '?')}) "
+                f"vis={group_visible} fill={ft} "
+                f"pts_bbox=({pbx0:.1f}, {pby0:.1f}, {pbx1:.1f}, {pby1:.1f}) "
+                f"fill_bbox={fill_bbox} fill_qimg={fq_w}×{fq_h} "
+                f"in_region={hits_region} in_cell={hits_cell}"
+            )
+
+        lines.append(f"\n=== Counts ===")
+        lines.append(f"Polygons drawn (visible + in render region): {drawn_count}")
+        lines.append(f"Polygons in cell but OUTSIDE render region:  {in_cell_only}")
+        lines.append(f"Polygons in region but OUTSIDE cell:         {in_region_only}")
+
+        txt_path = os.path.join(out_dir, f"{label}_debug.txt")
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+
+        # ── Debug PNG (overlays on the pre-mask render) ───────────
+        # Take the numpy render (rgb, size out_h × out_w × 3, no mask
+        # applied) as the base, then draw:
+        #   • red thick outline: DXF polygon (in output pixel coords)
+        #   • blue thick outline: grid cell rectangle
+        #   • green thin outlines: polygons that intersect the region
+        base = _PILImage.fromarray(rgb).convert("RGBA")
+        draw = _ImageDraw.Draw(base)
+
+        def w2p(x, y):
+            return ((x - wx0) * scale, (y - wy0) * scale)
+
+        # DXF polygon (red).
+        px = [w2p(px_i, py_i) for (px_i, py_i) in polygon_world]
+        draw.line(px + [px[0]], fill=(255, 40, 40, 255), width=4)
+
+        # Grid cell rectangle (blue).
+        c_tl = w2p(cell_x0, cell_y0)
+        c_tr = w2p(cell_x1, cell_y0)
+        c_br = w2p(cell_x1, cell_y1)
+        c_bl = w2p(cell_x0, cell_y1)
+        draw.line([c_tl, c_tr, c_br, c_bl, c_tl],
+                  fill=(40, 100, 255, 255), width=4)
+
+        # Every visible polygon that hits the region — green thin.
+        for poly in canvas.polygons:
+            if not gid_visible.get(poly['group_id'], True):
+                continue
+            pts = poly.get('points') or []
+            if len(pts) < 3:
+                continue
+            pxs = [p[0] for p in pts]; pys = [p[1] for p in pts]
+            if max(pxs) < wx0 or min(pxs) > wx1: continue
+            if max(pys) < wy0 or min(pys) > wy1: continue
+            pcoords = [w2p(px_, py_) for (px_, py_) in pts]
+            draw.line(pcoords + [pcoords[0]],
+                      fill=(50, 200, 60, 220), width=1)
+
+        png_path = os.path.join(out_dir, f"{label}_debug.png")
+        base.save(png_path, format="PNG")
 
     def on_delete_tool_toggled(self, checked: bool) -> None:
         """Toggle the on-canvas eraser tool from the right toolbar."""
