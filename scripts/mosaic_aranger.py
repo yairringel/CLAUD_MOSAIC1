@@ -787,7 +787,10 @@ class TilesPanel(QFrame):
         if self.current_dir is None or not self.current_dir.is_dir():
             return
 
-        png_paths = sorted(self.current_dir.rglob("*.png"))
+        # Only PNGs sitting DIRECTLY in the chosen directory — no
+        # recursion. Matches how mosaic_editor / image_strech now write
+        # every tile PNG to a single flat output folder.
+        png_paths = sorted(self.current_dir.glob("*.png"))
         if not png_paths:
             empty = QLabel("(no .png files found)")
             empty.setAlignment(Qt.AlignCenter)

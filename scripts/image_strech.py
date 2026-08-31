@@ -62,6 +62,16 @@ class ImageCanvas(QWidget):
         self.grid_aspect_ratio = 1.0
         self.grid_offset_x = 0  # Grid horizontal offset in pixels
         self.grid_offset_y = 0  # Grid vertical offset in pixels
+        # Running total of "polygons-only" translations applied by the
+        # arrow-key mover with `only_polygons_chk` checked, since the
+        # last baseline (Load Image / Load Array / Save Array / polygon
+        # scale). Save Tile Image adds this to the DXF polygon so the
+        # tile crop reflects where the user has since positioned the
+        # polygons on the canvas — the containing box stays at the
+        # grid's (col*cell_w, row*cell_h), so the tile appears offset
+        # inside the arranger box by the same delta.
+        self.polygon_translation_x = 0.0
+        self.polygon_translation_y = 0.0
         self.grid_line_thickness = 2  # Grid line thickness in pixels
         self.polygon_line_thickness = 1  # Polygon line thickness in pixels
         # When False, paintEvent draws a solid red rectangle where the
@@ -2088,6 +2098,12 @@ class MainWindow(QMainWindow):
                 [(px + delta_x, py + delta_y) for px, py in poly]
                 for poly in self.canvas.polygons
             ]
+            # Track polygon-only translation so Save Tile Image can
+            # apply the same shift to DXF polygons — otherwise the
+            # tile position inside the arranger box would still
+            # reflect the OLD polygon location.
+            self.canvas.polygon_translation_x += delta_x
+            self.canvas.polygon_translation_y += delta_y
         else:
             # Default: shift the image, optionally the polygons with it.
             self.canvas.grid_offset_x += delta_x
@@ -2520,6 +2536,21 @@ class MainWindow(QMainWindow):
             # gets us back to canvas-relative coords.
             polygon = polygon * inverse_scale
 
+            # APPLY THE ONLY-POLYGON TRANSLATION — arrow moves with
+            # `only_polygons_chk` checked accumulate into
+            # canvas.polygon_translation_*, and the DXF polygon we
+            # just loaded is a snapshot from BEFORE those moves. Add
+            # the accumulated delta to bring the DXF polygon to where
+            # the polygon currently sits on the canvas. The containing
+            # box further down keeps its (col*cell_w, row*cell_h)
+            # position, so the polygon appears offset inside the box
+            # by the same delta when placed in mosaic_aranger.
+            polygon = polygon + np.array(
+                [self.canvas.polygon_translation_x,
+                 self.canvas.polygon_translation_y],
+                dtype=np.float32,
+            )
+
             # APPLY THE PAN — polygons are stored in CANVAS coords where
             # the grid origin is fixed at (0, 0); the image is drawn at
             # canvas position (grid_offset_x, grid_offset_y). So the
@@ -2562,6 +2593,56 @@ class MainWindow(QMainWindow):
             tile_resized = cv2.resize(tile_image, (out_w, out_h),
                                       interpolation=cv2.INTER_LANCZOS4)
 
+            # ── Containing-box (grid-cell) corner metadata ────────────
+            # Same schema mosaic_editor.py writes so mosaic_aranger can
+            # place / scale this tile onto a target grid box regardless
+            # of which tool cut it. The DXF offset boundary can spill
+            # OUTSIDE the source grid cell (that's the whole point of
+            # the offset), so we need to know where the cell's four
+            # corners sit inside the PNG in order to align it back to a
+            # target grid cell at arrangement time.
+            #
+            # Grid cell (row_index, col_index) in image-pixel coords —
+            # same convention the polygon uses (grid_offset subtracted
+            # a few lines above), so the cell corners live in the same
+            # coord system as x_min / y_min. This is exact when the
+            # user hasn't scaled / translated the canvas polygons
+            # (or the image) between Save Array and Save Tile Image.
+            cell_x0 = col_index * cell_w - self.canvas.grid_offset_x
+            cell_y0 = row_index * cell_h - self.canvas.grid_offset_y
+            world_corners = [
+                (cell_x0,          cell_y0),           # TL
+                (cell_x0 + cell_w, cell_y0),           # TR
+                (cell_x0 + cell_w, cell_y0 + cell_h),  # BR
+                (cell_x0,          cell_y0 + cell_h),  # BL
+            ]
+            corners_px = [
+                [float(round((wx - x_min) * scale, 3)),
+                 float(round((wy - y_min) * scale, 3))]
+                for (wx, wy) in world_corners
+            ]
+            meta = {
+                "label":         tile_name,
+                "grid_box_mm":   float(tile_size_mm),
+                "dpi":           int(dpi),
+                "png_size_px":   [int(out_w), int(out_h)],
+                # Clockwise from top-left; each entry is [x_px, y_px]
+                # measured from the PNG's top-left corner (0, 0).
+                "corners_px":    corners_px,
+                "corner_order":  ["TL", "TR", "BR", "BL"],
+                "coord_system": (
+                    "PNG-pixel space, (0,0) = PNG top-left. Sub-pixel "
+                    "precision. Load the PNG, read the "
+                    "`mosaic_box_corners` PngInfo tEXt chunk, and warp "
+                    "these four points onto the target grid box's four "
+                    "corners to align the tile."
+                ),
+            }
+            from PIL import Image as _PILImage
+            from PIL.PngImagePlugin import PngInfo as _PngInfo
+            pnginfo = _PngInfo()
+            pnginfo.add_text("mosaic_box_corners", json.dumps(meta))
+
             # Save the PNG into the user-named flat output folder as
             # `<label>.png`. Every tile lands in one folder inside
             # `dxf_dir`, so an arrangement pass in mosaic_aranger can
@@ -2569,14 +2650,15 @@ class MainWindow(QMainWindow):
             # sub-folders. DPI is written into the PNG's pHYs chunk so
             # Photoshop / Illustrator / Inkscape open the file at the
             # correct physical print size (mm / inches) instead of
-            # defaulting to 72 dpi.
+            # defaulting to 72 dpi. `pnginfo` carries the containing-box
+            # corner metadata mosaic_aranger uses to place the tile.
             out_path = os.path.join(out_dir, f"{tile_name}.png")
             try:
-                from PIL import Image as _PILImage
                 # tile_resized is RGB (cv_image is stored RGB in this app).
                 _PILImage.fromarray(tile_resized).save(
                     out_path, format="PNG",
                     dpi=(float(dpi), float(dpi)),
+                    pnginfo=pnginfo,
                 )
                 saved.append(tile_name)
             except Exception:
@@ -2587,7 +2669,10 @@ class MainWindow(QMainWindow):
             f"Each PNG is named after its box (A1.png, B2.png, …), was "
             f"cut with that box's OFFSET boundary (color 5) from the "
             f"DXF, and carries the current DPI ({dpi}) in its pHYs "
-            f"metadata so Photoshop opens it at the correct print size."
+            f"metadata so Photoshop opens it at the correct print "
+            f"size. A `mosaic_box_corners` tEXt chunk records the four "
+            f"grid-box corners in PNG-pixel coords so mosaic_aranger "
+            f"can align the tile to a target grid cell."
         )
         if skipped_no_dxf:
             msg += (
