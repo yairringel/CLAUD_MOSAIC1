@@ -19,6 +19,7 @@ click-selected, dragged, and deleted individually. Loaded batches
 """
 
 import sys
+import os
 import csv
 import io
 import json
@@ -2729,14 +2730,49 @@ class MosaicEditorWindow(QMainWindow):
         if not dxf_dir:
             self.statusBar().showMessage("Save Tile Image cancelled.")
             return
-        self._save_tile_ask_scale(ox, oy, selected, dxf_dir)
+
+        # Step 3b: ask the user to name the OUTPUT subfolder. Every
+        # tile PNG (and per-tile debug artifact when enabled) is
+        # written into this single folder as `<label>.png` instead of
+        # being scattered into each box's own sub-DXF folder.
+        name, ok = QInputDialog.getText(
+            self,
+            "Output Folder Name",
+            f"Name of the new folder to hold all tile PNGs.\n\n"
+            f"It will be created inside:\n{dxf_dir}",
+            text="tiles",
+        )
+        if not ok:
+            self.statusBar().showMessage("Save Tile Image cancelled.")
+            return
+        name = name.strip()
+        # Strip characters Windows/Unix filesystems reject in folder
+        # names — keeps ASCII letters/digits/-/_/space and turns
+        # anything else into `_` so a paste of an odd string doesn't
+        # explode inside makedirs.
+        safe = "".join(ch if (ch.isalnum() or ch in "-_ .") else "_"
+                       for ch in name) or "tiles"
+        out_dir = os.path.join(dxf_dir, safe)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save Tile Image",
+                f"Could not create output folder:\n{out_dir}\n\n{e}"
+            )
+            return
+
+        self._save_tile_ask_scale(ox, oy, selected, dxf_dir, out_dir)
 
     def _save_tile_ask_scale(self, ox: float, oy: float,
-                             selected: list, dxf_dir: str) -> None:
+                             selected: list, dxf_dir: str,
+                             out_dir: str) -> None:
         """Step 4 (single dialog, matching image_strech.py): ask for
         the target grid box size the user entered at Save Array time.
         Tile size (mm) + DPI come from the persistent right-toolbar
-        spinboxes, so we don't prompt for them here."""
+        spinboxes, so we don't prompt for them here. `out_dir` is the
+        folder we already resolved in `_save_tile_ask_dxf` — every PNG
+        lands there as `<label>.png`."""
         current_cell_px = self.canvas._grid_cell_world()
         target_cell_px, ok = QInputDialog.getDouble(
             self,
@@ -2759,7 +2795,7 @@ class MosaicEditorWindow(QMainWindow):
         dpi = int  (self.dpi_spin.value())
         try:
             saved, no_dxf, other = self._save_tiles_via_dxf(
-                ox, oy, selected, dxf_dir,
+                ox, oy, selected, dxf_dir, out_dir,
                 inverse_scale, current_cell_px, mm, dpi,
             )
         except Exception as e:
@@ -2769,11 +2805,10 @@ class MosaicEditorWindow(QMainWindow):
             )
             return
         msg = (
-            f"Saved {len(saved)} tile(s) into their per-box subfolders "
-            f"under:\n{dxf_dir}\n\n"
-            f"Each PNG sits next to its box_<label>.dxf, was cut with "
-            f"that file's OFFSET boundary (color 5), and carries "
-            f"DPI ({dpi}) in its pHYs metadata."
+            f"Saved {len(saved)} tile(s) into:\n{out_dir}\n\n"
+            f"Each PNG is named after its box (A1.png, B2.png, …), "
+            f"was cut with that box's OFFSET boundary (color 5) from "
+            f"the DXF, and carries DPI ({dpi}) in its pHYs metadata."
         )
         if no_dxf:
             msg += (f"\n\nSkipped (no box_<label>.dxf found or unreadable): "
@@ -2915,7 +2950,7 @@ class MosaicEditorWindow(QMainWindow):
         return np.ascontiguousarray(arr[:, :, :3])
 
     def _save_tiles_via_dxf(self, ox: float, oy: float,
-                            selected: list, dxf_dir: str,
+                            selected: list, dxf_dir: str, out_dir: str,
                             inverse_scale: float,
                             current_cell_px: float,
                             tile_size_mm: float, dpi: int) -> tuple:
@@ -2925,14 +2960,15 @@ class MosaicEditorWindow(QMainWindow):
         offset boundary into canvas world coords, render the composite
         of canvas + polygons inside that polygon's bbox, mask outside
         to white, resize proportionally to the requested mm + DPI, and
-        save the PNG next to the DXF. Each PNG carries a PngInfo tEXt
-        chunk named `mosaic_box_corners` with a JSON blob giving the
-        four containing-box corners in PNG-pixel coords so
-        mosaic_aranger can place / scale the tile onto a target grid
-        box later.
+        save the PNG as `<out_dir>/<label>.png`. Every tile lands in a
+        SINGLE flat folder (`out_dir`) named after its box — A1.png,
+        A2.png, … — instead of being scattered into each box's own
+        sub-DXF folder. Each PNG carries a PngInfo tEXt chunk named
+        `mosaic_box_corners` with a JSON blob giving the four
+        containing-box corners in PNG-pixel coords so mosaic_aranger
+        can place / scale the tile onto a target grid box later.
 
         Returns (saved, no_dxf, other) lists of tile labels."""
-        import os
         from PIL import Image as _PILImage
         from PIL.PngImagePlugin import PngInfo as _PngInfo
 
@@ -3067,11 +3103,10 @@ class MosaicEditorWindow(QMainWindow):
             pnginfo = _PngInfo()
             pnginfo.add_text("mosaic_box_corners", json.dumps(meta))
 
-            # PNG saved beside the DXF, with DPI in pHYs and the box-
-            # corner metadata in tEXt.
-            out_path = os.path.join(
-                os.path.dirname(dxf_path), f"{tile_name}.png",
-            )
+            # PNG saved into the user-named flat output folder as
+            # `<label>.png`, with DPI in pHYs and the box-corner
+            # metadata in tEXt.
+            out_path = os.path.join(out_dir, f"{tile_name}.png")
             try:
                 _PILImage.fromarray(tile_resized).save(
                     out_path, format="PNG",
@@ -3087,10 +3122,11 @@ class MosaicEditorWindow(QMainWindow):
             #   <label>_debug.txt  — per-polygon log
             #   <label>_debug.png  — render + overlays (DXF polygon,
             #                        grid cell, canvas polygons)
+            # Both go into the same flat output folder as the tile PNG.
             if self.debug_tile_chk.isChecked():
                 try:
                     self._write_tile_debug(
-                        os.path.dirname(dxf_path), tile_name,
+                        out_dir, tile_name,
                         dxf_path, polygon,
                         origin_x=ox, origin_y=oy,
                         cell_world=current_cell_px,

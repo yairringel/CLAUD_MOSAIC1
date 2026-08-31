@@ -237,11 +237,29 @@ class ArrangerCanvas(QWidget):
         full_w  = pm.width()  * sx
         full_h  = pm.height() * sy
 
-        painter.drawPixmap(
-            QRectF(full_x0, full_y0, full_w, full_h),
-            pm,
-            QRectF(0, 0, pm.width(), pm.height()),
-        )
+        # Rotation (0/90/180/270) around the CENTER of the target grid
+        # cell — the tile's containing box stays snapped to the cell,
+        # only the artwork spins. Space-bar cycles through these.
+        rot = int(tile.get('rotation', 0)) % 360
+        if rot:
+            cxw = target_x0 + cell / 2.0
+            cyw = target_y0 + cell / 2.0
+            painter.save()
+            painter.translate(cxw, cyw)
+            painter.rotate(rot)
+            painter.translate(-cxw, -cyw)
+            painter.drawPixmap(
+                QRectF(full_x0, full_y0, full_w, full_h),
+                pm,
+                QRectF(0, 0, pm.width(), pm.height()),
+            )
+            painter.restore()
+        else:
+            painter.drawPixmap(
+                QRectF(full_x0, full_y0, full_w, full_h),
+                pm,
+                QRectF(0, 0, pm.width(), pm.height()),
+            )
 
     # ── mouse wheel: zoom around cursor ───────────────────────────────
     def wheelEvent(self, ev):
@@ -343,10 +361,31 @@ class ArrangerCanvas(QWidget):
         self.pending_batch = None
         self.setCursor(Qt.ArrowCursor)
 
+    def _remove_tiles_at(self, row: int, col: int,
+                         exclude_index: int | None = None) -> None:
+        """Delete every placed tile sitting on cell (row, col). Optional
+        `exclude_index` skips one entry — used when MOVING a selected
+        tile onto its own cell so we don't delete the tile we're about
+        to relocate. `selected_placed_index` is kept in sync (or reset
+        if the selected tile was one of the removed ones)."""
+        keep: list[dict] = []
+        sel = self.selected_placed_index
+        new_sel = -1
+        for i, t in enumerate(self.placed_tiles):
+            if t.get('row') == row and t.get('col') == col \
+                    and i != exclude_index:
+                # Drop it.
+                continue
+            if i == sel:
+                new_sel = len(keep)
+            keep.append(t)
+        self.placed_tiles = keep
+        self.selected_placed_index = new_sel
+
     def keyPressEvent(self, ev):
         """ESC releases: clears any pending placement AND any current
-        placed-tile selection. Other keys fall through to the default
-        handler."""
+        placed-tile selection. Del / Backspace erases the currently
+        selected placed tile. Other keys fall through."""
         if ev.key() == Qt.Key_Escape:
             changed = (self.pending_tile is not None
                        or self.pending_batch is not None
@@ -356,6 +395,21 @@ class ArrangerCanvas(QWidget):
             self.selected_placed_index = -1
             self.setCursor(Qt.ArrowCursor)
             if changed:
+                self.update()
+            return
+        if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            if 0 <= self.selected_placed_index < len(self.placed_tiles):
+                del self.placed_tiles[self.selected_placed_index]
+                self.selected_placed_index = -1
+                self.update()
+            return
+        if ev.key() == Qt.Key_Space:
+            # Rotate the selected placed tile by +90°. Cycles through
+            # 0 / 90 / 180 / 270. Rotation persists on the tile so
+            # subsequent moves / copies / saves carry it too.
+            if 0 <= self.selected_placed_index < len(self.placed_tiles):
+                tile = self.placed_tiles[self.selected_placed_index]
+                tile['rotation'] = (int(tile.get('rotation', 0)) + 90) % 360
                 self.update()
             return
         super().keyPressEvent(ev)
@@ -374,6 +428,13 @@ class ArrangerCanvas(QWidget):
 
         # Batch placement wins over single tile when armed.
         if self.pending_batch is not None:
+            # Clear any existing tiles from every cell the batch will
+            # touch, so the batch fully replaces prior content there.
+            targets = {(row + int(item.get('dr', 0)),
+                        col + int(item.get('dc', 0)))
+                       for item in self.pending_batch}
+            for (tr, tc) in targets:
+                self._remove_tiles_at(tr, tc)
             for item in self.pending_batch:
                 self.placed_tiles.append({
                     'pixmap':      item['pixmap'],
@@ -387,6 +448,8 @@ class ArrangerCanvas(QWidget):
             return
 
         if self.pending_tile is not None:
+            # Replace anything already sitting on this cell.
+            self._remove_tiles_at(row, col)
             self.placed_tiles.append({
                 'pixmap':      self.pending_tile['pixmap'],
                 'corners_px':  self.pending_tile['corners_px'],
@@ -401,15 +464,42 @@ class ArrangerCanvas(QWidget):
 
         # ── select-and-move (no placement armed) ───────────────────
         # If a tile is already selected, this click moves it to the
-        # clicked cell then RELEASES the selection. Same-cell click on
-        # a selected tile just deselects. Otherwise, pick the topmost
-        # placed tile sitting on the clicked cell and select it.
+        # clicked cell then RELEASES the selection. Holding SHIFT
+        # instead COPIES the tile to the clicked cell (the original
+        # stays put). Same-cell click without shift just deselects.
+        # Otherwise, pick the topmost placed tile sitting on the
+        # clicked cell and select it.
         if 0 <= self.selected_placed_index < len(self.placed_tiles):
-            tile = self.placed_tiles[self.selected_placed_index]
-            if not (tile['row'] == row and tile['col'] == col):
-                tile['row'] = row
-                tile['col'] = col
-            # Either way (moved or same-cell), the paste is done → release.
+            sel_idx = self.selected_placed_index
+            tile = self.placed_tiles[sel_idx]
+            shift = bool(ev.modifiers() & Qt.ShiftModifier)
+            if shift:
+                # Copy: clear the target cell (any pre-existing tiles
+                # there — but NOT the source, which stays put) then
+                # append a duplicate.
+                self._remove_tiles_at(row, col, exclude_index=sel_idx)
+                self.placed_tiles.append({
+                    'pixmap':      tile['pixmap'],
+                    'corners_px':  tile.get('corners_px'),
+                    'label':       tile.get('label', ''),
+                    'source_path': tile.get('source_path'),
+                    'rotation':    int(tile.get('rotation', 0)) % 360,
+                    'row':         row,
+                    'col':         col,
+                })
+            else:
+                if not (tile['row'] == row and tile['col'] == col):
+                    # Move: erase anything else at the destination, then
+                    # relocate this tile there. _remove_tiles_at may
+                    # renumber the list, so re-fetch the tile via the
+                    # (possibly updated) selected index.
+                    self._remove_tiles_at(row, col,
+                                          exclude_index=sel_idx)
+                    tile = self.placed_tiles[self.selected_placed_index]
+                    tile['row'] = row
+                    tile['col'] = col
+            # Either way (moved, copied, or same-cell click), the paste
+            # is done → release the selection.
             self.selected_placed_index = -1
             self.update()
             return
@@ -1031,6 +1121,7 @@ class MosaicArrangerWindow(QMainWindow):
                 'source_path': str(src),
                 'corners_px':  tile.get('corners_px'),
                 'label':       tile.get('label', ''),
+                'rotation':    int(tile.get('rotation', 0)) % 360,
                 'row':         int(tile.get('row', 0)),
                 'col':         int(tile.get('col', 0)),
             })
@@ -1099,6 +1190,7 @@ class MosaicArrangerWindow(QMainWindow):
                 'corners_px':  t.get('corners_px'),
                 'label':       t.get('label', ''),
                 'source_path': str(src),
+                'rotation':    int(t.get('rotation', 0)) % 360,
                 'row':         int(t.get('row', 0)),
                 'col':         int(t.get('col', 0)),
             })

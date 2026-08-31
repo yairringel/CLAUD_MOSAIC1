@@ -2409,6 +2409,35 @@ class MainWindow(QMainWindow):
         if not dxf_dir:
             return
 
+        # ── Ask for the output folder name ─────────────────────────────────
+        # Instead of scattering PNGs into each box's own sub-DXF folder,
+        # every tile now lands in one flat folder the user names. The
+        # folder is created inside `dxf_dir`; its name is sanitised so
+        # unusual characters can't break `os.makedirs`.
+        import os
+        from PyQt5.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self,
+            "Output Folder Name",
+            f"Name of the new folder to hold all tile PNGs.\n\n"
+            f"It will be created inside:\n{dxf_dir}",
+            text="tiles",
+        )
+        if not ok:
+            return
+        name = name.strip()
+        safe = "".join(ch if (ch.isalnum() or ch in "-_ .") else "_"
+                       for ch in name) or "tiles"
+        out_dir = os.path.join(dxf_dir, safe)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save Tile Image",
+                f"Could not create output folder:\n{out_dir}\n\n{e}"
+            )
+            return
+
         # ── Ask for the scale that was used at Save Array time ─────────────
         # Save Array in image_strech.py multiplies every polygon coordinate
         # by  (target_grid_box_px / original_grid_box_px)  before writing
@@ -2422,7 +2451,6 @@ class MainWindow(QMainWindow):
             original_cell_px = max(
                 1.0, img_w * (self.canvas.grid_size_percent / 100.0),
             )
-        from PyQt5.QtWidgets import QInputDialog
         target_cell_px, ok = QInputDialog.getDouble(
             self,
             "Un-scale DXF Coordinates",
@@ -2461,7 +2489,6 @@ class MainWindow(QMainWindow):
                         if self.canvas.cv_image is not None
                         else self.canvas.display_image)
 
-        import os
         saved, skipped_no_dxf, skipped_other = [], [], []
         for (row_index, col_index) in selected:
             row_letter = chr(ord('A') + row_index) if row_index < 26 else f"R{row_index+1}"
@@ -2535,17 +2562,15 @@ class MainWindow(QMainWindow):
             tile_resized = cv2.resize(tile_image, (out_w, out_h),
                                       interpolation=cv2.INTER_LANCZOS4)
 
-            # Save the PNG into the SAME directory that contains the DXF
-            # for this box — right next to box_<label>.dxf. Each box's
-            # tile folder collects both its geometry and its cut image
-            # together, no separate output tree to manage.
-            # DPI is written into the PNG's pHYs chunk so Photoshop /
-            # Illustrator / Inkscape open the file at the correct
-            # physical print size (mm / inches) instead of defaulting
-            # to 72 dpi.
-            out_path = os.path.join(
-                os.path.dirname(dxf_path), f"{tile_name}.png",
-            )
+            # Save the PNG into the user-named flat output folder as
+            # `<label>.png`. Every tile lands in one folder inside
+            # `dxf_dir`, so an arrangement pass in mosaic_aranger can
+            # point at a single directory instead of walking per-box
+            # sub-folders. DPI is written into the PNG's pHYs chunk so
+            # Photoshop / Illustrator / Inkscape open the file at the
+            # correct physical print size (mm / inches) instead of
+            # defaulting to 72 dpi.
+            out_path = os.path.join(out_dir, f"{tile_name}.png")
             try:
                 from PIL import Image as _PILImage
                 # tile_resized is RGB (cv_image is stored RGB in this app).
@@ -2558,12 +2583,11 @@ class MainWindow(QMainWindow):
                 skipped_other.append(tile_name)
 
         msg = (
-            f"Saved {len(saved)} tile(s) into their per-box subfolders "
-            f"under:\n{dxf_dir}\n\n"
-            f"Each PNG sits next to its box_<label>.dxf, was cut with "
-            f"that file's OFFSET boundary (color 5), and carries the "
-            f"current DPI ({dpi}) in its pHYs metadata so Photoshop "
-            f"opens it at the correct print size."
+            f"Saved {len(saved)} tile(s) into:\n{out_dir}\n\n"
+            f"Each PNG is named after its box (A1.png, B2.png, …), was "
+            f"cut with that box's OFFSET boundary (color 5) from the "
+            f"DXF, and carries the current DPI ({dpi}) in its pHYs "
+            f"metadata so Photoshop opens it at the correct print size."
         )
         if skipped_no_dxf:
             msg += (
