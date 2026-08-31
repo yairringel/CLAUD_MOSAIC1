@@ -338,6 +338,11 @@ class MosaicCanvas(QWidget):
         self._next_group_id = 1
 
         self.canvas_background: QPixmap | None = None
+        # Absolute path of the file `canvas_background` was loaded from
+        # (or None if none set). Save Project stores just this path;
+        # Load Project reloads the file so the .mep never carries the
+        # background bitmap.
+        self.canvas_background_source: str | None = None
         # World-space position of the canvas background's top-left
         # corner. Moved by the sidebar's arrow buttons when
         # bg_affected is True.
@@ -363,6 +368,12 @@ class MosaicCanvas(QWidget):
         self.grid_thickness = 2
         self.grid_offset_x = 0.0
         self.grid_offset_y = 0.0
+
+        # Show polygon outline strokes. When False, only the filled
+        # interiors render — useful when you want to preview the mosaic
+        # as-printed. The SELECTED polygon still gets its red outline
+        # so selection is always visible regardless of this flag.
+        self.show_polygon_lines = True
 
         # Interaction state.
         self.selected_index = -1
@@ -407,7 +418,8 @@ class MosaicCanvas(QWidget):
         self._pan_start_offset = (0.0, 0.0)
 
     # ── layers management ─────────────────────────────────────────────
-    def add_group(self, name: str, kind: str) -> int:
+    def add_group(self, name: str, kind: str,
+                  source_path: str | None = None) -> int:
         gid = self._next_group_id
         self._next_group_id += 1
         # applied_scale tracks the group's current size as a factor of
@@ -415,9 +427,15 @@ class MosaicCanvas(QWidget):
         # brings the group to `pct/100` * original — the ratio to the
         # current applied_scale is what actually gets multiplied into
         # the coordinates, so scaling is always absolute-from-original.
+        # source_path (optional, absolute) is where this group's data
+        # originally came from — a .mosaic bundle for image-fill layers,
+        # a .csv for polygon-only layers. Save Project stores just this
+        # path (not the images), and Load Project reloads the file to
+        # rebuild every polygon's fill.
         self.groups.append({'id': gid, 'name': name, 'kind': kind,
                             'visible': True, 'affected': True,
-                            'applied_scale': 1.0})
+                            'applied_scale': 1.0,
+                            'source_path': source_path})
         return gid
 
     def set_group_affected(self, gid: int, affected: bool) -> None:
@@ -456,6 +474,64 @@ class MosaicCanvas(QWidget):
             self.bg_offset_x += dx
             self.bg_offset_y += dy
         self.update()
+
+    def scale_all_polygons_individual(self, pct: float) -> int:
+        """Scale EVERY polygon (regardless of layer / affected flag) by
+        `pct` percent around ITS OWN centroid — 110 = each polygon
+        grows 10 % about its own centre, 90 = each shrinks 10 %.
+
+        Unlike `scale_affected` which is ABSOLUTE-FROM-ORIGINAL and
+        uses per-group centroids, this is a RELATIVE MULTIPLIER applied
+        per polygon: applying 110 twice grows every polygon by 21 %,
+        applying 100 is a no-op. Returns the number of polygons
+        actually scaled.
+
+        source_points is left untouched — it lives in the source
+        .mosaic bundle's local coord system, so Load Project's
+        `warp_fill_piecewise_affine(source_points → orig_points)`
+        naturally captures the new scale."""
+        if pct <= 0 or abs(pct - 100.0) < 1e-9:
+            return 0
+        ratio = pct / 100.0
+        if not self.polygons:
+            return 0
+
+        self._push_undo()
+        n = 0
+        for poly in self.polygons:
+            pts = poly.get('points') or []
+            if len(pts) < 3:
+                continue
+            cx = sum(x for (x, _) in pts) / len(pts)
+            cy = sum(y for (_, y) in pts) / len(pts)
+            poly['points'] = [
+                (cx + (x - cx) * ratio, cy + (y - cy) * ratio)
+                for x, y in pts
+            ]
+            if poly.get('fill_bbox') is not None:
+                x0, y0, w, h = poly['fill_bbox']
+                poly['fill_bbox'] = (
+                    cx + (x0 - cx) * ratio,
+                    cy + (y0 - cy) * ratio,
+                    w * ratio,
+                    h * ratio,
+                )
+            if poly.get('orig_points') is not None:
+                poly['orig_points'] = [
+                    (cx + (x - cx) * ratio, cy + (y - cy) * ratio)
+                    for x, y in poly['orig_points']
+                ]
+            if poly.get('orig_fill_bbox') is not None:
+                x0, y0, w, h = poly['orig_fill_bbox']
+                poly['orig_fill_bbox'] = (
+                    cx + (x0 - cx) * ratio,
+                    cy + (y0 - cy) * ratio,
+                    w * ratio,
+                    h * ratio,
+                )
+            n += 1
+        self.update()
+        return n
 
     def scale_affected(self, pct: float) -> None:
         """Scale every affected element ABSOLUTELY relative to its
@@ -594,7 +670,8 @@ class MosaicCanvas(QWidget):
         canvas.'"""
         polys, bg_np = load_mosaic_bundle(path)
         self._push_undo()
-        gid = self.add_group(Path(path).name, 'mosaic')
+        gid = self.add_group(Path(path).name, 'mosaic',
+                             source_path=str(Path(path).resolve()))
         for p in polys:
             fill_qimg, fill_bbox = (None, None)
             if bg_np is not None:
@@ -616,6 +693,15 @@ class MosaicCanvas(QWidget):
                 'orig_fill_qimg': (fill_qimg.copy()
                                    if fill_qimg is not None else None),
                 'orig_fill_bbox': fill_bbox,
+                # Snapshot of the polygon's coords in the SOURCE .mosaic's
+                # local coordinate system (== `points` at load time, before
+                # any translation / scale / vertex-drag). Save Project
+                # stores this and Load Project uses it to re-sample the
+                # bundle's background.png so the fill can be rebuilt
+                # without embedding image bytes in the .mep file.
+                'source_points':  [(float(x), float(y))
+                                   for (x, y) in p['points']],
+                'image_zoom':     1.0,
                 'group_id':  gid,
             })
         self.selected_index = -1
@@ -628,6 +714,7 @@ class MosaicCanvas(QWidget):
             raise ValueError(f"Could not load image: {path}")
         self._push_undo()
         self.canvas_background = pm
+        self.canvas_background_source = str(Path(path).resolve())
         # Reset background offset + scale — a freshly-loaded image
         # starts at world (0, 0) and 1:1, same as a freshly-loaded
         # CSV / mosaic.
@@ -641,6 +728,7 @@ class MosaicCanvas(QWidget):
             return
         self._push_undo()
         self.canvas_background = None
+        self.canvas_background_source = None
         self.bg_offset_x = 0.0
         self.bg_offset_y = 0.0
         self.bg_scale    = 1.0
@@ -653,7 +741,16 @@ class MosaicCanvas(QWidget):
     # Qt/PyQt version changes and doesn't rely on QColor/QImage having
     # working __reduce__ implementations.
     #
-    PROJECT_VERSION = 1
+    # V2 (2026): the .mep no longer embeds any high-resolution image
+    # bytes. Groups store their source_path, polygons store their
+    # source_points (in source-local coords), and the canvas background
+    # stores its source path. Load Project reloads the source files and
+    # rebuilds every fill via build_image_fill (+ optional
+    # warp_fill_piecewise_affine to reach the current shape).
+    # V1 files (with fill_png / orig_fill_png / canvas_background_png)
+    # still open — the loader falls back to the embedded bytes when a
+    # source_path is absent.
+    PROJECT_VERSION = 2
 
     @staticmethod
     def _qcolor_to_tuple(c: QColor) -> tuple:
@@ -680,10 +777,18 @@ class MosaicCanvas(QWidget):
         return qimg if not qimg.isNull() else None
 
     def save_project(self, path: str) -> None:
-        """Serialise the full canvas state to a .mep pickle file:
-        every polygon (points + fill colour + fill image + bbox +
-        group_id), every group's metadata, canvas background, view
-        transform, and grid settings."""
+        """Serialise the canvas state to a .mep pickle file — INFORMATION
+        ONLY. No high-resolution image bytes are stored: instead each
+        group carries its `source_path` (e.g. the .mosaic bundle it was
+        loaded from) and each polygon carries its `source_points` (its
+        outline in that source's local coord system). Load Project
+        reloads the source files and rebuilds every polygon's fill via
+        build_image_fill + warp_fill_piecewise_affine.
+
+        Result: a typical .mep drops from tens of MB (embedded PNG
+        crops) to a few dozen KB (points + metadata), while still
+        round-tripping the full scene provided the source files remain
+        reachable at load time."""
         data = {
             'version': self.PROJECT_VERSION,
             'groups':  [dict(g) for g in self.groups],
@@ -693,7 +798,6 @@ class MosaicCanvas(QWidget):
                     'points':    list(p['points']),
                     'fill_type': p['fill_type'],
                     'color':     self._qcolor_to_tuple(p['color']),
-                    'fill_png':  self._qimage_to_png_bytes(p.get('fill_qimg')),
                     'fill_bbox': p.get('fill_bbox'),
                     # Warp-reference snapshot — needed so vertex-drag
                     # stretches from the stable original geometry
@@ -701,19 +805,24 @@ class MosaicCanvas(QWidget):
                     'orig_points':    (list(p['orig_points'])
                                        if p.get('orig_points') is not None
                                        else None),
-                    'orig_fill_png':  self._qimage_to_png_bytes(
-                        p.get('orig_fill_qimg')
-                    ),
                     'orig_fill_bbox': p.get('orig_fill_bbox'),
                     'image_zoom':     float(p.get('image_zoom', 1.0)),
+                    # source_points: the polygon's outline in its source
+                    # .mosaic bundle's local coord system (== `points`
+                    # at load time). Load Project uses this + the
+                    # group's source_path to re-sample the source
+                    # background and rebuild the fill without any PNG
+                    # bytes in the .mep file. None → polygon has no
+                    # image-fill source (e.g. loaded from CSV).
+                    'source_points':  (list(p['source_points'])
+                                       if p.get('source_points') is not None
+                                       else None),
                     'group_id':  p['group_id'],
                 } for p in self.polygons
             ],
-            'canvas_background_png':
-                self._qimage_to_png_bytes(
-                    self.canvas_background.toImage()
-                    if self.canvas_background is not None else None
-                ),
+            # NB: no canvas_background_png — the bitmap is reloaded from
+            # canvas_background_source at Load Project time.
+            'canvas_background_source': self.canvas_background_source,
             'bg_offset_x': self.bg_offset_x,
             'bg_offset_y': self.bg_offset_y,
             'bg_scale':    self.bg_scale,
@@ -935,9 +1044,20 @@ class MosaicCanvas(QWidget):
 
         return (written, w, h)
 
-    def load_project(self, path: str) -> None:
+    def load_project(self, path: str) -> list[str]:
         """Restore canvas state from a .mep pickle file. Replaces every
-        current layer / background / transform / grid setting."""
+        current layer / background / transform / grid setting.
+
+        For V2 files (info-only), each polygon's fill is rebuilt by
+        re-reading the source .mosaic bundle referenced by its group
+        (`build_image_fill` at the polygon's `source_points`, then
+        `warp_fill_piecewise_affine` to the current shape). V1 files
+        with embedded PNG bytes still load — the bytes are used
+        directly and no source-reload is attempted.
+
+        Returns a list of human-readable warnings (missing source files,
+        polygons that couldn't be reconstructed, etc.). Empty list on a
+        fully-clean load."""
         with open(path, 'rb') as f:
             data = pickle.load(f)
         if not isinstance(data, dict) or 'polygons' not in data:
@@ -950,6 +1070,10 @@ class MosaicCanvas(QWidget):
         self._panning            = False
 
         self.groups         = [dict(g) for g in data.get('groups', [])]
+        # Older files predate group['source_path']; default it in so
+        # downstream code can always .get without a KeyError.
+        for g in self.groups:
+            g.setdefault('source_path', None)
         self._next_group_id = int(
             data.get('next_group_id',
                      max((g['id'] for g in self.groups), default=0) + 1)
@@ -962,6 +1086,9 @@ class MosaicCanvas(QWidget):
                 'fill_type': p.get('fill_type', 'none'),
                 'color':     self._tuple_to_qcolor(p.get('color',
                                                         (0, 0, 0, 0))),
+                # V1 files carry fill_png / orig_fill_png bytes. V2
+                # files omit them; we set None here and let the
+                # source-reload pass below fill them in.
                 'fill_qimg': self._png_bytes_to_qimage(p.get('fill_png')),
                 'fill_bbox': (tuple(p['fill_bbox'])
                               if p.get('fill_bbox') is not None else None),
@@ -976,20 +1103,53 @@ class MosaicCanvas(QWidget):
                                    if p.get('orig_fill_bbox') is not None
                                    else None),
                 'image_zoom': float(p.get('image_zoom', 1.0)),
+                'source_points': ([(float(x), float(y))
+                                   for x, y in p['source_points']]
+                                  if p.get('source_points') is not None
+                                  else None),
                 'group_id':  int(p['group_id']),
             })
         self.polygons = polys
 
         # Canvas background.
-        bg_qimg = self._png_bytes_to_qimage(
-            data.get('canvas_background_png')
+        warnings: list[str] = []
+        self.canvas_background_source = data.get(
+            'canvas_background_source'
         )
-        self.canvas_background = (QPixmap.fromImage(bg_qimg)
-                                  if bg_qimg is not None else None)
+        # V2 path: reload the source file. V1 fallback: use the embedded
+        # PNG bytes if they're there.
+        bg_qimg = None
+        if self.canvas_background_source:
+            src = self.canvas_background_source
+            if Path(src).exists():
+                pm = QPixmap(src)
+                self.canvas_background = pm if not pm.isNull() else None
+                if pm.isNull():
+                    warnings.append(
+                        f"Canvas background: could not decode {src}"
+                    )
+            else:
+                self.canvas_background = None
+                warnings.append(
+                    f"Canvas background source missing: {src}"
+                )
+        else:
+            bg_qimg = self._png_bytes_to_qimage(
+                data.get('canvas_background_png')
+            )
+            self.canvas_background = (QPixmap.fromImage(bg_qimg)
+                                      if bg_qimg is not None else None)
         self.bg_offset_x = float(data.get('bg_offset_x', 0.0))
         self.bg_offset_y = float(data.get('bg_offset_y', 0.0))
         self.bg_scale    = float(data.get('bg_scale',    1.0))
         self.bg_affected = bool (data.get('bg_affected', True))
+
+        # Reconstruct polygon fills from source .mosaic bundles for
+        # every polygon that has (a) a source_points snapshot and (b)
+        # a group whose source_path resolves to an existing file. One
+        # bundle load per unique source path (cached), so a mosaic with
+        # thousands of polygons doesn't re-open the zip per polygon.
+        self._reload_fills_from_sources(warnings)
 
         # View.
         self.zoom_factor = float(data.get('zoom_factor', 1.0))
@@ -1011,6 +1171,109 @@ class MosaicCanvas(QWidget):
         self._undo_stack.clear()
 
         self.update()
+        return warnings
+
+    def _reload_fills_from_sources(self, warnings: list[str]) -> None:
+        """For every polygon whose fill isn't already populated (V2
+        info-only projects), rebuild `fill_qimg` / `orig_fill_qimg`
+        by re-reading the group's source .mosaic bundle. The polygon's
+        `source_points` snapshot (in source-local coords) picks the
+        crop; `warp_fill_piecewise_affine` maps it back to the world
+        `orig_points` and then to the current `points` shape.
+
+        One bundle per unique `source_path` — cached in a local dict
+        so a mosaic with thousands of polygons re-reads the zip once.
+        Missing / unreadable sources are appended to `warnings`."""
+        groups_by_id = {g['id']: g for g in self.groups}
+        cache: dict = {}       # source_path -> bg_np (numpy) or False
+        missing_reported: set = set()
+
+        for poly in self.polygons:
+            # Already has an image fill (V1 embedded bytes, or built
+            # elsewhere) → nothing to do.
+            if poly.get('fill_qimg') is not None:
+                continue
+            if poly.get('fill_type') != 'image':
+                continue
+            src_pts = poly.get('source_points')
+            if not src_pts or len(src_pts) < 3:
+                continue
+
+            g = groups_by_id.get(poly.get('group_id'))
+            if g is None:
+                continue
+            src_path = g.get('source_path')
+            if not src_path:
+                continue
+
+            bg_np = cache.get(src_path)
+            if bg_np is None:
+                if not Path(src_path).exists():
+                    if src_path not in missing_reported:
+                        warnings.append(
+                            f"Source missing: {src_path} — polygons "
+                            f"from group '{g.get('name', '?')}' will "
+                            f"load without fills."
+                        )
+                        missing_reported.add(src_path)
+                    cache[src_path] = False
+                    continue
+                try:
+                    _polys, bg_np = load_mosaic_bundle(src_path)
+                except Exception as e:
+                    warnings.append(
+                        f"Source unreadable: {src_path} ({e})"
+                    )
+                    cache[src_path] = False
+                    continue
+                if bg_np is None:
+                    warnings.append(
+                        f"Source has no background.png: {src_path}"
+                    )
+                    cache[src_path] = False
+                    continue
+                cache[src_path] = bg_np
+
+            if bg_np is False:
+                continue
+
+            # Sample the source at source_points → orig-quality fill in
+            # source-local coords.
+            src_fill_qimg, src_fill_bbox = build_image_fill(src_pts, bg_np)
+            if src_fill_qimg is None:
+                continue
+
+            # Warp source → orig_points (current world-space "resting"
+            # shape). If the group has never been transformed, orig_points
+            # equals source_points and the warp is essentially a copy.
+            orig_pts = poly.get('orig_points') or list(poly['points'])
+            orig_fill_qimg, orig_fill_bbox = warp_fill_piecewise_affine(
+                src_fill_qimg, src_fill_bbox, src_pts, orig_pts,
+            )
+            if orig_fill_qimg is None:
+                # Warp degenerate — fall back to the source crop as-is;
+                # it'll sit at the source coord and at least the pixels
+                # exist.
+                orig_fill_qimg, orig_fill_bbox = src_fill_qimg, src_fill_bbox
+
+            poly['orig_fill_qimg'] = orig_fill_qimg
+            poly['orig_fill_bbox'] = orig_fill_bbox
+
+            # Warp orig → current shape. If they match, no warp needed.
+            cur_pts = poly['points']
+            if list(cur_pts) == list(orig_pts):
+                poly['fill_qimg'] = orig_fill_qimg.copy()
+                poly['fill_bbox'] = orig_fill_bbox
+            else:
+                new_qimg, new_bbox = warp_fill_piecewise_affine(
+                    orig_fill_qimg, orig_fill_bbox, orig_pts, cur_pts,
+                )
+                if new_qimg is None:
+                    poly['fill_qimg'] = orig_fill_qimg.copy()
+                    poly['fill_bbox'] = orig_fill_bbox
+                else:
+                    poly['fill_qimg'] = new_qimg
+                    poly['fill_bbox'] = new_bbox
 
     # ── undo ─────────────────────────────────────────────────────────
     def _snapshot_state(self) -> dict:
@@ -1209,13 +1472,18 @@ class MosaicCanvas(QWidget):
             painter.drawPolygon(qpoly)
         # 'none' → nothing filled
 
-        # Outline (thicker + red when selected)
+        # Outline (thicker + red when selected). Skipped entirely when
+        # `show_polygon_lines` is off — unless the polygon is the
+        # selected one, whose red outline is always drawn so the user
+        # can still see what they're editing.
         if i == self.selected_index:
             painter.setPen(QPen(QColor(255, 30, 30), 3))
-        else:
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPolygon(qpoly)
+        elif self.show_polygon_lines:
             painter.setPen(QPen(QColor(0, 0, 0), 1))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawPolygon(qpoly)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPolygon(qpoly)
 
         # Control-point handles for the SELECTED polygon: small yellow
         # squares at each vertex so the user can grab and drag them
@@ -2027,6 +2295,31 @@ class MosaicEditorWindow(QMainWindow):
         row.addWidget(self.apply_scale_btn)
         sb.addLayout(row)
 
+        # Scale All Polygons (%) — RELATIVE multiplier applied to every
+        # polygon around ITS OWN centroid. Ignores the ⇢ affected
+        # checkboxes and doesn't touch the per-group applied_scale.
+        # 110 = each polygon grows 10 % about its own centre.
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Scale All:"))
+        self.scale_all_spin = QDoubleSpinBox()
+        self.scale_all_spin.setRange(0.1, 10000.0)
+        self.scale_all_spin.setDecimals(1)
+        self.scale_all_spin.setSingleStep(1.0)
+        self.scale_all_spin.setValue(100.0)
+        self.scale_all_spin.setSuffix(" %")
+        self.scale_all_spin.setToolTip(
+            "Scale EVERY polygon around its own centroid by this "
+            "percentage. Relative multiplier — 110 grows by 10 %, "
+            "90 shrinks by 10 %, 100 is a no-op. Ignores the ⇢ "
+            "affected checkboxes."
+        )
+        row.addWidget(self.scale_all_spin)
+        self.apply_scale_all_btn = QPushButton("Apply")
+        self.apply_scale_all_btn.setFixedWidth(60)
+        self.apply_scale_all_btn.clicked.connect(self.on_apply_scale_all)
+        row.addWidget(self.apply_scale_all_btn)
+        sb.addLayout(row)
+
         # Edit — erase affected layers + undo.
         # "Erase Affected" wipes every polygon whose layer has ⇢
         # (affected) ticked, then removes those layer entries too.
@@ -2052,6 +2345,17 @@ class MosaicEditorWindow(QMainWindow):
         sb.addLayout(row)
 
         sb.addSpacing(8)
+        sb.addWidget(self._section_label("View"))
+        self.polygon_lines_cb = QCheckBox("Show polygon lines")
+        self.polygon_lines_cb.setChecked(self.canvas.show_polygon_lines)
+        self.polygon_lines_cb.setToolTip(
+            "Toggle the black polygon outlines. Off = filled shapes only "
+            "(as it would look printed). The selected polygon's red "
+            "outline stays visible either way."
+        )
+        self.polygon_lines_cb.toggled.connect(self.on_polygon_lines_toggled)
+        sb.addWidget(self.polygon_lines_cb)
+
         sb.addWidget(self._section_label("Grid"))
         self.grid_cb = QCheckBox("Show grid")
         self.grid_cb.toggled.connect(self.on_grid_toggled)
@@ -2296,6 +2600,17 @@ class MosaicEditorWindow(QMainWindow):
         """Scale every affected element by the sidebar's percentage."""
         pct = float(self.scale_spin.value())
         self.canvas.scale_affected(pct)
+
+    def on_apply_scale_all(self) -> None:
+        """Scale EVERY polygon around its own centroid by the Scale All
+        spinbox's percentage. Ignores affected / group state."""
+        pct = float(self.scale_all_spin.value())
+        n = self.canvas.scale_all_polygons_individual(pct)
+        if n:
+            self.statusBar().showMessage(
+                f"Scaled {n} polygon(s) to {pct:g} % around their own "
+                f"centres."
+            )
 
     # ── Save Tile Image chain ─────────────────────────────────────────
     # Multi-step flow triggered by the right-toolbar "Save Tile Image"
@@ -3148,13 +3463,18 @@ class MosaicEditorWindow(QMainWindow):
         if not path:
             return
         try:
-            self.canvas.load_project(path)
+            warnings = self.canvas.load_project(path) or []
         except Exception as e:
             QMessageBox.critical(
                 self, "Load Project",
                 f"Failed to load project: {type(e).__name__}: {e}"
             )
             return
+        if warnings:
+            QMessageBox.warning(
+                self, "Load Project — partial",
+                "Loaded, but with warnings:\n\n" + "\n".join(warnings),
+            )
         # Sync sidebar widgets to the newly-loaded canvas state so the
         # spinboxes / checkbox positions don't disagree with the canvas.
         self.grid_cb.blockSignals(True)
@@ -3183,6 +3503,10 @@ class MosaicEditorWindow(QMainWindow):
 
     def on_grid_toggled(self, checked: bool) -> None:
         self.canvas.grid_enabled = checked
+        self.canvas.update()
+
+    def on_polygon_lines_toggled(self, checked: bool) -> None:
+        self.canvas.show_polygon_lines = bool(checked)
         self.canvas.update()
 
     def on_grid_size_changed(self, v: float) -> None:

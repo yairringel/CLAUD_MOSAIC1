@@ -12,6 +12,7 @@ Later passes will add element placement, drag-and-drop, etc.
 import sys
 import json
 import re
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -19,11 +20,45 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFrame, QLabel, QSpinBox, QPushButton, QScrollArea, QFileDialog,
+    QCheckBox, QMessageBox,
 )
-from PyQt5.QtCore import Qt, QRectF
+from PyQt5.QtCore import Qt, QRectF, QBuffer, QByteArray, QIODevice
 from PyQt5.QtGui import (
     QPainter, QPen, QColor, QBrush, QPixmap, QImage,
 )
+
+PROJECT_EXT = ".aranger"
+PROJECT_VERSION = 1
+
+
+def _pixmap_to_png_bytes(pm: QPixmap) -> bytes:
+    """Serialize a QPixmap losslessly as PNG bytes. Returns b'' if the
+    pixmap is null or the encoder fails — the caller can then skip that
+    tile at save time and warn at load time."""
+    if pm is None or pm.isNull():
+        return b""
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.WriteOnly)
+    try:
+        if not pm.save(buf, "PNG"):
+            return b""
+    finally:
+        buf.close()
+    return bytes(ba)
+
+
+def _pixmap_from_png_bytes(data: bytes) -> QPixmap | None:
+    """Rebuild a QPixmap from PNG bytes. Returns None on empty/invalid
+    data so the caller can skip the tile rather than crashing."""
+    if not data:
+        return None
+    pm = QPixmap()
+    if not pm.loadFromData(data, "PNG"):
+        return None
+    if pm.isNull():
+        return None
+    return pm
 
 
 class ArrangerCanvas(QWidget):
@@ -58,6 +93,9 @@ class ArrangerCanvas(QWidget):
         # scripts (image_strech / mosaic_editor).
         self._grid_color     = QColor(255, 105, 180)
         self._grid_thickness = 2
+        # When False, paintEvent skips the grid overlay entirely (both
+        # the pre-tile and post-tile passes). Toggled from the sidebar.
+        self.show_grid = True
 
         # Tile placement state.
         #   pending_tile: single tile armed for placement — clicking a
@@ -74,6 +112,22 @@ class ArrangerCanvas(QWidget):
         self.pending_tile:  dict | None  = None
         self.pending_batch: list[dict] | None = None
         self.placed_tiles: list[dict]    = []
+
+        # Select-and-move state. When nothing is armed for placement,
+        # clicking a cell that already holds a placed tile SELECTS the
+        # topmost one there; the next click on any grid cell moves it.
+        # ESC (or clicking the same cell twice) clears the selection.
+        self.selected_placed_index: int = -1
+
+        # Widget needs keyboard focus for the ESC-to-release shortcut.
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def set_show_grid(self, on: bool) -> None:
+        on = bool(on)
+        if on == self.show_grid:
+            return
+        self.show_grid = on
+        self.update()
 
     def set_grid_dims(self, cols: int, rows: int) -> None:
         cols = max(self.MIN_DIM, min(self.MAX_DIM, int(cols)))
@@ -119,17 +173,18 @@ class ArrangerCanvas(QWidget):
         pen.setCosmetic(True)
         painter.setPen(pen)
 
-        # Vertical lines (cols + 1 of them, including outer borders).
-        for i in range(cols + 1):
-            x = ox + i * cell
-            painter.drawLine(int(x), int(oy),
-                             int(x), int(oy + grid_h))
+        if self.show_grid:
+            # Vertical lines (cols + 1 of them, including outer borders).
+            for i in range(cols + 1):
+                x = ox + i * cell
+                painter.drawLine(int(x), int(oy),
+                                 int(x), int(oy + grid_h))
 
-        # Horizontal lines (rows + 1).
-        for j in range(rows + 1):
-            y = oy + j * cell
-            painter.drawLine(int(ox),          int(y),
-                             int(ox + grid_w), int(y))
+            # Horizontal lines (rows + 1).
+            for j in range(rows + 1):
+                y = oy + j * cell
+                painter.drawLine(int(ox),          int(y),
+                                 int(ox + grid_w), int(y))
 
         # ── Placed tiles ──────────────────────────────────────────
         # Draw each dropped tile using its box-corner metadata: the
@@ -139,18 +194,32 @@ class ArrangerCanvas(QWidget):
         for tile in self.placed_tiles:
             self._paint_placed_tile(painter, tile, cell, ox, oy)
 
+        # ── Selection highlight ─────────────────────────────────────
+        # Cyan cosmetic border around the selected placed tile's cell,
+        # drawn after the tiles so it's visible on top of the image.
+        if 0 <= self.selected_placed_index < len(self.placed_tiles):
+            sel = self.placed_tiles[self.selected_placed_index]
+            sel_pen = QPen(QColor(0, 200, 255), 3)
+            sel_pen.setCosmetic(True)
+            painter.setPen(sel_pen)
+            painter.setBrush(Qt.NoBrush)
+            sx = ox + sel['col'] * cell
+            sy = oy + sel['row'] * cell
+            painter.drawRect(QRectF(sx, sy, cell, cell))
+
         # The grid lines below have already been drawn UNDER the tiles.
         # Draw them again on top so the grid stays visible over the
         # dropped tiles too — nice for alignment.
-        painter.setPen(pen)
-        for i in range(cols + 1):
-            x = ox + i * cell
-            painter.drawLine(int(x), int(oy),
-                             int(x), int(oy + grid_h))
-        for j in range(rows + 1):
-            y = oy + j * cell
-            painter.drawLine(int(ox),          int(y),
-                             int(ox + grid_w), int(y))
+        if self.show_grid:
+            painter.setPen(pen)
+            for i in range(cols + 1):
+                x = ox + i * cell
+                painter.drawLine(int(x), int(oy),
+                                 int(x), int(oy + grid_h))
+            for j in range(rows + 1):
+                y = oy + j * cell
+                painter.drawLine(int(ox),          int(y),
+                                 int(ox + grid_w), int(y))
         painter.end()
 
     @staticmethod
@@ -252,11 +321,14 @@ class ArrangerCanvas(QWidget):
 
     # ── tile placement ────────────────────────────────────────────────
     def arm_tile(self, pixmap: QPixmap, corners_px, label: str = "") -> None:
-        """Arm a SINGLE tile for placement. Clears any pending batch."""
+        """Arm a SINGLE tile for placement. Clears any pending batch
+        and any current placed-tile selection (mutually exclusive)."""
         self.pending_batch = None
+        self.selected_placed_index = -1
         if pixmap is None or pixmap.isNull():
             self.pending_tile = None
             self.setCursor(Qt.ArrowCursor)
+            self.update()
             return
         self.pending_tile = {
             'pixmap':     pixmap,
@@ -264,26 +336,52 @@ class ArrangerCanvas(QWidget):
             'label':      label,
         }
         self.setCursor(Qt.CrossCursor)
+        self.update()
 
     def arm_batch(self, items: list) -> None:
         """Arm a BATCH placement — the next canvas click drops every
         item at (target_row + item['dr'], target_col + item['dc']).
         Each item is a dict with keys: pixmap, corners_px, dr, dc,
-        label. Clears any pending single tile."""
+        label. Clears any pending single tile and any current
+        placed-tile selection."""
         self.pending_tile = None
+        self.selected_placed_index = -1
         if not items:
             self.pending_batch = None
             self.setCursor(Qt.ArrowCursor)
+            self.update()
             return
         self.pending_batch = list(items)
         self.setCursor(Qt.CrossCursor)
+        self.update()
 
     def clear_pending_tile(self) -> None:
         self.pending_tile  = None
         self.pending_batch = None
         self.setCursor(Qt.ArrowCursor)
 
+    def keyPressEvent(self, ev):
+        """ESC releases: clears any pending placement AND any current
+        placed-tile selection. Other keys fall through to the default
+        handler."""
+        if ev.key() == Qt.Key_Escape:
+            changed = (self.pending_tile is not None
+                       or self.pending_batch is not None
+                       or self.selected_placed_index != -1)
+            self.pending_tile  = None
+            self.pending_batch = None
+            self.selected_placed_index = -1
+            self.setCursor(Qt.ArrowCursor)
+            if changed:
+                self.update()
+            return
+        super().keyPressEvent(ev)
+
     def mousePressEvent(self, ev):
+        # Ensure the widget has keyboard focus after any click so the
+        # ESC-to-release shortcut works right away.
+        self.setFocus(Qt.MouseFocusReason)
+
         if ev.button() != Qt.LeftButton:
             return
         rc = self._cell_from_screen(ev.x(), ev.y())
@@ -314,6 +412,33 @@ class ArrangerCanvas(QWidget):
             })
             # Keep armed so the user can drop copies rapidly.
             self.update()
+            return
+
+        # ── select-and-move (no placement armed) ───────────────────
+        # If a tile is already selected, this click moves it to the
+        # clicked cell then RELEASES the selection. Same-cell click on
+        # a selected tile just deselects. Otherwise, pick the topmost
+        # placed tile sitting on the clicked cell and select it.
+        if 0 <= self.selected_placed_index < len(self.placed_tiles):
+            tile = self.placed_tiles[self.selected_placed_index]
+            if not (tile['row'] == row and tile['col'] == col):
+                tile['row'] = row
+                tile['col'] = col
+            # Either way (moved or same-cell), the paste is done → release.
+            self.selected_placed_index = -1
+            self.update()
+            return
+
+        # Nothing selected → try to pick the top tile at this cell.
+        # Iterate in REVERSE so the last-drawn (visually topmost) tile
+        # wins when several were dropped on the same cell.
+        for idx in range(len(self.placed_tiles) - 1, -1, -1):
+            t = self.placed_tiles[idx]
+            if t['row'] == row and t['col'] == col:
+                self.selected_placed_index = idx
+                self.update()
+                return
+        # Empty cell click — nothing to do.
 
 
 class SidePanel(QFrame):
@@ -321,9 +446,10 @@ class SidePanel(QFrame):
     down arrows). Set up so more sections can be appended above the
     trailing addStretch()."""
 
-    def __init__(self, canvas: ArrangerCanvas, parent=None):
+    def __init__(self, canvas: ArrangerCanvas, window=None, parent=None):
         super().__init__(parent)
         self.canvas = canvas
+        self.window_ref = window   # MosaicArrangerWindow for save/load
         self.setFrameStyle(QFrame.StyledPanel)
         self.setMinimumWidth(200)
         self.setMaximumWidth(240)
@@ -332,6 +458,26 @@ class SidePanel(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
+        # ── Project section ───────────────────────────────────────────
+        # Save / Load buttons at the very top so they're always in a
+        # predictable spot regardless of what other sections grow below.
+        layout.addWidget(self._section_label("Project"))
+
+        self.save_btn = QPushButton("Save Project")
+        self.save_btn.setToolTip(
+            f"Save grid dims, view state, and every placed tile "
+            f"(image + label + cell) to a *{PROJECT_EXT} file."
+        )
+        self.save_btn.clicked.connect(self._on_save_project)
+        layout.addWidget(self.save_btn)
+
+        self.load_btn = QPushButton("Load Project")
+        self.load_btn.setToolTip(
+            f"Load a *{PROJECT_EXT} file. REPLACES the current arrangement."
+        )
+        self.load_btn.clicked.connect(self._on_load_project)
+        layout.addWidget(self.load_btn)
 
         # ── Grid section ──────────────────────────────────────────────
         # Two direct-input spinboxes for the grid's column × row count.
@@ -365,6 +511,17 @@ class SidePanel(QFrame):
         row.addWidget(self.rows_spin)
         layout.addLayout(row)
 
+        # Show / hide the pink grid overlay. On by default, matches
+        # ArrangerCanvas.show_grid so the checkbox reads correctly.
+        self.show_grid_chk = QCheckBox("Show Grid")
+        self.show_grid_chk.setChecked(canvas.show_grid)
+        self.show_grid_chk.setToolTip(
+            "Toggle the pink grid overlay. Off = plain canvas + placed "
+            "tiles only (grid still exists; tiles still snap to cells)."
+        )
+        self.show_grid_chk.toggled.connect(self.canvas.set_show_grid)
+        layout.addWidget(self.show_grid_chk)
+
         layout.addStretch(1)
 
     # ── helpers ───────────────────────────────────────────────────────
@@ -379,6 +536,57 @@ class SidePanel(QFrame):
             self.cols_spin.value(),
             self.rows_spin.value(),
         )
+
+    # ── project save / load ──────────────────────────────────────────
+    def _on_save_project(self) -> None:
+        w = self.window_ref
+        if w is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Project", "",
+            f"Arranger Project (*{PROJECT_EXT})",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(PROJECT_EXT):
+            path += PROJECT_EXT
+        try:
+            w.save_project(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+            return
+
+    def _on_load_project(self) -> None:
+        w = self.window_ref
+        if w is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Project", "",
+            f"Arranger Project (*{PROJECT_EXT})",
+        )
+        if not path:
+            return
+        try:
+            skipped = w.load_project(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Load failed", str(e))
+            return
+        # Reflect the newly-loaded canvas state in the sidebar widgets.
+        self.cols_spin.blockSignals(True)
+        self.rows_spin.blockSignals(True)
+        self.show_grid_chk.blockSignals(True)
+        self.cols_spin.setValue(self.canvas.grid_cols)
+        self.rows_spin.setValue(self.canvas.grid_rows)
+        self.show_grid_chk.setChecked(self.canvas.show_grid)
+        self.cols_spin.blockSignals(False)
+        self.rows_spin.blockSignals(False)
+        self.show_grid_chk.blockSignals(False)
+        if skipped:
+            QMessageBox.warning(
+                self, "Load complete",
+                f"Loaded, but skipped {skipped} tile(s) whose "
+                "image bytes were missing or unreadable.",
+            )
 
 
 class ClickableFrame(QFrame):
@@ -799,12 +1007,88 @@ class MosaicArrangerWindow(QMainWindow):
         main.setContentsMargins(8, 8, 8, 8)
 
         self.canvas = ArrangerCanvas()
-        self.sidebar = SidePanel(self.canvas)
+        self.sidebar = SidePanel(self.canvas, window=self)
         self.tiles_panel = TilesPanel(self.canvas)
 
         main.addWidget(self.sidebar)
         main.addWidget(self.canvas, 1)   # canvas gets the stretch
         main.addWidget(self.tiles_panel)
+
+    # ── project save / load ─────────────────────────────────────────
+    def save_project(self, path: str) -> None:
+        """Serialize grid dims, view state, and every placed tile
+        (PNG bytes + label + cell) to `path`. Raises on I/O failure."""
+        tiles_out = []
+        for tile in self.canvas.placed_tiles:
+            png = _pixmap_to_png_bytes(tile.get('pixmap'))
+            if not png:
+                # Skip tiles we can't encode instead of aborting the
+                # whole save — the rest of the arrangement is worth
+                # keeping.
+                continue
+            tiles_out.append({
+                'png':        png,
+                'corners_px': tile.get('corners_px'),
+                'label':      tile.get('label', ''),
+                'row':        int(tile.get('row', 0)),
+                'col':        int(tile.get('col', 0)),
+            })
+
+        payload = {
+            'version':   PROJECT_VERSION,
+            'grid_cols': self.canvas.grid_cols,
+            'grid_rows': self.canvas.grid_rows,
+            'show_grid': self.canvas.show_grid,
+            'zoom':      self.canvas.zoom_factor,
+            'pan_x':     self.canvas.pan_x,
+            'pan_y':     self.canvas.pan_y,
+            'tiles':     tiles_out,
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load_project(self, path: str) -> int:
+        """Load a project from `path`, REPLACING the current arrangement.
+        Returns the number of tiles skipped (bad/missing PNG bytes)."""
+        with open(path, 'rb') as f:
+            payload = pickle.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError("Not an arranger project file.")
+        version = payload.get('version', 0)
+        if version > PROJECT_VERSION:
+            raise ValueError(
+                f"Project file version {version} is newer than this "
+                f"arranger (max supported: {PROJECT_VERSION})."
+            )
+
+        cols = int(payload.get('grid_cols', self.canvas.DEFAULT_COLS))
+        rows = int(payload.get('grid_rows', self.canvas.DEFAULT_ROWS))
+        self.canvas.set_grid_dims(cols, rows)
+        self.canvas.set_show_grid(bool(payload.get('show_grid', True)))
+        self.canvas.zoom_factor = float(payload.get('zoom', 1.0))
+        self.canvas.pan_x       = float(payload.get('pan_x', 0.0))
+        self.canvas.pan_y       = float(payload.get('pan_y', 0.0))
+
+        new_tiles = []
+        skipped   = 0
+        for t in payload.get('tiles', []):
+            pm = _pixmap_from_png_bytes(t.get('png', b""))
+            if pm is None:
+                skipped += 1
+                continue
+            new_tiles.append({
+                'pixmap':     pm,
+                'corners_px': t.get('corners_px'),
+                'label':      t.get('label', ''),
+                'row':        int(t.get('row', 0)),
+                'col':        int(t.get('col', 0)),
+            })
+        self.canvas.placed_tiles = new_tiles
+        self.canvas.clear_pending_tile()
+        # Fresh scene → no placed-tile selection carried over.
+        self.canvas.selected_placed_index = -1
+        self.canvas.update()
+        return skipped
 
 
 def main():
