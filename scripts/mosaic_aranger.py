@@ -22,43 +22,19 @@ from PyQt5.QtWidgets import (
     QFrame, QLabel, QSpinBox, QPushButton, QScrollArea, QFileDialog,
     QCheckBox, QMessageBox,
 )
-from PyQt5.QtCore import Qt, QRectF, QBuffer, QByteArray, QIODevice
+from PyQt5.QtCore import Qt, QRectF
 from PyQt5.QtGui import (
     QPainter, QPen, QColor, QBrush, QPixmap, QImage,
 )
 
 PROJECT_EXT = ".aranger"
-PROJECT_VERSION = 1
-
-
-def _pixmap_to_png_bytes(pm: QPixmap) -> bytes:
-    """Serialize a QPixmap losslessly as PNG bytes. Returns b'' if the
-    pixmap is null or the encoder fails — the caller can then skip that
-    tile at save time and warn at load time."""
-    if pm is None or pm.isNull():
-        return b""
-    ba = QByteArray()
-    buf = QBuffer(ba)
-    buf.open(QIODevice.WriteOnly)
-    try:
-        if not pm.save(buf, "PNG"):
-            return b""
-    finally:
-        buf.close()
-    return bytes(ba)
-
-
-def _pixmap_from_png_bytes(data: bytes) -> QPixmap | None:
-    """Rebuild a QPixmap from PNG bytes. Returns None on empty/invalid
-    data so the caller can skip the tile rather than crashing."""
-    if not data:
-        return None
-    pm = QPixmap()
-    if not pm.loadFromData(data, "PNG"):
-        return None
-    if pm.isNull():
-        return None
-    return pm
+# V2 (2026): the .aranger file stores INFORMATION ONLY — grid dims,
+# view state, and per-placed-tile (source_path, corners_px, label,
+# row, col). No image bytes. Load Project re-reads each PNG from
+# disk (and re-applies the white-transparent transform). V1 (which
+# embedded PNG bytes) still opens via a fallback branch in the
+# loader; the resulting resave will drop the embedded bytes.
+PROJECT_VERSION = 2
 
 
 class ArrangerCanvas(QWidget):
@@ -320,9 +296,15 @@ class ArrangerCanvas(QWidget):
         return (row, col)
 
     # ── tile placement ────────────────────────────────────────────────
-    def arm_tile(self, pixmap: QPixmap, corners_px, label: str = "") -> None:
+    def arm_tile(self, pixmap: QPixmap, corners_px, label: str = "",
+                 source_path: str | None = None) -> None:
         """Arm a SINGLE tile for placement. Clears any pending batch
-        and any current placed-tile selection (mutually exclusive)."""
+        and any current placed-tile selection (mutually exclusive).
+
+        `source_path` (absolute path to the on-disk PNG) is stashed on
+        the pending tile and propagated to each placed_tiles entry
+        that results from dropping it, so Save Project can round-trip
+        the placement without embedding image bytes."""
         self.pending_batch = None
         self.selected_placed_index = -1
         if pixmap is None or pixmap.isNull():
@@ -331,9 +313,10 @@ class ArrangerCanvas(QWidget):
             self.update()
             return
         self.pending_tile = {
-            'pixmap':     pixmap,
-            'corners_px': corners_px,
-            'label':      label,
+            'pixmap':      pixmap,
+            'corners_px':  corners_px,
+            'label':       label,
+            'source_path': source_path,
         }
         self.setCursor(Qt.CrossCursor)
         self.update()
@@ -393,22 +376,24 @@ class ArrangerCanvas(QWidget):
         if self.pending_batch is not None:
             for item in self.pending_batch:
                 self.placed_tiles.append({
-                    'pixmap':     item['pixmap'],
-                    'corners_px': item.get('corners_px'),
-                    'label':      item.get('label', ''),
-                    'row':        row + int(item.get('dr', 0)),
-                    'col':        col + int(item.get('dc', 0)),
+                    'pixmap':      item['pixmap'],
+                    'corners_px':  item.get('corners_px'),
+                    'label':       item.get('label', ''),
+                    'source_path': item.get('source_path'),
+                    'row':         row + int(item.get('dr', 0)),
+                    'col':         col + int(item.get('dc', 0)),
                 })
             self.update()
             return
 
         if self.pending_tile is not None:
             self.placed_tiles.append({
-                'pixmap':     self.pending_tile['pixmap'],
-                'corners_px': self.pending_tile['corners_px'],
-                'label':      self.pending_tile['label'],
-                'row':        row,
-                'col':        col,
+                'pixmap':      self.pending_tile['pixmap'],
+                'corners_px':  self.pending_tile['corners_px'],
+                'label':       self.pending_tile['label'],
+                'source_path': self.pending_tile.get('source_path'),
+                'row':         row,
+                'col':         col,
             })
             # Keep armed so the user can drop copies rapidly.
             self.update()
@@ -567,7 +552,7 @@ class SidePanel(QFrame):
         if not path:
             return
         try:
-            skipped = w.load_project(path)
+            skipped, warnings = w.load_project(path)
         except Exception as e:
             QMessageBox.critical(self, "Load failed", str(e))
             return
@@ -582,11 +567,16 @@ class SidePanel(QFrame):
         self.rows_spin.blockSignals(False)
         self.show_grid_chk.blockSignals(False)
         if skipped:
-            QMessageBox.warning(
-                self, "Load complete",
-                f"Loaded, but skipped {skipped} tile(s) whose "
-                "image bytes were missing or unreadable.",
-            )
+            body = (f"Loaded, but skipped {skipped} tile(s) whose "
+                    "source PNGs were missing or unreadable.")
+            if warnings:
+                # Cap the listing so a big missing directory doesn't
+                # produce a wall-of-text dialog.
+                shown = warnings[:12]
+                body += "\n\n" + "\n".join(shown)
+                if len(warnings) > len(shown):
+                    body += f"\n… and {len(warnings) - len(shown)} more."
+            QMessageBox.warning(self, "Load complete", body)
 
 
 class ClickableFrame(QFrame):
@@ -839,11 +829,12 @@ class TilesPanel(QFrame):
             pm = self._pixmap_with_white_transparent(pm)
             corners_px = self._read_corners_metadata(p)
             items.append({
-                'pixmap':     pm,
-                'corners_px': corners_px,
-                'dr':         dr,
-                'dc':         dc,
-                'label':      p.stem,
+                'pixmap':      pm,
+                'corners_px':  corners_px,
+                'dr':          dr,
+                'dc':          dc,
+                'label':       p.stem,
+                'source_path': str(Path(p).resolve()),
             })
         if not items:
             return
@@ -915,7 +906,11 @@ class TilesPanel(QFrame):
         pm = QPixmap(str(png_path))
         pm = self._pixmap_with_white_transparent(pm)
         corners_px = self._read_corners_metadata(png_path)
-        self.canvas.arm_tile(pm, corners_px, label=png_path.stem)
+        self.canvas.arm_tile(
+            pm, corners_px,
+            label=png_path.stem,
+            source_path=str(Path(png_path).resolve()),
+        )
 
         # Swap highlight.
         if self._armed_card is not None:
@@ -1016,22 +1011,28 @@ class MosaicArrangerWindow(QMainWindow):
 
     # ── project save / load ─────────────────────────────────────────
     def save_project(self, path: str) -> None:
-        """Serialize grid dims, view state, and every placed tile
-        (PNG bytes + label + cell) to `path`. Raises on I/O failure."""
+        """Serialize grid dims, view state, and every placed tile to
+        `path` — INFORMATION ONLY. Each tile is written as its source
+        PNG's absolute path + `corners_px` metadata + label + cell.
+        No image bytes are embedded, so a typical .aranger file is a
+        few KB regardless of how many tiles were placed.
+
+        Load Project re-reads each source PNG from disk to rebuild the
+        pixmap (and re-applies the white-transparent transform)."""
         tiles_out = []
         for tile in self.canvas.placed_tiles:
-            png = _pixmap_to_png_bytes(tile.get('pixmap'))
-            if not png:
-                # Skip tiles we can't encode instead of aborting the
-                # whole save — the rest of the arrangement is worth
-                # keeping.
+            src = tile.get('source_path')
+            if not src:
+                # Tiles placed before source_path tracking existed have
+                # no on-disk origin we can point at — skip rather than
+                # silently invent one.
                 continue
             tiles_out.append({
-                'png':        png,
-                'corners_px': tile.get('corners_px'),
-                'label':      tile.get('label', ''),
-                'row':        int(tile.get('row', 0)),
-                'col':        int(tile.get('col', 0)),
+                'source_path': str(src),
+                'corners_px':  tile.get('corners_px'),
+                'label':       tile.get('label', ''),
+                'row':         int(tile.get('row', 0)),
+                'col':         int(tile.get('col', 0)),
             })
 
         payload = {
@@ -1047,9 +1048,12 @@ class MosaicArrangerWindow(QMainWindow):
         with open(path, 'wb') as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    def load_project(self, path: str) -> int:
+    def load_project(self, path: str) -> tuple[int, list[str]]:
         """Load a project from `path`, REPLACING the current arrangement.
-        Returns the number of tiles skipped (bad/missing PNG bytes)."""
+
+        Returns `(skipped_count, warnings)`. `skipped_count` is the
+        number of placed tiles that couldn't be rebuilt (missing or
+        unreadable source PNG); `warnings` lists their source paths."""
         with open(path, 'rb') as f:
             payload = pickle.load(f)
         if not isinstance(payload, dict):
@@ -1069,26 +1073,41 @@ class MosaicArrangerWindow(QMainWindow):
         self.canvas.pan_x       = float(payload.get('pan_x', 0.0))
         self.canvas.pan_y       = float(payload.get('pan_y', 0.0))
 
-        new_tiles = []
-        skipped   = 0
+        new_tiles: list[dict] = []
+        warnings: list[str]   = []
+        skipped = 0
         for t in payload.get('tiles', []):
-            pm = _pixmap_from_png_bytes(t.get('png', b""))
-            if pm is None:
+            src = t.get('source_path')
+            if not src:
                 skipped += 1
                 continue
+            if not Path(src).exists():
+                warnings.append(f"Missing tile PNG: {src}")
+                skipped += 1
+                continue
+            pm = QPixmap(str(src))
+            if pm.isNull():
+                warnings.append(f"Unreadable tile PNG: {src}")
+                skipped += 1
+                continue
+            # Same on-load transform as the tiles panel applies to a
+            # freshly-armed tile, so a round-tripped project looks
+            # identical to placing everything again by hand.
+            pm = TilesPanel._pixmap_with_white_transparent(pm)
             new_tiles.append({
-                'pixmap':     pm,
-                'corners_px': t.get('corners_px'),
-                'label':      t.get('label', ''),
-                'row':        int(t.get('row', 0)),
-                'col':        int(t.get('col', 0)),
+                'pixmap':      pm,
+                'corners_px':  t.get('corners_px'),
+                'label':       t.get('label', ''),
+                'source_path': str(src),
+                'row':         int(t.get('row', 0)),
+                'col':         int(t.get('col', 0)),
             })
         self.canvas.placed_tiles = new_tiles
         self.canvas.clear_pending_tile()
         # Fresh scene → no placed-tile selection carried over.
         self.canvas.selected_placed_index = -1
         self.canvas.update()
-        return skipped
+        return skipped, warnings
 
 
 def main():
