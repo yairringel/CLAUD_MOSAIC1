@@ -163,6 +163,16 @@ class Canvas(QWidget):
         self.grid_size = 300  # Size of each individual grid box/cell in world coordinates (increased for 3x3)
         self.grid_offset_x = 0  # Grid offset in world coordinates
         self.grid_offset_y = 0  # Grid offset in world coordinates
+
+        # Origin-pick mode — Load Array uses this to let the user click
+        # a grid intersection that becomes the array's (0, 0) reference.
+        # When active, the next left-click snaps to the nearest grid
+        # intersection, invokes `_origin_pick_callback(wx, wy)` with
+        # the world-space coords of the snap point, and exits the mode.
+        # Doesn't change the project's real origin — only shifts the
+        # polygons being loaded.
+        self.origin_pick_mode = False
+        self._origin_pick_callback = None
         self.grid_dragging = False  # Whether we're dragging the grid
         self.grid_drag_start = None  # Starting point for grid drag
         self.grid_drag_world_start = None  # Starting world coordinates for grid drag
@@ -198,6 +208,33 @@ class Canvas(QWidget):
         screen_x = world_x * self.zoom_factor + self.pan_offset_x
         screen_y = world_y * self.zoom_factor + self.pan_offset_y
         return screen_x, screen_y
+
+    # ── Origin-pick mode (used by Load Array) ────────────────────────
+    def start_origin_pick(self, callback):
+        """Arm origin-pick mode. `callback(world_x, world_y)` fires on
+        the next left-click, snapped to the nearest grid intersection.
+        Doesn't move the project's own (0, 0)."""
+        self.origin_pick_mode = True
+        self._origin_pick_callback = callback
+        # Turn the grid on so the user can see the intersections.
+        self.show_grid = True
+        self.setCursor(Qt.CrossCursor)
+        self.update()
+
+    def cancel_origin_pick(self):
+        self.origin_pick_mode = False
+        self._origin_pick_callback = None
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+
+    def _snap_to_grid_intersection(self, world_x, world_y):
+        """Return the nearest grid intersection in WORLD coords."""
+        gs = max(1e-6, float(self.grid_size))
+        i = round((world_x - self.grid_offset_x) / gs)
+        j = round((world_y - self.grid_offset_y) / gs)
+        return (self.grid_offset_x + i * gs,
+                self.grid_offset_y + j * gs)
+
     
     def set_eraser_mode(self, enabled):
         """Set whether eraser mode is enabled"""
@@ -533,21 +570,24 @@ class Canvas(QWidget):
                 ((box_size, box_size), QColor(173, 216, 230, 255))   # 8th copy - Light blue frame
             ]
             
-            # Create each duplicate with same group ID
+            # Create each duplicate with same group ID.
+            # Copy the original polygon's fill colour onto every copy
+            # so any later Duplicate All / Paint operations round-trip.
+            src_color = original_polygon.get('color') or QColor(0, 0, 0, 0)
             for (offset_x, offset_y), frame_color in offsets_and_colors:
                 duplicate_points = []
                 for point in self.polygon_points:
                     new_x = point[0] + offset_x
                     new_y = point[1] + offset_y
                     duplicate_points.append((new_x, new_y))
-                
+
                 duplicate_polygon = {
                     'points': duplicate_points,
-                    'color': QColor(0, 0, 0, 0),  # Transparent fill
-                    'frame_color': frame_color,   # Colored frame
+                    'color': QColor(src_color),   # copy original fill
+                    'frame_color': frame_color,   # Colored frame (per-copy hint)
                     'group_id': current_group_id  # Same group ID as original
                 }
-                
+
                 self.polygons.append(duplicate_polygon)
         
         # If mandala mode is enabled, create 4 radial copies around center
@@ -1001,7 +1041,27 @@ class Canvas(QWidget):
         """Handle mouse press events"""
         # Ensure canvas has focus for keyboard events
         self.setFocus()
-        
+
+        # Origin-pick mode wins over every other click behaviour: the
+        # first LMB click snaps to the nearest grid intersection, fires
+        # the stored callback, and exits the mode. RMB (or Esc, handled
+        # in keyPressEvent) cancels.
+        if self.origin_pick_mode:
+            if event.button() == Qt.LeftButton:
+                wx, wy = self.screen_to_world(event.x(), event.y())
+                sx, sy = self._snap_to_grid_intersection(wx, wy)
+                cb = self._origin_pick_callback
+                self.origin_pick_mode = False
+                self._origin_pick_callback = None
+                self.setCursor(Qt.ArrowCursor)
+                self.update()
+                if callable(cb):
+                    cb(sx, sy)
+                return
+            if event.button() == Qt.RightButton:
+                self.cancel_origin_pick()
+                return
+
         if event.button() == Qt.LeftButton and self.line_mode:
             # In line mode, left click starts line drawing
             world_x, world_y = self.screen_to_world(event.x(), event.y())
@@ -1523,21 +1583,23 @@ class Canvas(QWidget):
                     ((box_size, box_size), QColor(173, 216, 230, 255))   # 8th copy - Light blue frame
                 ]
                 
-                # Create each duplicate with same group ID
+                # Create each duplicate with same group ID.
+                # Copy the original polygon's fill colour onto every copy.
+                src_color = polygon_data.get('color') or QColor(0, 0, 0, 0)
                 for (offset_x, offset_y), frame_color in offsets_and_colors:
                     duplicate_points = []
                     for point in final_polygon_points:
                         new_x = point[0] + offset_x
                         new_y = point[1] + offset_y
                         duplicate_points.append((new_x, new_y))
-                    
+
                     duplicate_polygon = {
                         'points': duplicate_points,
-                        'color': QColor(0, 0, 0, 0),  # Transparent fill
-                        'frame_color': frame_color,   # Colored frame
+                        'color': QColor(src_color),   # copy original fill
+                        'frame_color': frame_color,   # Colored frame (per-copy hint)
                         'group_id': current_group_id  # Same group ID as original
                     }
-                    
+
                     self.polygons.append(duplicate_polygon)
     
     def create_offset_line(self, smooth_points, spline_data, offset_distance):
@@ -1821,7 +1883,11 @@ class Canvas(QWidget):
         if event.key() == Qt.Key_Escape:
             # Escape key exits all modes except duplicate mode
             modes_changed = False
-            
+
+            if self.origin_pick_mode:
+                self.cancel_origin_pick()
+                modes_changed = True
+
             if self.polygon_mode:
                 self.polygon_mode = False
                 self.polygon_points = []  # Clear any in-progress polygon
@@ -3643,20 +3709,25 @@ class SidePanel(QFrame):
         
         # Create duplicates for each original polygon
         for original_polygon in original_polygons:
+            # Preserve the original polygon's fill color on every copy
+            # so paint work / Cut assignments carry across (the frame
+            # colors still cycle by position — that's the "which copy
+            # am I looking at" hint the button was designed to give).
+            src_color = original_polygon.get('color') or QColor(0, 0, 0, 0)
             for (offset_x, offset_y), frame_color in offsets_and_colors:
                 duplicate_points = []
                 for point in original_polygon['points']:
                     new_x = point[0] + offset_x
                     new_y = point[1] + offset_y
                     duplicate_points.append((new_x, new_y))
-                
+
                 duplicate_polygon = {
                     'points': duplicate_points,
-                    'color': QColor(0, 0, 0, 0),  # Transparent fill
-                    'frame_color': frame_color,   # Colored frame
+                    'color': QColor(src_color),   # copy original fill
+                    'frame_color': frame_color,   # Colored frame (per-copy hint)
                     'group_id': None  # No group ID for manually duplicated polygons
                 }
-                
+
                 self.canvas.polygons.append(duplicate_polygon)
         
         # Update the display
@@ -3831,7 +3902,30 @@ class SidePanel(QFrame):
         if not self.canvas or not self.canvas.polygons:
             QMessageBox.warning(self, "Warning", "No polygons to save.")
             return
-        
+
+        # ── Calibrate grid box size (same UX as image_strech.py) ─────
+        # The current grid box is `self.canvas.grid_size` world units.
+        # Ask what target grid box size the CSV should be scaled to;
+        # every coordinate then gets multiplied by (target / current)
+        # before being written, so downstream tools that expect a
+        # specific box size (e.g. mosaic_studio's target cell) receive
+        # the polygons at the right absolute scale.
+        original_cell_px = max(1.0, float(self.canvas.grid_size))
+        new_cell_px, ok = QInputDialog.getDouble(
+            self,
+            "Calibrate Grid Box Size",
+            f"Current grid box is {original_cell_px:.2f} px.\n"
+            "Enter the target grid box size in pixels.\n"
+            "All coordinates will be scaled by (target / current):",
+            value=round(original_cell_px, 2),
+            min=0.01,
+            max=100000.0,
+            decimals=2,
+        )
+        if not ok:
+            return  # User cancelled the calibration
+        scale = new_cell_px / original_cell_px
+
         # Open file dialog to choose save location
         filename, _ = QFileDialog.getSaveFileName(
             self,
@@ -3839,57 +3933,61 @@ class SidePanel(QFrame):
             "",
             "CSV Files (*.csv);;All Files (*)"
         )
-        
+
         if not filename:
             return  # User cancelled
-        
+
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
-                
+
                 # Write header with frame color support, group ID, and image transform parameters
-                writer.writerow(['polygon_id', 'coordinates', 'color_r', 'color_g', 'color_b', 'color_a', 
+                writer.writerow(['polygon_id', 'coordinates', 'color_r', 'color_g', 'color_b', 'color_a',
                                'frame_r', 'frame_g', 'frame_b', 'frame_a', 'group_id'])
-                
+
                 # Write each polygon
                 for i, polygon_data in enumerate(self.canvas.polygons):
                     points = polygon_data['points']
                     color = polygon_data['color']
                     frame_color = polygon_data.get('frame_color', QColor(0, 0, 0, 255))  # Default to black
                     group_id = polygon_data.get('group_id', '')  # Get group ID if available
-                    
-                    # Convert points to be relative to default grid position (0,0)
-                    # Subtract current grid offset to make coordinates relative to origin
+
+                    # Convert each point to grid-relative coords (subtract
+                    # current grid_offset so grid (0, 0) is the origin),
+                    # then apply the calibration scale so the CSV is in
+                    # target-cell units.
                     adjusted_points = []
                     for x, y in points:
-                        adjusted_x = x - self.canvas.grid_offset_x
-                        adjusted_y = y - self.canvas.grid_offset_y
+                        adjusted_x = (x - self.canvas.grid_offset_x) * scale
+                        adjusted_y = (y - self.canvas.grid_offset_y) * scale
                         adjusted_points.append([float(adjusted_x), float(adjusted_y)])
-                    
+
                     # Convert points to JSON string format
                     coords_json = json.dumps(adjusted_points)
-                    
+
                     # Extract RGBA values (convert from QColor to 0-1 range)
                     r = color.red() / 255.0
                     g = color.green() / 255.0
                     b = color.blue() / 255.0
                     a = color.alpha() / 255.0
-                    
+
                     # Extract frame color RGBA values
                     fr = frame_color.red() / 255.0
                     fg = frame_color.green() / 255.0
                     fb = frame_color.blue() / 255.0
                     fa = frame_color.alpha() / 255.0
-                    
+
                     # Write row with group ID
                     writer.writerow([i, coords_json, r, g, b, a, fr, fg, fb, fa, group_id])
-            
+
             QMessageBox.information(
-                self, 
-                "Success", 
-                f"Saved {len(self.canvas.polygons)} polygons to {filename}"
+                self,
+                "Success",
+                f"Saved {len(self.canvas.polygons)} polygons to {filename}\n"
+                f"Scale factor applied: {scale:.4f}  "
+                f"({original_cell_px:.2f} px → {new_cell_px:.2f} px)"
             )
-            
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save array: {str(e)}")
     
@@ -3925,48 +4023,39 @@ class SidePanel(QFrame):
             scale_factor = max(0.01, min(1000.0, scale_factor))  # Clamp between 1% and 1000%
         except ValueError:
             scale_factor = 1.0  # Default to 100% if invalid input
-        
+
         try:
             polygons = []
-            
+
             with open(filename, 'r', newline='', encoding='utf-8') as csvfile:
                 reader = csv.DictReader(csvfile)
                 for row_num, row in enumerate(reader, 1):
                     try:
                         # Check if this is the image parameters row
                         coords_str = row['coordinates'] if 'coordinates' in row else row.get('polygon_coords', '')
-                        
+
                         # Skip rows with empty coordinates or special parameter rows
                         if not coords_str or coords_str.strip() == '' or coords_str in ['IMAGE_PARAMS', 'GRID_PARAMS']:
                             continue
-                        
+
                         # Parse coordinates - handle JSON array format
                         # Remove quotes and parse as JSON
                         coords_str = coords_str.strip('"\'')
-                        
+
                         try:
                             coord_list = json.loads(coords_str)
-                            # Convert loaded coordinates to current grid position and apply scale
-                            # Add current grid offset to make coordinates match current grid
-                            points = []
-                            for point in coord_list:
-                                scaled_x = float(point[0]) * scale_factor
-                                scaled_y = float(point[1]) * scale_factor
-                                adjusted_x = scaled_x + self.canvas.grid_offset_x
-                                adjusted_y = scaled_y + self.canvas.grid_offset_y
-                                points.append((adjusted_x, adjusted_y))
+                            # Apply scale only for now — the caller will
+                            # translate by the origin-pick offset below.
+                            points = [(float(p[0]) * scale_factor,
+                                       float(p[1]) * scale_factor)
+                                      for p in coord_list]
                         except:
                             # Fallback to ast parsing for backward compatibility
                             import ast
                             coord_list = ast.literal_eval(coords_str)
-                            # Convert loaded coordinates to current grid position and apply scale
-                            points = []
-                            for point in coord_list:
-                                scaled_x = float(point[0]) * scale_factor
-                                scaled_y = float(point[1]) * scale_factor
-                                adjusted_x = scaled_x + self.canvas.grid_offset_x
-                                adjusted_y = scaled_y + self.canvas.grid_offset_y
-                                points.append((adjusted_x, adjusted_y))
+                            points = [(float(p[0]) * scale_factor,
+                                       float(p[1]) * scale_factor)
+                                      for p in coord_list]
                         
                         if len(points) < 3:
                             continue
@@ -4038,28 +4127,52 @@ class SidePanel(QFrame):
                         print(f"Error parsing row {row_num}: {e}")
                         continue
             
-            if polygons:
+            if not polygons:
+                QMessageBox.warning(self, "Warning", "No valid polygons found in the file.")
+                return
+
+            # ── Origin-pick step ─────────────────────────────────────
+            # Instead of installing the polygons at their raw CSV coords
+            # (which would treat grid (0, 0) as the array's origin),
+            # let the user click a grid intersection that becomes the
+            # array's (0, 0). Every polygon then gets translated by
+            # that snap point. The project's own origin is unchanged.
+            # A short status-bar hint + a QMessageBox tell the user
+            # what to do; ESC / right-click on the canvas cancels.
+            QMessageBox.information(
+                self, "Load Array — pick origin",
+                f"Loaded {len(polygons)} polygons from the CSV.\n\n"
+                "Click a grid intersection on the canvas — it becomes "
+                "the array's (0, 0). Right-click or Esc cancels."
+            )
+
+            def _finalize(snap_x, snap_y):
+                for poly in polygons:
+                    poly['points'] = [(x + snap_x, y + snap_y)
+                                      for (x, y) in poly['points']]
                 # Clear existing polygons and load new ones
                 self.canvas.polygons = polygons
-                
+
                 # Update next_group_id to avoid conflicts with loaded polygons
                 max_group_id = 0
                 for polygon in polygons:
                     group_id = polygon.get('group_id')
                     if group_id is not None and isinstance(group_id, int):
                         max_group_id = max(max_group_id, group_id)
-                
+
                 self.canvas.next_group_id = max_group_id + 1
                 self.canvas.update()
-                
+
                 QMessageBox.information(
-                    self, 
-                    "Success", 
-                    f"Loaded {len(polygons)} polygons from {filename} with {scale_factor*100:.1f}% scale"
+                    self,
+                    "Success",
+                    f"Loaded {len(polygons)} polygons from {filename} "
+                    f"with {scale_factor*100:.1f}% scale, placed at "
+                    f"grid ({snap_x:.1f}, {snap_y:.1f})."
                 )
-            else:
-                QMessageBox.warning(self, "Warning", "No valid polygons found in the file.")
-                
+
+            self.canvas.start_origin_pick(_finalize)
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load array: {str(e)}")
 

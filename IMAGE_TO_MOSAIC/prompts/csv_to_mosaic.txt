@@ -1,46 +1,37 @@
-The supplied image is ALREADY a mosaic — the tiles have been laid out and the tessellation is fixed. Your task is to RE-RENDER this mosaic so it looks like an authentic, real-world ancient Roman mosaic photographed from above, WITHOUT changing which tiles exist or where they sit. This variant emphasises RICH PER-STONE DETAIL: each tile should show clear stone character (veining, grain, mineral inclusions) while still reading as one dominant color from a step or two back.
+The input image is already a mosaic — a synthetic rendering of a polygon-mosaic CSV array (each solid-colour polygon separated by thin dark grout lines is one tile). Re-render it so each tile looks like a real stone tessera photographed from above, WITHOUT changing tile positions, tile shapes, or tile colours. The only change from the input is added stone character on the surface of each tile.
 
-INPUT FORMAT NOTE — the image is a synthetic RENDERING of a polygon-mosaic CSV array (each solid-colour polygon separated by thin dark grout lines is exactly one tessera). Treat every colored polygon in the input as one tile of the final mosaic. The polygon's outline in the input equals the tile's silhouette in the output.
+═══ Rule #1: PRESERVE TILE GEOMETRY EXACTLY ═══
+- Every tile in the input remains a tile in the output at the same position and the same shape. No tile is moved, resized, rotated, split, merged, added, or removed.
+- Tile boundaries line up pixel-for-pixel with the input. The grout lines run in exactly the same places, at the same width. The tile count is identical.
+- If you overlaid the input on the output, every tile boundary would coincide.
 
-═══ Rule #1 (highest priority): PRESERVE THE TILE GEOMETRY EXACTLY ═══
-- Every tile in the input remains a tile in the output at THE SAME POSITION and THE SAME SHAPE. No tile is moved, resized, rotated, split, merged, added, or removed.
-- Tile boundaries in the output must line up pixel-for-pixel with the tile boundaries in the input. The grout lines run in exactly the same places.
-- The number of tiles in the output equals the number of tiles in the input. Same tessellation, same layout.
-- Do NOT resample the mosaic into a different tessellation. Do NOT introduce new subdivisions. Do NOT round-off or smooth the tile edges into a different shape.
-- Self-check: if you overlaid the input on the output, every tile-boundary would coincide. Failing this rule is failing the whole task.
+═══ Rule #2: PRESERVE TILE COLOURS EXACTLY ═══
+- Each output tile's base colour IS the input polygon's fill colour — same hue, same saturation, same lightness. Sample the input pixel and use that. No palette remapping, no hue shifts, no desaturation, no "period-appropriate" pigment substitution.
+- Bright, saturated, synthetic-looking input colours stay bright and saturated in the output. If the input has hot pink, the output has hot pink.
+- Held next to the input, the two mosaics show the SAME colour scheme.
 
-Color palette — RESTRICTED to real Roman mosaic pigments:
-- Use ONLY colors that occur in authentic ancient Roman mosaics: cream / bone white, warm ochre / mustard, terracotta red, oxblood / brick red, burnt sienna, umber / dark brown, olive green, muted teal / slate blue-gray, charcoal / near-black. A very small amount of gold-ochre or muted rust is allowed. Also a few dark near-black glass tesserae for shadow accents.
-- NO fluorescent colors. NO modern synthetic hues (hot pink, neon, saturated magenta, electric blue, lime green, etc.). NO pure primary colors — always dulled and earthy.
-- Every color in the input mosaic maps to the NEAREST authentic pigment. Preserve the input's overall tonal composition (which regions are dark vs light, warm vs cool) — just shift each color to a historically-plausible pigment.
-
-Per-stone realism — richer detail than a plain "solid tile" render:
-- Each tessera is a real physical stone cube seen from above (marble, limestone, travertine, basalt, terracotta, or smalti). It has ALL of the following, applied subtly but visibly:
-  1. **Veining and mineral lines** — most stones (especially the paler ones) show 1–3 fine natural veins running diagonally or curving across the tile face. Veins are a shade or two darker than the tile's base color (never black-on-white; always a natural mineral tone: soft grey on cream, warm brown on ochre, darker slate on blue-grey, etc.). Vein thickness is thin — 1–3 pixels wide at the tile scale. Some veins fade in and out along their length. Not every tile has veins; roughly 40–60 % of the paler tiles do, fewer of the very dark ones.
-  2. **Internal color variation** — a gentle non-uniform gradient or mottling across the tile face (marble veining, travertine grain, limestone speckling). The variation is soft enough that the tile still reads as ONE dominant color from a distance, but at close viewing distance the surface clearly isn't a flat fill.
-  3. **Mineral speckles and inclusions** — a sparse scatter of tiny darker or lighter specks (1–2 pixel dots) on a minority of tiles. Do NOT overdo it: most tiles have 0–3 specks; a few have more. Never a regular pattern.
-  4. **Small edge imperfections** — a chipped corner, a shallow crack, or a slightly worn edge on maybe 15–25 % of tiles. Distribute sparingly; most tiles look clean; a minority show visible wear. Edge chips are small (1–3 pixels) and don't extend into the neighbouring grout enough to change the tile shape.
-  5. **Very light surface grain** — an almost imperceptible stone-grain noise on every tile so no tile looks digitally-flat. NOT a photorealistic scan. NO glossy reflections; the surface is MATTE.
-- Defects and details are per-tile and small; they do NOT extend across tile boundaries and they do NOT break the tile's overall solid color read from a distance.
-- No missing tiles, no gaping holes — the mosaic is intact. Only cosmetic aging on individual tesserae.
-- Reference for the level of stone character wanted: think of a photograph of a fine ancient Roman mosaic where each stone tessera clearly shows its natural marble/limestone grain and one or two thin darker veins, but the mosaic overall still reads as a clean tessellated design — not a chaotic rock-texture soup.
+Stone artifacts (added on top of the preserved base colour):
+- Fine natural veins: 1–3 thin veins (1–3 px wide) drift diagonally or curve across the tile face on roughly half of the tiles. Vein colour is a slightly darker shade of the SAME hue as the tile's base — never a switch to a different hue.
+- Gentle mottling / grain: a soft non-uniform tone across the tile face so it doesn't look like a flat digital fill. Subtle enough that the tile still reads as its input colour from a step or two back.
+- A few sparse specks (1–2 px dots) on some tiles, slightly darker or lighter than the base. Most tiles have none or a couple.
+- Small edge wear on maybe 15–25 % of tiles — a chipped corner or a shallow crack (1–3 px). Does NOT extend into the grout or change the tile's outline.
+- Matte surface, no gloss, no reflections, no highlights on any specific tile.
 
 Grout:
-- Grout occupies the exact same pixels as the boundaries between tiles in the input. Grout color: dark, uniform charcoal-to-near-black (#1a1a1a to #333). Slight color variation is allowed to look natural (a hint of dust or age). Not pale, not beige.
-- Grout width matches the input's grout width. Do NOT widen or narrow the grout lines.
-- Grout lines are continuous — no missing sections, no gaps.
+- Same pixels as the input grout, same width, same layout. Dark, uniform charcoal-to-near-black (#1a1a1a to #333) with a hint of natural variation.
+- Grout lines are continuous — no gaps.
 
-Lighting and camera:
-- Perfectly even, diffuse illumination across the entire mosaic — as if photographed under a soft overhead source or an overcast sky. No hot spots, no directional shadows, no vignetting, no highlights on specific tiles.
-- Strict orthographic top-down view, perpendicular to the floor. No perspective distortion, no tilt.
-- The mosaic fills the frame edge to edge. No border, no surrounding floor, no background.
+Lighting and framing:
+- Perfectly even, diffuse illumination across the whole mosaic. No hot spots, no directional shadows, no vignetting.
+- Strict orthographic top-down view. No perspective, no tilt.
+- The mosaic fills the frame edge to edge. No border, no surrounding background.
 
 Output:
-- Match the input image's aspect ratio and resolution exactly.
-- Sharp, well-defined tile edges where they meet the grout. Rich per-tile detail (veining, mottling, occasional speckles, small chips) but each tile still reads as one dominant color from a distance. Even lighting throughout.
+- Match the input's aspect ratio and resolution exactly.
+- Sharp tile edges against the grout. Subtle per-tile stone artifacts as described. Each tile still clearly reads as its input colour.
 
-Final self-check before emitting:
-- Tile positions and shapes are unchanged from the input.
-- Every color is from the Roman palette above.
-- Individual tiles show clear stone character — most paler tiles have visible thin darker veins; most tiles show subtle mottling; a minority have small edge chips or specks — but each tile still reads as one dominant color from a distance.
-- Lighting is even everywhere; no highlights, no shadows on the surface.
+Final self-check:
+- Tile positions, shapes, and grout are unchanged from the input.
+- Every tile's base colour matches its input polygon's colour — no palette shift.
+- Stone artifacts (veins, mottling, occasional specks, small edge wear) are visible but subtle, and never override the tile's input colour.
+- Lighting is even everywhere.

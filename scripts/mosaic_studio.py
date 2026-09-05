@@ -51,11 +51,43 @@ BOX_COLORS = [
 ]
 _BOX_COLOR_RGB_TO_INDEX = {(c.red(), c.green(), c.blue()): i for i, c in enumerate(BOX_COLORS)}
 
+# Max per-channel drift we still count as "the same" box color. CSV
+# save/load normalises RGB to 0..1 floats (`c.red()/255.0`) and reads
+# them back with `int(x * 255)` — TRUNCATION, not rounding — so a
+# fresh BOX_COLORS entry can come back off by 1 in every channel. Any
+# other operation that touches the color (alpha compositing, a mid-tone
+# blend from a debug overlay) can also drift a few units. All 36
+# BOX_COLORS entries are ≥ ~50 units apart on at least one channel, so
+# a tolerance of 8 easily catches the drift without ever colliding
+# with a genuinely-different palette entry or with the (128,128,128)
+# unassigned gray.
+_BOX_COLOR_MATCH_TOL = 8
+
 
 def color_to_box_index(color: QColor) -> int:
-    """Reverse-lookup a polygon color back to its box index (0..35), or -1 if it
-    doesn't exactly match any of the 36 BOX_COLORS (e.g. unassigned-gray, original-from-CSV)."""
-    return _BOX_COLOR_RGB_TO_INDEX.get((color.red(), color.green(), color.blue()), -1)
+    """Reverse-lookup a polygon color back to its box index (0..35), or
+    -1 if it isn't one of the 36 BOX_COLORS (unassigned gray, an
+    original-from-CSV custom color, etc.).
+
+    Exact-match fast path first, then a tolerant nearest-neighbour
+    scan (max per-channel distance ≤ `_BOX_COLOR_MATCH_TOL`) so a
+    polygon whose color drifted by 1 during a save/load or paint
+    round-trip still lands on its intended box. Without the tolerance,
+    Tiles reports painted stones as "unassigned" and falls back to
+    their geometric dominant-box — which is exactly the bug that
+    leaves painted stones outside their box's closed shape."""
+    r, g, b = color.red(), color.green(), color.blue()
+    idx = _BOX_COLOR_RGB_TO_INDEX.get((r, g, b))
+    if idx is not None:
+        return idx
+    best_idx = -1
+    best_d = _BOX_COLOR_MATCH_TOL + 1
+    for i, c in enumerate(BOX_COLORS):
+        d = max(abs(c.red() - r), abs(c.green() - g), abs(c.blue() - b))
+        if d < best_d:
+            best_d = d
+            best_idx = i
+    return best_idx if best_d <= _BOX_COLOR_MATCH_TOL else -1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -602,11 +634,11 @@ class CutterCanvas(QWidget):
                 # Single Polygon
                 coords = list(polygon.exterior.coords)
                 qt_polygon = QPolygonF()
-                
+
                 for x, y in coords:
                     screen_x, screen_y = self.world_to_screen(x, y)
                     qt_polygon.append(QPointF(screen_x, screen_y))
-                
+
                 # Draw polygon
                 if self.transparent_fill:
                     painter.setBrush(QBrush(Qt.NoBrush))  # No fill, only outline
@@ -614,18 +646,18 @@ class CutterCanvas(QWidget):
                     painter.setBrush(QBrush(color))  # Use original color fill
                 painter.setPen(QPen(edge_color, 2))
                 painter.drawPolygon(qt_polygon)
-                
+
             elif hasattr(polygon, 'geoms'):
                 # MultiPolygon - draw each polygon separately
                 for sub_polygon in polygon.geoms:
                     if hasattr(sub_polygon, 'exterior'):
                         coords = list(sub_polygon.exterior.coords)
                         qt_polygon = QPolygonF()
-                        
+
                         for x, y in coords:
                             screen_x, screen_y = self.world_to_screen(x, y)
                             qt_polygon.append(QPointF(screen_x, screen_y))
-                        
+
                         # Draw polygon
                         if self.transparent_fill:
                             painter.setBrush(QBrush(Qt.NoBrush))  # No fill, only outline
@@ -1824,34 +1856,34 @@ class ControlPanel(QWidget):
         """Handle Tiles button click - create polygons for all grid boxes with content"""
         if not self.canvas or not self.canvas.polygons:
             return
-            
+
         # Check if Cut has been run (we need the box assignments)
         if not hasattr(self.canvas, 'boxes_with_polygons'):
             QMessageBox.warning(self, "Error", "Please run Cut first to assign polygons to grid boxes.")
             return
-        
+
         # Disable Tiles button during processing
         self.tiles_btn.setEnabled(False)
         self.tiles_btn.setText("Processing...")
         # Force UI update to show the disabled state immediately
         QApplication.processEvents()
-        
+
         # Get grid parameters
         cell_size = self.canvas.grid_size
         grid_x = self.canvas.grid_offset_x
         grid_y = self.canvas.grid_offset_y
-        
+
         # Initialize canvas arrays if needed
         if not hasattr(self.canvas, 'polygons'):
             self.canvas.polygons = []
             self.canvas.colors = []
             self.canvas.edge_colors = []
-        
+
         # Count for summary
         total_boxes_processed = 0
         total_unified = 0
         total_subtracted = 0
-        
+
         # Snapshot the input polygons — Tiles appends each newly-created tile back
         # into self.canvas.polygons as it processes boxes, so iterating the live list
         # would let tile polygons slip into the union/subtract logic for later boxes.
@@ -1907,6 +1939,19 @@ class ControlPanel(QWidget):
             
             # Iterate the snapshot, not self.canvas.polygons (which grows during
             # the outer loop as we append tile polygons).
+            #
+            # UNION step (assigned here): a stone whose color says it
+            # belongs to `box_index` gets added regardless of geometric
+            # location — Paint mode routinely puts a stone from box Y's
+            # rectangle into box X's tile, and gating on
+            # `polygon.intersects(X_rect)` would drop those stones back
+            # out of X's closed shape.
+            #
+            # SUBTRACT step (assigned elsewhere): only relevant when a
+            # foreign-box stone actually overlaps THIS box's rectangle,
+            # so keep the intersect / touches guard there — no point
+            # doing a boolean-difference against a polygon that can't
+            # touch us anyway.
             for i, polygon in enumerate(source_polygons):
                 # Color-based assignment (overridable by Paint) instead of geometry.
                 polygon_box_index = polygon_box_assignment[i]
@@ -1919,10 +1964,10 @@ class ControlPanel(QWidget):
                     else:
                         # Polygon overlaps this box's rect but belongs to another box.
                         intersecting_other_polygons.append(polygon)
-            
+
             # Start with the original box polygon
             modified_box_polygon = box_polygon
-            
+
             # First, unify all polygons that were assigned to this box by Cut
             for polygon_to_unify in box_assigned_polygons:
                 try:
@@ -1931,7 +1976,7 @@ class ControlPanel(QWidget):
                 except Exception as unify_e:
                     print(f"Error unifying polygon in box {box_index}: {unify_e}")
                     continue
-            
+
             # Then subtract polygons that intersect this box but are assigned to other boxes
             for polygon_to_subtract in intersecting_other_polygons:
                 try:
@@ -1976,22 +2021,22 @@ class ControlPanel(QWidget):
             print(f"Created tile polygon for box {box_letter}{box_number} (index {box_index})")
             print(f"  - Unified {len(box_assigned_polygons)} assigned polygons")
             print(f"  - Subtracted {len(intersecting_other_polygons)} intersecting polygons")
-        
+
         # Update the display
         self.canvas.update()
-        
+
         # Summary
         print(f"\n=== Tiles Creation Summary ===")
         print(f"Processed {total_boxes_processed} boxes with polygons")
         print(f"Total polygons unified: {total_unified}")
         print(f"Total polygons subtracted: {total_subtracted}")
-        
+
         # Re-enable Tiles button after operation is complete
         self.tiles_btn.setEnabled(True)
         self.tiles_btn.setText("Tiles")
         # Force UI update to show the re-enabled state
         QApplication.processEvents()
-    
+
     def on_save_boxes_clicked(self):
         """Handle Save Boxes button click - save polygons organized by grid boxes"""
         if not self.canvas or not self.canvas.polygons or not hasattr(self.canvas, 'boxes_with_polygons'):

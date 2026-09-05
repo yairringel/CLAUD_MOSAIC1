@@ -2258,6 +2258,19 @@ class MainWindow(QMainWindow):
             gox = float(self.canvas.grid_offset_x)
             goy = float(self.canvas.grid_offset_y)
 
+            # Compute the source's grid-box size in image pixels. Every
+            # polygon coordinate is then divided by these so the CSV
+            # holds values in GRID-BOX UNITS (1 unit = 1 grid box on
+            # this image). The manifest records the pixel size so a
+            # receiver can rescale to its own grid at load time.
+            img_h, img_w = bg_source.shape[:2]
+            source_cell_w_px = max(1.0,
+                float(img_w) * self.canvas.grid_size_percent / 100.0)
+            source_cell_h_px = max(
+                1.0,
+                source_cell_w_px / max(0.01, self.canvas.grid_aspect_ratio),
+            )
+
             # 1. Build polygons.csv in memory (save_array-compatible schema).
             csv_buf = io.StringIO()
             writer  = csv.writer(csv_buf)
@@ -2268,9 +2281,15 @@ class MainWindow(QMainWindow):
             for i, pts in enumerate(self.canvas.polygons):
                 if not pts or len(pts) < 3:
                     continue
-                coords_json = json.dumps(
-                    [[float(x) - gox, float(y) - goy] for x, y in pts]
-                )
+                # Grid-pan subtracted so (0, 0) is the top-left grid
+                # intersection on the source image, then divided by the
+                # source cell size so `(1, 0)` means "one grid box to
+                # the right of origin" regardless of image resolution.
+                coords_json = json.dumps([
+                    [(float(x) - gox) / source_cell_w_px,
+                     (float(y) - goy) / source_cell_h_px]
+                    for (x, y) in pts
+                ])
                 # Color columns kept for schema compatibility; 0,0,0,0
                 # tells the receiver to fill from the background image.
                 writer.writerow([i, coords_json, 0.0, 0.0, 0.0, 0.0])
@@ -2288,21 +2307,35 @@ class MainWindow(QMainWindow):
             # 3. Small manifest for receivers that prefer JSON over CSV.
             h, w = bg_source.shape[:2]
             manifest = {
-                "version": 1,
+                "version": 2,
                 "background": "background.png",
                 "background_size": [int(w), int(h)],
                 "polygons_csv": "polygons.csv",
                 "polygon_count": sum(
                     1 for p in self.canvas.polygons if p and len(p) >= 3
                 ),
+                # NEW in v2: coordinates in polygons.csv are expressed
+                # in GRID-BOX UNITS. `source_cell_size_px` is the size
+                # in pixels of one grid box on background.png. A
+                # receiver multiplies each coord by its own target cell
+                # size (in world units) to place the mosaic on its own
+                # grid at the right absolute scale; the same ratio
+                # (target_cell / source_cell_px) tells the receiver how
+                # to resample the background when it samples per-polygon
+                # fills.
+                "coord_system":         "grid_units",
+                "source_cell_size_px":  [float(source_cell_w_px),
+                                          float(source_cell_h_px)],
                 "notes": (
                     "polygons.csv schema matches save_array in the "
                     "sibling scripts. Colors are 0,0,0,0 — the intended "
-                    "fill is a sample from background.png masked by "
-                    "each polygon's shape. Coordinates are in native "
-                    "image-pixel space (grid pan offset already "
-                    "subtracted; tilt / warp already baked into the "
-                    "saved background image)."
+                    "fill is a sample from background.png masked by each "
+                    "polygon's shape. Coordinates are in GRID-BOX units "
+                    "(v2): one unit = one grid box on the source; "
+                    "multiply by the receiver's own grid box size (in "
+                    "world units) to place the mosaic on the receiver's "
+                    "grid. Grid pan offset already subtracted; tilt / "
+                    "warp already baked into the saved background image."
                 ),
             }
 

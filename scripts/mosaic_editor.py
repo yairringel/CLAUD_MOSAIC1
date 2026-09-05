@@ -79,9 +79,14 @@ def parse_polygon_csv(csv_text: str):
 
 
 def load_mosaic_bundle(path: str):
-    """Read a .mosaic ZIP. Returns (polygons, background_rgba_np) where:
+    """Read a .mosaic ZIP. Returns (polygons, background_rgba_np, manifest)
+    where:
       * polygons is the parsed CSV entries (same shape as parse_polygon_csv)
       * background_rgba_np is a numpy uint8 array (H, W, 4) or None
+      * manifest is the parsed manifest.json dict, or {} if absent /
+        unparseable. For v2+ bundles the manifest carries
+        `coord_system` == "grid_units" and `source_cell_size_px` — the
+        caller uses those to rescale polygon coords to its own grid.
     """
     with zipfile.ZipFile(path, 'r') as zf:
         names = zf.namelist()
@@ -104,7 +109,16 @@ def load_mosaic_bundle(path: str):
                 ptr.setsize(h * stride)
                 arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, stride)
                 bg_np = arr[:, : w * 4].reshape(h, w, 4).copy()
-        return polys, bg_np
+        manifest: dict = {}
+        m_name = next((n for n in names if n.lower().endswith('manifest.json')), None)
+        if m_name is not None:
+            try:
+                manifest = json.loads(zf.read(m_name).decode('utf-8'))
+                if not isinstance(manifest, dict):
+                    manifest = {}
+            except Exception:
+                manifest = {}
+        return polys, bg_np, manifest
 
 
 def build_image_fill(polygon_points, bg_rgba: np.ndarray):
@@ -662,46 +676,104 @@ class MosaicCanvas(QWidget):
         self.update()
         return len(polys)
 
-    def load_mosaic(self, path: str) -> int:
+    def load_mosaic(self, path: str, origin: tuple = (0.0, 0.0)) -> int:
         """Load a .mosaic bundle by sampling each polygon's pixels from
         the bundled background.png (via build_image_fill), then
-        discarding the source image — matches the user's model of
-        'the source background is only used to bake the per-polygon
-        fills; only a Load Image background persists behind the whole
-        canvas.'"""
-        polys, bg_np = load_mosaic_bundle(path)
+        discarding the source image.
+
+        `origin=(ox, oy)` (world coords) is the grid intersection the
+        caller picked to serve as the bundle's local (0, 0).
+
+        Coord system:
+          * v2 bundles (image_strech's newer Save Mosaic) — polygon
+            coords live in GRID-BOX UNITS. We multiply them by the
+            editor's current grid cell size so the mosaic lands on the
+            editor's grid at the right scale. Fills are sampled at
+            bundle-local BG-PIXEL coords (grid_units × source_cell_px)
+            and then placed at the corresponding world bbox.
+          * v1 / legacy bundles — polygon coords are in image pixels;
+            we treat 1 image pixel as 1 world unit (the pre-v2
+            behaviour) so old bundles keep opening as before."""
+        ox, oy = float(origin[0]), float(origin[1])
+        polys, bg_np, manifest = load_mosaic_bundle(path)
         self._push_undo()
         gid = self.add_group(Path(path).name, 'mosaic',
                              source_path=str(Path(path).resolve()))
+
+        # Decide the coord conversion from bundle-CSV to editor-world.
+        cs = str(manifest.get('coord_system', '') or '').lower()
+        cell_px = manifest.get('source_cell_size_px')
+        if cs == 'grid_units' and cell_px is not None:
+            # v2 — coords are in grid units. Multiply by the editor's
+            # CURRENT grid cell size (via `_grid_cell_world`, which
+            # honours the same "% of canvas background width" ↔ "plain
+            # world units" fallback the visible grid uses) so the
+            # mosaic gets scaled to match whatever grid is active,
+            # including canvas-background scaling.
+            if isinstance(cell_px, (list, tuple)) and len(cell_px) >= 2:
+                src_cell_w_px = float(cell_px[0])
+                src_cell_h_px = float(cell_px[1])
+            else:
+                src_cell_w_px = src_cell_h_px = float(cell_px)
+            editor_cell = float(self._grid_cell_world())
+            wx_per_unit = editor_cell            # world units per grid unit
+            wy_per_unit = editor_cell
+            # BG-PIXEL coords per grid unit — used for sampling the
+            # background at the correct spot.
+            bx_per_unit = src_cell_w_px
+            by_per_unit = src_cell_h_px
+        else:
+            # v1 / legacy — polygon coords ARE image-pixel coords.
+            wx_per_unit = 1.0
+            wy_per_unit = 1.0
+            bx_per_unit = 1.0
+            by_per_unit = 1.0
+
         for p in polys:
-            fill_qimg, fill_bbox = (None, None)
+            csv_pts = p['points']
+            # source_points: coords in BUNDLE-BG-PIXEL space, so the
+            # save/load-project resample path (build_image_fill on the
+            # source bundle) always sees the right pixel coords.
+            src_pts_bgpx = [(x * bx_per_unit, y * by_per_unit)
+                            for (x, y) in csv_pts]
+            fill_qimg, fill_bbox_bgpx = (None, None)
             if bg_np is not None:
-                fill_qimg, fill_bbox = build_image_fill(p['points'], bg_np)
+                fill_qimg, fill_bbox_bgpx = build_image_fill(
+                    src_pts_bgpx, bg_np,
+                )
+            # Editor-world coords for the polygon and its fill bbox.
+            world_pts = [(x * wx_per_unit + ox, y * wy_per_unit + oy)
+                         for (x, y) in csv_pts]
+            if fill_bbox_bgpx is not None:
+                bx0, by0, bw, bh = fill_bbox_bgpx
+                world_bbox = (
+                    bx0 / bx_per_unit * wx_per_unit + ox,
+                    by0 / by_per_unit * wy_per_unit + oy,
+                    bw  / bx_per_unit * wx_per_unit,
+                    bh  / by_per_unit * wy_per_unit,
+                )
+            else:
+                world_bbox = None
             self.polygons.append({
-                'points':    p['points'],
+                'points':    world_pts,
                 'fill_type': ('image' if fill_qimg is not None else
                               ('solid' if p['color'].alpha() > 0 else 'none')),
                 'color':     p['color'],
                 'fill_qimg': fill_qimg,
-                'fill_bbox': fill_bbox,
+                'fill_bbox': world_bbox,
                 # Stable warp reference: original polygon shape + fill
                 # image at load time. Kept in sync with translations
                 # and scales so it always represents the polygon's
-                # "pre vertex-drag" shape. Vertex-drag warp uses
-                # this as the source so the fill doesn't accumulate
-                # quality loss over many small vertex adjustments.
-                'orig_points':    list(p['points']),
+                # "pre vertex-drag" shape.
+                'orig_points':    list(world_pts),
                 'orig_fill_qimg': (fill_qimg.copy()
                                    if fill_qimg is not None else None),
-                'orig_fill_bbox': fill_bbox,
-                # Snapshot of the polygon's coords in the SOURCE .mosaic's
-                # local coordinate system (== `points` at load time, before
-                # any translation / scale / vertex-drag). Save Project
-                # stores this and Load Project uses it to re-sample the
-                # bundle's background.png so the fill can be rebuilt
-                # without embedding image bytes in the .mep file.
+                'orig_fill_bbox': world_bbox,
+                # source_points is stored in BG-PIXEL coords so
+                # _reload_fills_from_sources can pass it straight into
+                # build_image_fill against the reloaded background.
                 'source_points':  [(float(x), float(y))
-                                   for (x, y) in p['points']],
+                                   for (x, y) in src_pts_bgpx],
                 'image_zoom':     1.0,
                 'group_id':  gid,
             })
@@ -1220,7 +1292,7 @@ class MosaicCanvas(QWidget):
                     cache[src_path] = False
                     continue
                 try:
-                    _polys, bg_np = load_mosaic_bundle(src_path)
+                    _polys, bg_np, _mf = load_mosaic_bundle(src_path)
                 except Exception as e:
                     warnings.append(
                         f"Source unreadable: {src_path} ({e})"
@@ -2551,21 +2623,51 @@ class MosaicEditorWindow(QMainWindow):
         )
         if not paths:
             return
-        total = 0
-        for path in paths:
-            try:
-                n = self.canvas.load_mosaic(path)
-                total += n
-            except Exception as e:
-                QMessageBox.warning(
-                    self, "Load Mosaic",
-                    f"Failed to load {Path(path).name}: {type(e).__name__}: {e}"
-                )
-        self.layers_panel.rebuild()
+
+        # Force the grid on so intersections are visible while the user
+        # picks the origin. Save the previous state so we can restore if
+        # the pick is cancelled.
+        prev_grid_enabled = self.canvas.grid_enabled
+        if not self.canvas.grid_enabled:
+            self.canvas.grid_enabled = True
+            self.grid_cb.blockSignals(True)
+            self.grid_cb.setChecked(True)
+            self.grid_cb.blockSignals(False)
+            self.canvas.update()
+
         self.statusBar().showMessage(
-            f"Loaded {total} polygon(s) from {len(paths)} .mosaic bundle(s). "
-            f"Source backgrounds were consumed to fill each polygon."
+            "Load Mosaic — click a gridline intersection to set the "
+            "(0, 0) origin for the loaded mosaic(s). Esc to cancel."
         )
+
+        def _finalise(origin_x: float, origin_y: float) -> None:
+            total = 0
+            for path in paths:
+                try:
+                    n = self.canvas.load_mosaic(path, origin=(origin_x, origin_y))
+                    total += n
+                except Exception as e:
+                    QMessageBox.warning(
+                        self, "Load Mosaic",
+                        f"Failed to load {Path(path).name}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+            self.layers_panel.rebuild()
+            self.statusBar().showMessage(
+                f"Loaded {total} polygon(s) from {len(paths)} "
+                f".mosaic bundle(s) at origin "
+                f"({origin_x:.1f}, {origin_y:.1f})."
+            )
+            # If the user hadn't turned the grid on themselves, put it
+            # back the way we found it now that the pick is done.
+            if not prev_grid_enabled:
+                self.canvas.grid_enabled = False
+                self.grid_cb.blockSignals(True)
+                self.grid_cb.setChecked(False)
+                self.grid_cb.blockSignals(False)
+                self.canvas.update()
+
+        self.canvas.start_origin_pick(_finalise)
 
     def on_load_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
