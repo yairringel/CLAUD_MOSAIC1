@@ -1633,6 +1633,28 @@ class MainWindow(QMainWindow):
         per_poly_layout.addWidget(apply_per_poly_btn)
         right_sidebar_layout.addLayout(per_poly_layout)
 
+        # "Scale Polygons Image" — one-click +5% zoom of the image
+        # inside each polygon, matching the P-key behaviour in
+        # mosaic_editor. Since image_strech doesn't store per-polygon
+        # fills, we achieve the "image looks 5% bigger inside each
+        # polygon" effect by shrinking each polygon around its
+        # centroid by 1/1.05 — the polygon covers a slightly smaller
+        # patch of the source, so downstream tools that treat each
+        # polygon as its own tile show the image content magnified.
+        self.scale_polys_image_btn = QPushButton("Scale Polygons Image")
+        self.scale_polys_image_btn.setToolTip(
+            "Enlarge the image inside every polygon by 5 %. Same as "
+            "mosaic_editor's P-key: polygon shape STAYS PUT, the "
+            "pixels visible inside become a magnified crop of the "
+            "source — crop = bbox / zoom centred on the polygon "
+            "centroid, stretched to fill the polygon. Click again "
+            "for another 5 % (compounded)."
+        )
+        self.scale_polys_image_btn.clicked.connect(
+            self.scale_polygons_image
+        )
+        right_sidebar_layout.addWidget(self.scale_polys_image_btn)
+
         right_sidebar_layout.addSpacing(10)
         right_sidebar_layout.addWidget(QLabel("Move Image:"))
 
@@ -2073,6 +2095,98 @@ class MainWindow(QMainWindow):
         self._original_polygons = None
         self.canvas.apply_effects()
         self.canvas.update()
+
+    def scale_polygons_image(self):
+        """Enlarge the image inside every polygon by 5 % — the polygon
+        shape STAYS PUT (this is the point) and the pixels visible
+        inside become a magnified crop of the source. Same behaviour
+        as mosaic_editor's P-key: for each polygon, sample a smaller
+        centred region of the source image (crop_w = bbox_w / zoom,
+        centred on the polygon centroid), then bilinear-resize it up
+        to the polygon's bbox and store it in
+        `polygon_fill_images[idx]` so paintEvent draws it clipped to
+        the polygon shape.
+
+        Each click compounds — the per-polygon zoom is multiplied by
+        1.05 every time. `polygon_fill_images` is the existing dict
+        image_strech's paintEvent already reads for the Copy Polygon
+        feature; we reuse it here so no render code changes."""
+        canvas = self.canvas
+        if not canvas.polygons:
+            QMessageBox.warning(self, "Warning",
+                                "No polygons to scale.")
+            return
+        source = canvas.cv_image if canvas.cv_image is not None \
+                                  else canvas.display_image
+        if source is None:
+            QMessageBox.warning(self, "Warning",
+                                "No image loaded.")
+            return
+
+        # Per-polygon cumulative zoom lives on the canvas so it
+        # survives across clicks. Init on first use.
+        if not hasattr(canvas, 'polygon_image_zoom'):
+            canvas.polygon_image_zoom = {}
+
+        h_src, w_src = source.shape[:2]
+        gox = float(canvas.grid_offset_x)
+        goy = float(canvas.grid_offset_y)
+        magnified = 0
+        for idx, poly in enumerate(canvas.polygons):
+            if not poly or len(poly) < 3:
+                continue
+            new_zoom = float(canvas.polygon_image_zoom.get(idx, 1.0)) * 1.05
+            canvas.polygon_image_zoom[idx] = new_zoom
+
+            # Polygon bbox in CANVAS coords → image-pixel coords by
+            # subtracting the grid_offset pan (image_strech leaves
+            # polygons in canvas coords and pans the image behind them).
+            xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
+            min_x = min(xs); min_y = min(ys)
+            max_x = max(xs); max_y = max(ys)
+            bw_canvas = max(1.0, max_x - min_x)
+            bh_canvas = max(1.0, max_y - min_y)
+            cx_canvas = (min_x + max_x) / 2.0
+            cy_canvas = (min_y + max_y) / 2.0
+            # Centred crop of the source: crop side / zoom, centered
+            # on the polygon centroid (in image-pixel coords).
+            crop_w = max(1.0, bw_canvas / new_zoom)
+            crop_h = max(1.0, bh_canvas / new_zoom)
+            cx_img = cx_canvas - gox
+            cy_img = cy_canvas - goy
+            cx0 = cx_img - crop_w / 2.0
+            cy0 = cy_img - crop_h / 2.0
+            # Clamp to source image bounds (only sampling in-bounds
+            # pixels; anything outside falls back to source edge).
+            ix0 = max(0, int(round(cx0)))
+            iy0 = max(0, int(round(cy0)))
+            ix1 = min(w_src, int(round(cx0 + crop_w)))
+            iy1 = min(h_src, int(round(cy0 + crop_h)))
+            if ix1 <= ix0 or iy1 <= iy0:
+                # Polygon is entirely off the source — leave any
+                # earlier fill as-is (or nothing).
+                continue
+            crop = source[iy0:iy1, ix0:ix1]
+            out_w = max(1, int(round(bw_canvas)))
+            out_h = max(1, int(round(bh_canvas)))
+            resized = cv2.resize(crop, (out_w, out_h),
+                                 interpolation=cv2.INTER_LINEAR)
+            # RGB uint8 → QImage (RGB888). Copy so QImage owns the
+            # buffer after `resized` goes out of scope.
+            qimg = QImage(
+                resized.data, out_w, out_h, out_w * 3,
+                QImage.Format_RGB888,
+            ).copy()
+            canvas.polygon_fill_images[idx] = qimg
+            magnified += 1
+
+        canvas.update()
+        if magnified == 0:
+            QMessageBox.information(
+                self, "Scale Polygons Image",
+                "No polygons overlapped the source image — nothing "
+                "was magnified.",
+            )
 
     def pan_image(self, dx, dy):
         step = self.grid_step_spin.value()

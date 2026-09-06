@@ -23,6 +23,7 @@ import os
 import csv
 import io
 import json
+import math
 import pickle
 import zipfile
 from pathlib import Path
@@ -377,7 +378,7 @@ class MosaicCanvas(QWidget):
 
         # Grid.
         self.grid_enabled = False
-        self.grid_size_percent = 10.0          # % of canvas background width
+        self.grid_size_percent = 1520.0        # % of canvas background width
         self.grid_size_world = 100.0           # falls back when no background
         self.grid_color = QColor(255, 105, 180)
         self.grid_thickness = 2
@@ -871,6 +872,12 @@ class MosaicCanvas(QWidget):
                     'points':    list(p['points']),
                     'fill_type': p['fill_type'],
                     'color':     self._qcolor_to_tuple(p['color']),
+                    # Embed the per-polygon fill directly as PNG bytes
+                    # — restores the reliable pre-v2 behaviour. Load
+                    # Project reads this back and skips the fragile
+                    # source-bundle re-sample when the bytes are
+                    # present.
+                    'fill_png':  self._qimage_to_png_bytes(p.get('fill_qimg')),
                     'fill_bbox': p.get('fill_bbox'),
                     # Warp-reference snapshot — needed so vertex-drag
                     # stretches from the stable original geometry
@@ -878,23 +885,29 @@ class MosaicCanvas(QWidget):
                     'orig_points':    (list(p['orig_points'])
                                        if p.get('orig_points') is not None
                                        else None),
+                    'orig_fill_png':  self._qimage_to_png_bytes(
+                        p.get('orig_fill_qimg')
+                    ),
                     'orig_fill_bbox': p.get('orig_fill_bbox'),
                     'image_zoom':     float(p.get('image_zoom', 1.0)),
-                    # source_points: the polygon's outline in its source
-                    # .mosaic bundle's local coord system (== `points`
-                    # at load time). Load Project uses this + the
-                    # group's source_path to re-sample the source
-                    # background and rebuild the fill without any PNG
-                    # bytes in the .mep file. None → polygon has no
-                    # image-fill source (e.g. loaded from CSV).
+                    # source_points + group.source_path let Load Project
+                    # rebuild fills from the source bundle if the
+                    # embedded PNG bytes above are ever missing (older
+                    # files, encoding failures). Kept as a robust
+                    # fallback, not the primary path.
                     'source_points':  (list(p['source_points'])
                                        if p.get('source_points') is not None
                                        else None),
                     'group_id':  p['group_id'],
                 } for p in self.polygons
             ],
-            # NB: no canvas_background_png — the bitmap is reloaded from
-            # canvas_background_source at Load Project time.
+            # Canvas background as PNG bytes for reliable restore, plus
+            # its source path for the source-reload fallback path.
+            'canvas_background_png':
+                self._qimage_to_png_bytes(
+                    self.canvas_background.toImage()
+                    if self.canvas_background is not None else None
+                ),
             'canvas_background_source': self.canvas_background_source,
             'bg_offset_x': self.bg_offset_x,
             'bg_offset_y': self.bg_offset_y,
@@ -1016,7 +1029,20 @@ class MosaicCanvas(QWidget):
                 xs.append(float(x)); ys.append(float(y))
         if not xs:
             raise RuntimeError("Nothing visible to save.")
-        x0 = min(xs); y0 = min(ys)
+
+        # Snap the save's local (0, 0) to the largest GRID INTERSECTION
+        # at or below the min corner. Without this snap, any sub-cell
+        # offset the polygons had (e.g. polygons that landed 0.3 cell
+        # past their origin grid line) would be discarded — a
+        # subsequent Load Mosaic at the same intersection would drop
+        # them right at the line and the whole mosaic would appear
+        # shifted. Anchoring to the intersection preserves the sub-cell
+        # offset in the CSV coords, so re-loading at the same
+        # intersection reproduces the exact original position.
+        cell_world = float(self._grid_cell_world())
+        raw_x0 = min(xs); raw_y0 = min(ys)
+        x0 = math.floor(raw_x0 / cell_world) * cell_world
+        y0 = math.floor(raw_y0 / cell_world) * cell_world
         x1 = max(xs); y1 = max(ys)
         w  = max(1, int(round(x1 - x0)))
         h  = max(1, int(round(y1 - y0)))
@@ -1063,9 +1089,14 @@ class MosaicCanvas(QWidget):
         png_bytes = bytes(buf.data())
 
         # ── 4. Build polygons.csv (save_array-compatible schema) ──
-        # Coordinates are relative to the composite PNG's top-left,
-        # so opening the bundle in any receiver aligns polygon
-        # outlines to their baked-in pixel content 1:1.
+        # v2 coord system: coords are in GRID-BOX UNITS relative to the
+        # save's grid-aligned anchor (x0, y0). One unit = one grid box
+        # at the editor's current cell size. On reload, the receiver
+        # multiplies by ITS grid cell size, so the mosaic drops into
+        # place on the receiver's grid at the right scale — and, when
+        # loaded at the same grid intersection used here as anchor,
+        # every polygon lands EXACTLY where it was pre-save (sub-cell
+        # offsets included).
         csv_buf = io.StringIO()
         writer  = csv.writer(csv_buf)
         writer.writerow([
@@ -1074,9 +1105,11 @@ class MosaicCanvas(QWidget):
         ])
         written = 0
         for p in visible_polys:
-            coords_json = json.dumps(
-                [[float(px - x0), float(py - y0)] for (px, py) in p['points']]
-            )
+            coords_json = json.dumps([
+                [(float(px) - x0) / cell_world,
+                 (float(py) - y0) / cell_world]
+                for (px, py) in p['points']
+            ])
             # For image-filled polygons write 0,0,0,0 — the receiver
             # should sample from the composite PNG, exactly like the
             # convention image_strech.py's Save Mosaic uses.
@@ -1093,19 +1126,26 @@ class MosaicCanvas(QWidget):
 
         # ── 5. Manifest ──
         manifest = {
-            "version": 1,
+            "version": 2,
             "background": "background.png",
             "background_size": [int(w), int(h)],
             "polygons_csv": "polygons.csv",
             "polygon_count": written,
+            "coord_system":         "grid_units",
+            # cell size on the composite PNG, in pixels. `cell_world`
+            # world units span `cell_world` PNG pixels because we
+            # composite at 1 world unit per pixel.
+            "source_cell_size_px":  [float(cell_world), float(cell_world)],
             "notes": (
-                "Flattened mosaic saved by mosaic_editor.py. "
+                "Flattened mosaic saved by mosaic_editor.py (v2). "
                 "background.png is the composite of the shared canvas "
-                "background plus every visible polygon's image fill "
-                "(image-filled polygons drawn from their orig_fill "
-                "or fill_qimg, solid-color polygons filled with their "
-                "own color). polygons.csv holds each polygon's outline "
-                "in the PNG's coordinate space (0,0 = top-left)."
+                "background plus every visible polygon's image fill. "
+                "Polygon coordinates are in GRID-BOX units; the save "
+                "anchored (0, 0) to the largest grid intersection at or "
+                "below the visible content, so a receiver loading this "
+                "bundle at the same grid intersection reproduces the "
+                "original absolute position exactly, sub-cell offsets "
+                "included."
             ),
         }
 
@@ -1189,10 +1229,15 @@ class MosaicCanvas(QWidget):
         self.canvas_background_source = data.get(
             'canvas_background_source'
         )
-        # V2 path: reload the source file. V1 fallback: use the embedded
-        # PNG bytes if they're there.
-        bg_qimg = None
-        if self.canvas_background_source:
+        # Prefer the embedded PNG bytes — they're the reliable primary
+        # path. Fall back to reloading from `canvas_background_source`
+        # only if no bytes were saved (older files or an encoding fail).
+        bg_qimg = self._png_bytes_to_qimage(
+            data.get('canvas_background_png')
+        )
+        if bg_qimg is not None:
+            self.canvas_background = QPixmap.fromImage(bg_qimg)
+        elif self.canvas_background_source:
             src = self.canvas_background_source
             if Path(src).exists():
                 pm = QPixmap(src)
@@ -1207,11 +1252,7 @@ class MosaicCanvas(QWidget):
                     f"Canvas background source missing: {src}"
                 )
         else:
-            bg_qimg = self._png_bytes_to_qimage(
-                data.get('canvas_background_png')
-            )
-            self.canvas_background = (QPixmap.fromImage(bg_qimg)
-                                      if bg_qimg is not None else None)
+            self.canvas_background = None
         self.bg_offset_x = float(data.get('bg_offset_x', 0.0))
         self.bg_offset_y = float(data.get('bg_offset_y', 0.0))
         self.bg_scale    = float(data.get('bg_scale',    1.0))
@@ -1231,7 +1272,7 @@ class MosaicCanvas(QWidget):
 
         # Grid.
         self.grid_enabled      = bool (data.get('grid_enabled',      False))
-        self.grid_size_percent = float(data.get('grid_size_percent', 10.0))
+        self.grid_size_percent = float(data.get('grid_size_percent', 1520.0))
         self.grid_size_world   = float(data.get('grid_size_world',   100.0))
         self.grid_color        = self._tuple_to_qcolor(
             data.get('grid_color', (255, 105, 180, 255))
@@ -2441,7 +2482,7 @@ class MosaicEditorWindow(QMainWindow):
         row.addWidget(QLabel("Cell size:"))
         self.grid_size_spin = QDoubleSpinBox()
         self.grid_size_spin.setRange(0.5, 10000.0)
-        self.grid_size_spin.setValue(10.0)
+        self.grid_size_spin.setValue(1520.0)
         self.grid_size_spin.setDecimals(1)
         self.grid_size_spin.setSuffix(" %/px")
         self.grid_size_spin.setToolTip(
