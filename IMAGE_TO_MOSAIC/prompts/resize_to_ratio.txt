@@ -1,0 +1,24 @@
+Reframe the supplied image to fit a NEW aspect ratio of {TARGET_W_CM} cm × {TARGET_H_CM} cm (aspect {ASPECT_W}:{ASPECT_H}), intended to be printed at 300 DPI. The FINAL image will be {TARGET_W_PX} × {TARGET_H_PX} pixels.
+
+═══ Rule #1: PRESERVE THE ORIGINAL AS FAITHFULLY AS POSSIBLE ═══
+- Keep the subject, composition, colors, lighting, textures, and every recognisable detail of the original. The scene, mood, and content must remain the same — a viewer holding the original next to the output should see the SAME image, only reshaped to a new frame.
+- Do NOT re-imagine the scene. Do NOT stylise. Do NOT shift color palette. Do NOT alter facial features, poses, clothing, materials, or any identifying details.
+- If the input has visible artefacts (grain, compression, brush marks) keep them as-is — do not "clean up" the image.
+
+═══ Rule #2: EXTEND ONLY WHERE THE NEW ASPECT DEMANDS IT ═══
+- If the target aspect is WIDER than the source, extend the LEFT and RIGHT edges outward with plausible content that continues the original scene seamlessly (background textures, sky, ground, walls — whatever is present at the edges of the source).
+- If the target aspect is TALLER than the source, extend the TOP and BOTTOM edges outward the same way.
+- If the target aspect matches the source, do not extend — just rescale.
+- Never CROP the original — the entire source must remain visible inside the output. The new pixels appear only as expansion beyond the source edges.
+- Extended regions must match the source in style, palette, lighting direction, perspective, and texture so the seam between original and extension is invisible.
+
+Output requirements:
+- Output dimensions: exactly {TARGET_W_PX} × {TARGET_H_PX} pixels, aspect {ASPECT_W}:{ASPECT_H}.
+- Sharp and high-detail — ready for 300 DPI print at {TARGET_W_CM} cm × {TARGET_H_CM} cm physical size.
+- No borders, watermarks, captions, or added text.
+- No visible seam or discontinuity between original and extended regions.
+
+Final self-check before emitting:
+- Every recognisable element from the original is present and unchanged inside the output.
+- The output has exactly the requested aspect ratio ({ASPECT_W}:{ASPECT_H}).
+- Extensions (if any) blend seamlessly with the original — no jump in colour, lighting, texture, or perspective at the seam.

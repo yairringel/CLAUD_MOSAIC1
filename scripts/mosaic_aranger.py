@@ -20,7 +20,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFrame, QLabel, QSpinBox, QPushButton, QScrollArea, QFileDialog,
-    QCheckBox, QMessageBox,
+    QCheckBox, QMessageBox, QInputDialog,
 )
 from PyQt5.QtCore import Qt, QRectF
 from PyQt5.QtGui import (
@@ -88,6 +88,17 @@ class ArrangerCanvas(QWidget):
         self.pending_tile:  dict | None  = None
         self.pending_batch: list[dict] | None = None
         self.placed_tiles: list[dict]    = []
+
+        # Export Image state — a two-step LMB pick of the top-left
+        # and bottom-right GRID INTERSECTIONS that define the export
+        # region. Each entry is (row, col) with row ∈ [0..rows] and
+        # col ∈ [0..cols] (intersection indices, one more than the
+        # cell count). `_export_stage`: 'tl' waiting for TL click,
+        # 'br' waiting for BR click, None otherwise. `_export_callback`
+        # fires with the two corners once both are picked.
+        self._export_stage: str | None = None
+        self._export_tl: tuple | None  = None
+        self._export_callback = None
 
         # Select-and-move state. When nothing is armed for placement,
         # clicking a cell that already holds a placed tile SELECTS the
@@ -382,6 +393,73 @@ class ArrangerCanvas(QWidget):
         self.placed_tiles = keep
         self.selected_placed_index = new_sel
 
+    # ── Export image (2-corner region pick + render) ─────────────────
+    def start_export_pick(self, callback) -> None:
+        """Arm export-region pick. Two subsequent LMB clicks are
+        consumed as the TOP-LEFT and BOTTOM-RIGHT grid intersections.
+        Each click snaps to the nearest intersection. Once both are
+        picked, `callback((tl_row, tl_col), (br_row, br_col))` fires.
+        ESC cancels. Clears any pending placement / selection first."""
+        self.pending_tile  = None
+        self.pending_batch = None
+        self.selected_placed_index = -1
+        self._export_stage = 'tl'
+        self._export_tl    = None
+        self._export_callback = callback
+        self.setCursor(Qt.CrossCursor)
+        self.update()
+
+    def cancel_export_pick(self) -> None:
+        self._export_stage = None
+        self._export_tl = None
+        self._export_callback = None
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+
+    def _snap_screen_to_intersection(self, sx: int, sy: int) -> tuple:
+        """Screen point → nearest grid INTERSECTION as (row, col)
+        with row ∈ [0..rows], col ∈ [0..cols] (i.e. one more than
+        the cell count in each dim, since there are N+1 intersections
+        along N cells). Returns None if the cursor is far off-grid."""
+        wx = (sx - self.pan_x) / self.zoom_factor
+        wy = (sy - self.pan_y) / self.zoom_factor
+        cell, ox, oy, grid_w, grid_h = self._grid_layout()
+        r = round((wy - oy) / cell)
+        c = round((wx - ox) / cell)
+        r = max(0, min(self.grid_rows, int(r)))
+        c = max(0, min(self.grid_cols, int(c)))
+        return (r, c)
+
+    def render_region_to_qimage(self, tl_row: int, tl_col: int,
+                                br_row: int, br_col: int,
+                                out_w: int, out_h: int) -> QImage:
+        """Rasterise the placed tiles inside the rectangle bounded by
+        grid intersections (tl_row, tl_col) and (br_row, br_col) into
+        a fresh QImage of (out_w × out_h). The QImage's (0, 0) is the
+        top-left intersection; scaling is chosen to fit the region."""
+        cell, ox, oy, _gw, _gh = self._grid_layout()
+        # World region: pixels between the two intersections.
+        world_w = max(1.0, (br_col - tl_col) * cell)
+        world_h = max(1.0, (br_row - tl_row) * cell)
+        img = QImage(out_w, out_h, QImage.Format_ARGB32)
+        img.fill(Qt.white)     # match the canvas background
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        # Map region world → output pixels: multiply by out_w/world_w
+        # (and same for y). Also translate so the TL intersection lands
+        # at output (0, 0).
+        painter.scale(out_w / world_w, out_h / world_h)
+        # `_paint_placed_tile` positions tiles via `ox + col*cell`; we
+        # want the TL intersection at (0, 0), which sits at world
+        # (ox + tl_col*cell, oy + tl_row*cell), so pass a shifted ox/oy.
+        r_ox = -tl_col * cell
+        r_oy = -tl_row * cell
+        for tile in self.placed_tiles:
+            self._paint_placed_tile(painter, tile, cell, r_ox, r_oy)
+        painter.end()
+        return img
+
     def keyPressEvent(self, ev):
         """ESC releases: clears any pending placement AND any current
         placed-tile selection. Del / Backspace erases the currently
@@ -389,10 +467,14 @@ class ArrangerCanvas(QWidget):
         if ev.key() == Qt.Key_Escape:
             changed = (self.pending_tile is not None
                        or self.pending_batch is not None
-                       or self.selected_placed_index != -1)
+                       or self.selected_placed_index != -1
+                       or self._export_stage is not None)
             self.pending_tile  = None
             self.pending_batch = None
             self.selected_placed_index = -1
+            self._export_stage = None
+            self._export_tl = None
+            self._export_callback = None
             self.setCursor(Qt.ArrowCursor)
             if changed:
                 self.update()
@@ -418,6 +500,29 @@ class ArrangerCanvas(QWidget):
         # Ensure the widget has keyboard focus after any click so the
         # ESC-to-release shortcut works right away.
         self.setFocus(Qt.MouseFocusReason)
+
+        # Export-pick has the highest priority — LMB clicks feed the
+        # two-corner grid-intersection pick until the region is
+        # defined, then the callback fires.
+        if self._export_stage is not None and ev.button() == Qt.LeftButton:
+            rc_int = self._snap_screen_to_intersection(ev.x(), ev.y())
+            if self._export_stage == 'tl':
+                self._export_tl = rc_int
+                self._export_stage = 'br'
+                self.update()
+                return
+            if self._export_stage == 'br':
+                tl = self._export_tl
+                br = rc_int
+                cb = self._export_callback
+                self._export_stage = None
+                self._export_tl = None
+                self._export_callback = None
+                self.setCursor(Qt.ArrowCursor)
+                self.update()
+                if cb is not None and tl is not None:
+                    cb(tl, br)
+                return
 
         if ev.button() != Qt.LeftButton:
             return
@@ -554,6 +659,16 @@ class SidePanel(QFrame):
         self.load_btn.clicked.connect(self._on_load_project)
         layout.addWidget(self.load_btn)
 
+        self.export_btn = QPushButton("Export Image")
+        self.export_btn.setToolTip(
+            "Save the arrangement as a PNG. Prompts for TWO grid "
+            "intersections (top-left, then bottom-right) that define "
+            "the export rectangle, asks for the output pixel width, "
+            "then writes a PNG at that resolution. Esc cancels."
+        )
+        self.export_btn.clicked.connect(self._on_export_image)
+        layout.addWidget(self.export_btn)
+
         # ── Grid section ──────────────────────────────────────────────
         # Two direct-input spinboxes for the grid's column × row count.
         # Value changes push straight to the canvas, which clamps to
@@ -630,6 +745,113 @@ class SidePanel(QFrame):
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))
             return
+
+    def _on_export_image(self) -> None:
+        """Two-corner pick → resolution prompt → PNG save.
+
+        Sidebar-visible flow:
+          1. Show a hint in the status bar / message box telling the
+             user to click the TOP-LEFT grid intersection.
+          2. On first click: record TL; hint changes to BOTTOM-RIGHT.
+          3. On second click: prompt for output pixel WIDTH; height
+             derived from the region's aspect ratio.
+          4. Prompt for a save path.
+          5. Render the region and write PNG.
+        Esc at any point cancels."""
+        canvas = self.canvas
+        if not canvas.placed_tiles:
+            QMessageBox.warning(
+                self, "Export Image",
+                "No placed tiles to export.",
+            )
+            return
+        # Force the grid on so the intersections are visible.
+        prev_grid = canvas.show_grid
+        if not prev_grid:
+            canvas.set_show_grid(True)
+            self.show_grid_chk.blockSignals(True)
+            self.show_grid_chk.setChecked(True)
+            self.show_grid_chk.blockSignals(False)
+
+        QMessageBox.information(
+            self, "Export Image — TL",
+            "Click the TOP-LEFT grid intersection of the region to "
+            "export. Then click the BOTTOM-RIGHT intersection. Esc "
+            "cancels.",
+        )
+
+        def _done(tl: tuple, br: tuple) -> None:
+            # Restore grid state.
+            if not prev_grid:
+                canvas.set_show_grid(False)
+                self.show_grid_chk.blockSignals(True)
+                self.show_grid_chk.setChecked(False)
+                self.show_grid_chk.blockSignals(False)
+
+            tl_r, tl_c = tl
+            br_r, br_c = br
+            # Normalise so TL is actually top-left of the rectangle
+            # regardless of the click order.
+            r0, r1 = sorted((tl_r, br_r))
+            c0, c1 = sorted((tl_c, br_c))
+            if r1 - r0 < 1 or c1 - c0 < 1:
+                QMessageBox.warning(
+                    self, "Export Image",
+                    "The two picks must span at least one grid cell.",
+                )
+                return
+
+            # World size of the region — used to derive default width
+            # + height ratio.
+            cell, _ox, _oy, _gw, _gh = canvas._grid_layout()
+            world_w = (c1 - c0) * cell
+            world_h = (r1 - r0) * cell
+            aspect = world_h / max(1.0, world_w)
+
+            # Ask for output pixel width. Default: 200 px per grid
+            # cell along the wider axis — a sensible starting point
+            # for a printable mosaic reference. User can override.
+            default_w = int(round(200 * max(1, c1 - c0)))
+            width_px, ok = QInputDialog.getInt(
+                self, "Export Image — resolution",
+                f"Region spans {c1 - c0} × {r1 - r0} grid cells.\n"
+                f"Enter output image WIDTH in pixels "
+                f"(height auto-derived from aspect ratio).",
+                value=default_w, min=16, max=32768, step=100,
+            )
+            if not ok:
+                return
+            height_px = max(1, int(round(width_px * aspect)))
+
+            path, _f = QFileDialog.getSaveFileName(
+                self, "Save Exported Image",
+                "arrangement.png",
+                "PNG image (*.png);;All Files (*)",
+            )
+            if not path:
+                return
+            if not path.lower().endswith('.png'):
+                path += '.png'
+
+            try:
+                img = canvas.render_region_to_qimage(
+                    r0, c0, r1, c1, width_px, height_px,
+                )
+                if not img.save(path, "PNG"):
+                    raise RuntimeError("QImage.save returned False")
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Export Image",
+                    f"Failed to write PNG: {type(e).__name__}: {e}",
+                )
+                return
+
+            QMessageBox.information(
+                self, "Export Image",
+                f"Saved {width_px}×{height_px} px PNG to:\n{path}",
+            )
+
+        canvas.start_export_pick(_done)
 
     def _on_load_project(self) -> None:
         w = self.window_ref
