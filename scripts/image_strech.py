@@ -1516,6 +1516,17 @@ class MainWindow(QMainWindow):
         max_area_row.addWidget(erase_max_btn)
         cleanup_layout.addRow("Max area:", max_area_row)
 
+        # Erase all polygons whose majority (> 50 %) area falls inside
+        # the UNION of a user-picked set of grid boxes — opens the same
+        # A1 / B2 / … checkbox dialog Save Tile Image uses.
+        erase_gridbox_btn = QPushButton("Erase Gridbox Polygons")
+        erase_gridbox_btn.setToolTip(
+            "Pick grid boxes; every polygon whose majority area lies in "
+            "any picked box gets erased."
+        )
+        erase_gridbox_btn.clicked.connect(self.erase_gridbox_polygons)
+        cleanup_layout.addRow(erase_gridbox_btn)
+
         cleanup_group.setLayout(cleanup_layout)
         sidebar_layout.addWidget(cleanup_group)
 
@@ -1987,6 +1998,212 @@ class MainWindow(QMainWindow):
             description=f"area larger than {n} px²",
         )
 
+    def erase_gridbox_polygons(self):
+        """Open a grid checkbox dialog (same one Save Tile Image uses),
+        then erase every polygon whose majority area (> 50 % of the
+        polygon's own area) falls inside the UNION of the picked
+        boxes.
+
+        The grid in image_strech is fixed in polygon-coord space at
+        (0, 0) with cell size = img_w * grid_size_percent / 100 and
+        cell height = cell_w / grid_aspect_ratio. Grid pan
+        (grid_offset_x/y) only shifts the image beneath the grid, so
+        gridbox (r, c) always occupies polygon-coord rectangle
+        (c*cell_w, r*cell_h) → ((c+1)*cell_w, (r+1)*cell_h) — no
+        offset compensation is needed to align it with polygon
+        vertices."""
+        if self.canvas.cv_image is None:
+            QMessageBox.warning(
+                self, "Erase Gridbox Polygons",
+                "No image loaded — grid dimensions are unknown.",
+            )
+            return
+        if not self.canvas.polygons:
+            QMessageBox.information(
+                self, "Erase Gridbox Polygons",
+                "No polygons on the canvas — nothing to erase.",
+            )
+            return
+
+        img_h, img_w = self.canvas.cv_image.shape[:2]
+        cell_w = int(img_w * (self.canvas.grid_size_percent / 100.0))
+        cell_h = int(cell_w /
+                     max(0.01, self.canvas.grid_aspect_ratio))
+        if cell_w <= 0 or cell_h <= 0:
+            QMessageBox.warning(
+                self, "Erase Gridbox Polygons",
+                "Grid size is too small.",
+            )
+            return
+        num_cols = max(1, int(np.ceil(img_w / cell_w)))
+        num_rows = max(1, int(np.ceil(img_h / cell_h)))
+
+        # ── Grid-selection dialog (mirrors save_tile_image's popup) ─
+        from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QCheckBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select Gridboxes to Clear")
+        dlg_layout = QVBoxLayout(dlg)
+        info = QLabel(
+            f"Grid: {num_rows} rows × {num_cols} columns  "
+            f"(cell {cell_w} × {cell_h} px). "
+            "Any polygon with > 50 % of its area inside the picked "
+            "boxes will be erased."
+        )
+        info.setWordWrap(True)
+        dlg_layout.addWidget(info)
+
+        sel_btns = QHBoxLayout()
+        sel_all_btn   = QPushButton("Select All")
+        desel_all_btn = QPushButton("Deselect All")
+        sel_btns.addWidget(sel_all_btn)
+        sel_btns.addWidget(desel_all_btn)
+        dlg_layout.addLayout(sel_btns)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        grid_widget = QWidget()
+        grid_layout = QGridLayout(grid_widget)
+        grid_layout.setSpacing(2)
+        scroll.setWidget(grid_widget)
+        dlg_layout.addWidget(scroll)
+
+        checkboxes = {}
+        for r in range(num_rows):
+            row_letter = chr(ord('A') + r) if r < 26 else f"R{r + 1}"
+            for c in range(num_cols):
+                cb = QCheckBox(f"{row_letter}{c + 1}")
+                grid_layout.addWidget(cb, r, c)
+                checkboxes[(r, c)] = cb
+
+        sel_all_btn.clicked.connect(
+            lambda: [cb.setChecked(True)  for cb in checkboxes.values()])
+        desel_all_btn.clicked.connect(
+            lambda: [cb.setChecked(False) for cb in checkboxes.values()])
+
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        dlg_layout.addWidget(btn_box)
+        dlg.resize(min(120 * num_cols + 40, 900),
+                   min(40  * num_rows + 140, 700))
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        selected = [(r, c) for (r, c), cb in checkboxes.items()
+                    if cb.isChecked()]
+        if not selected:
+            QMessageBox.information(
+                self, "Erase Gridbox Polygons",
+                "No gridboxes selected — nothing was erased.",
+            )
+            return
+
+        # For each polygon: rasterize its shape into its own bbox, then
+        # sum the pixels that fall in the UNION of the selected boxes.
+        # If that intersection covers > 50 % of the polygon's pixel
+        # area, mark it for removal.
+        to_remove = []
+        for i, poly in enumerate(self.canvas.polygons):
+            if not poly or len(poly) < 3:
+                continue
+            pts = np.array(poly, dtype=np.float32)
+            xs, ys = pts[:, 0], pts[:, 1]
+            min_x = int(np.floor(xs.min()))
+            min_y = int(np.floor(ys.min()))
+            max_x = int(np.ceil (xs.max()))
+            max_y = int(np.ceil (ys.max()))
+            w = max(1, max_x - min_x)
+            h = max(1, max_y - min_y)
+            poly_mask = np.zeros((h, w), dtype=np.uint8)
+            poly_local = (pts - np.array([min_x, min_y])).astype(np.int32)
+            cv2.fillPoly(poly_mask, [poly_local], 1)
+            poly_area_px = int(poly_mask.sum())
+            if poly_area_px <= 0:
+                continue
+
+            # Sum intersection with each selected box.
+            inter_px = 0
+            for (r, c) in selected:
+                bx0 = c * cell_w
+                by0 = r * cell_h
+                bx1 = bx0 + cell_w
+                by1 = by0 + cell_h
+                ix0 = max(bx0, min_x)
+                iy0 = max(by0, min_y)
+                ix1 = min(bx1, max_x)
+                iy1 = min(by1, max_y)
+                if ix1 <= ix0 or iy1 <= iy0:
+                    continue
+                lx0 = ix0 - min_x
+                ly0 = iy0 - min_y
+                lx1 = ix1 - min_x
+                ly1 = iy1 - min_y
+                inter_px += int(poly_mask[ly0:ly1, lx0:lx1].sum())
+
+            if inter_px * 2 > poly_area_px:
+                to_remove.append(i)
+
+        if not to_remove:
+            QMessageBox.information(
+                self, "Erase Gridbox Polygons",
+                f"No polygon has more than half its area inside the "
+                f"{len(selected)} selected gridbox(es).",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm erase",
+            f"{len(to_remove)} of {len(self.canvas.polygons)} polygons "
+            f"have > 50 % of their area inside the {len(selected)} "
+            f"selected gridbox(es). Erase them?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Build old-index → new-index map BEFORE mutating the list so
+        # per-polygon fill / zoom dicts (which are keyed on indices)
+        # can be re-keyed to match the compacted polygon list.
+        removed = set(to_remove)
+        remap = {}
+        new_idx = 0
+        for old_idx in range(len(self.canvas.polygons)):
+            if old_idx in removed:
+                continue
+            remap[old_idx] = new_idx
+            new_idx += 1
+
+        # Delete from highest index to lowest so earlier indices stay
+        # valid.
+        for idx in sorted(to_remove, reverse=True):
+            self.canvas.polygons.pop(idx)
+
+        old_fill = getattr(self.canvas, 'polygon_fill_images', None)
+        if isinstance(old_fill, dict) and old_fill:
+            self.canvas.polygon_fill_images = {
+                remap[k]: v for k, v in old_fill.items()
+                if k in remap
+            }
+        old_zoom = getattr(self.canvas, 'polygon_image_zoom', None)
+        if isinstance(old_zoom, dict) and old_zoom:
+            self.canvas.polygon_image_zoom = {
+                remap[k]: v for k, v in old_zoom.items()
+                if k in remap
+            }
+
+        self.canvas.selected_polygon_index = None
+        self.canvas.dragging_point_index = None
+        self.canvas.selection_changed.emit(-1)
+        self.canvas.apply_effects()
+        self.canvas.update()
+        QMessageBox.information(
+            self, "Erase Gridbox Polygons",
+            f"Erased {len(to_remove)} polygon(s). "
+            f"{len(self.canvas.polygons)} remain.",
+        )
+
     def update_image_tilt(self):
         self.canvas.image_tilt = self.image_tilt_slider.value()
         self.canvas.apply_effects()
@@ -2348,42 +2565,142 @@ class MainWindow(QMainWindow):
 
         try:
             # ── Coordinate reconciliation ────────────────────────────
-            # Two mismatches to bake into the saved file so the receiver
-            # (mosaic_editor.py or any tool that assumes "polygon (0,0)
-            # = image pixel (0,0)") gets a correctly aligned mosaic:
+            # image_strech's paintEvent renders three layers that all
+            # need to land in the saved bundle in the SAME reference
+            # frame so the receiver can reconstruct the exact picture:
             #
-            #   1. Effects layer:
-            #      paintEvent draws self.canvas.display_image (which has
-            #      tilt / warp / sharpness applied), NOT cv_image. The
-            #      polygons were drawn on top of display_image, so save
-            #      display_image as the background.
+            #   1. display_image (cv_image with tilt / warp / sharpness
+            #      baked in). Drawn at (grid_offset_x, grid_offset_y)
+            #      in polygon-coord space — the image is what "pans"
+            #      when the user moves the grid.
             #
-            #   2. Grid pan offset:
-            #      paintEvent shifts the image by (grid_offset_x,
-            #      grid_offset_y) but leaves the polygons at their raw
-            #      world coords. So a polygon vertex stored as (px, py)
-            #      actually visually overlays image pixel
-            #      (px - grid_offset_x, py - grid_offset_y). Subtract
-            #      the grid offset before writing.
+            #   2. polygon_fill_images[idx] — per-polygon magnified
+            #      crops from Scale Polygons Image (the P-key
+            #      workflow). Clipped to each polygon shape and drawn
+            #      at the polygon's bbox in polygon-coord space.
+            #
+            #   3. Polygon outlines and vertices — cosmetic; not saved.
+            #
+            # The grid itself is fixed in polygon-coord space at (0, 0)
+            # with cell size = img_w * grid_size_percent / 100. So a
+            # polygon vertex stored at (px, py) sits on the grid at
+            # (px / cell, py / cell) grid boxes from the top-left grid
+            # intersection — REGARDLESS of grid_offset_x/y (grid pan
+            # only shifts the image beneath, not the grid).
+            #
+            # Save strategy:
+            #   * Composite layers 1 and 2 into a single "polygon-space"
+            #     image so pixel (0, 0) of the saved background sits at
+            #     polygon-coord (0, 0) → the same intersection the grid
+            #     starts at. No coord adjustment needed on the receiver.
+            #   * Save polygon CSV coords as (px / cell, py / cell) —
+            #     the polygon's grid position, unchanged by grid pan.
+            #   * Receiver samples background at (CSV_x * cell,
+            #     CSV_y * cell) → correct composite pixel.
 
-            bg_source = (self.canvas.display_image
-                         if self.canvas.display_image is not None
-                         else self.canvas.cv_image)
+            src_display = (self.canvas.display_image
+                           if self.canvas.display_image is not None
+                           else self.canvas.cv_image)
             gox = float(self.canvas.grid_offset_x)
             goy = float(self.canvas.grid_offset_y)
-
-            # Compute the source's grid-box size in image pixels. Every
-            # polygon coordinate is then divided by these so the CSV
-            # holds values in GRID-BOX UNITS (1 unit = 1 grid box on
-            # this image). The manifest records the pixel size so a
-            # receiver can rescale to its own grid at load time.
-            img_h, img_w = bg_source.shape[:2]
-            source_cell_w_px = max(1.0,
+            gox_i = int(round(gox))
+            goy_i = int(round(goy))
+            img_h, img_w = src_display.shape[:2]
+            source_cell_px = max(1.0,
                 float(img_w) * self.canvas.grid_size_percent / 100.0)
-            source_cell_h_px = max(
-                1.0,
-                source_cell_w_px / max(0.01, self.canvas.grid_aspect_ratio),
-            )
+
+            # Composite canvas size in polygon-coord space. Must
+            # encompass the panned image AND every polygon's bbox so
+            # nothing gets clipped off. Round up so bordering polygons
+            # still sample from a fully-covered edge.
+            polys_pts = [pts for pts in self.canvas.polygons
+                         if pts and len(pts) >= 3]
+            xs_all = [x for pts in polys_pts for (x, _) in pts]
+            ys_all = [y for pts in polys_pts for (_, y) in pts]
+            right_edge = max(gox_i + img_w,
+                             int(np.ceil(max(xs_all))) if xs_all else 0)
+            bottom_edge = max(goy_i + img_h,
+                              int(np.ceil(max(ys_all))) if ys_all else 0)
+            composite_w = max(1, right_edge)
+            composite_h = max(1, bottom_edge)
+
+            # White background — anywhere the image and polygons don't
+            # cover (e.g. beyond the image edge after a grid pan) reads
+            # as neutral instead of transparent black.
+            composite = np.full((composite_h, composite_w, 3), 255,
+                                dtype=np.uint8)
+
+            # Paste display_image at (gox_i, goy_i) with bounds
+            # clipping so a negative or oversize pan doesn't crash.
+            dx0 = max(0, gox_i)
+            dy0 = max(0, goy_i)
+            dx1 = min(composite_w, gox_i + img_w)
+            dy1 = min(composite_h, goy_i + img_h)
+            if dx1 > dx0 and dy1 > dy0:
+                sx0 = dx0 - gox_i
+                sy0 = dy0 - goy_i
+                composite[dy0:dy1, dx0:dx1] = src_display[
+                    sy0:sy0 + (dy1 - dy0),
+                    sx0:sx0 + (dx1 - dx0),
+                ]
+
+            # Overlay polygon_fill_images (Scale Polygons Image
+            # results). Each fill lives in a QImage sized to the
+            # polygon's bbox; blit it in, masked by the polygon shape,
+            # so only the interior gets the magnified pixels.
+            fill_dict = getattr(self.canvas, 'polygon_fill_images', {})
+            for idx, poly in enumerate(self.canvas.polygons):
+                if not poly or len(poly) < 3:
+                    continue
+                warped = fill_dict.get(idx)
+                if warped is None or warped.isNull():
+                    continue
+                xs_ = [p[0] for p in poly]
+                ys_ = [p[1] for p in poly]
+                min_x, min_y = min(xs_), min(ys_)
+                max_x, max_y = max(xs_), max(ys_)
+                bw = int(round(max_x - min_x))
+                bh = int(round(max_y - min_y))
+                if bw <= 0 or bh <= 0:
+                    continue
+                warped_rgb = warped.convertToFormat(QImage.Format_RGB888)
+                if (warped_rgb.width() != bw or
+                    warped_rgb.height() != bh):
+                    warped_rgb = warped_rgb.scaled(bw, bh)
+                w = warped_rgb.width()
+                h = warped_rgb.height()
+                bpl = warped_rgb.bytesPerLine()
+                ptr = warped_rgb.constBits()
+                ptr.setsize(bpl * h)
+                arr = (np.frombuffer(ptr, dtype=np.uint8)
+                       .reshape(h, bpl)[:, :w * 3]
+                       .reshape(h, w, 3).copy())
+                # Polygon shape mask in warped-image-local coords.
+                mask = np.zeros((h, w), dtype=np.uint8)
+                poly_local = np.array(
+                    [[int(round(px - min_x)),
+                      int(round(py - min_y))]
+                     for (px, py) in poly],
+                    dtype=np.int32,
+                )
+                cv2.fillPoly(mask, [poly_local], 255)
+                # Paste with bounds clipping in composite coords.
+                px0 = max(0, int(round(min_x)))
+                py0 = max(0, int(round(min_y)))
+                px1 = min(composite_w, px0 + w)
+                py1 = min(composite_h, py0 + h)
+                if px1 <= px0 or py1 <= py0:
+                    continue
+                sx0 = px0 - int(round(min_x))
+                sy0 = py0 - int(round(min_y))
+                sx1 = sx0 + (px1 - px0)
+                sy1 = sy0 + (py1 - py0)
+                region_mask = mask[sy0:sy1, sx0:sx1] > 0
+                region_arr = arr[sy0:sy1, sx0:sx1]
+                composite[py0:py1, px0:px1][region_mask] = \
+                    region_arr[region_mask]
+
+            bg_source = composite
 
             # 1. Build polygons.csv in memory (save_array-compatible schema).
             csv_buf = io.StringIO()
@@ -2395,13 +2712,13 @@ class MainWindow(QMainWindow):
             for i, pts in enumerate(self.canvas.polygons):
                 if not pts or len(pts) < 3:
                     continue
-                # Grid-pan subtracted so (0, 0) is the top-left grid
-                # intersection on the source image, then divided by the
-                # source cell size so `(1, 0)` means "one grid box to
-                # the right of origin" regardless of image resolution.
+                # CSV coords = polygon vertex / source cell size. The
+                # polygon stays where the user placed it on the grid;
+                # grid_offset was absorbed by shifting the image inside
+                # the composite, so no per-vertex subtraction here.
                 coords_json = json.dumps([
-                    [(float(x) - gox) / source_cell_w_px,
-                     (float(y) - goy) / source_cell_h_px]
+                    [float(x) / source_cell_px,
+                     float(y) / source_cell_px]
                     for (x, y) in pts
                 ])
                 # Color columns kept for schema compatibility; 0,0,0,0
@@ -2409,9 +2726,10 @@ class MainWindow(QMainWindow):
                 writer.writerow([i, coords_json, 0.0, 0.0, 0.0, 0.0])
 
             # 2. Encode background as PNG (RGB numpy → PNG bytes).
-            #    cv2.imencode expects BGR, but display_image / cv_image
-            #    are stored as RGB throughout this file — swap once
-            #    before encoding so the PNG has the correct colors.
+            #    cv2.imencode expects BGR, but the composite (and
+            #    display_image / cv_image) are stored as RGB — swap
+            #    once before encoding so the PNG has the correct
+            #    colors.
             bgr = cv2.cvtColor(bg_source, cv2.COLOR_RGB2BGR)
             ok, png_buf = cv2.imencode('.png', bgr)
             if not ok:
@@ -2438,8 +2756,11 @@ class MainWindow(QMainWindow):
                 # to resample the background when it samples per-polygon
                 # fills.
                 "coord_system":         "grid_units",
-                "source_cell_size_px":  [float(source_cell_w_px),
-                                          float(source_cell_h_px)],
+                # Same value for x and y — the CSV coords were divided
+                # by this single number for both axes to preserve the
+                # polygon's image-pixel shape across the round-trip.
+                "source_cell_size_px":  [float(source_cell_px),
+                                          float(source_cell_px)],
                 "notes": (
                     "polygons.csv schema matches save_array in the "
                     "sibling scripts. Colors are 0,0,0,0 — the intended "
@@ -2448,8 +2769,11 @@ class MainWindow(QMainWindow):
                     "(v2): one unit = one grid box on the source; "
                     "multiply by the receiver's own grid box size (in "
                     "world units) to place the mosaic on the receiver's "
-                    "grid. Grid pan offset already subtracted; tilt / "
-                    "warp already baked into the saved background image."
+                    "grid. The background is a POLYGON-SPACE composite: "
+                    "grid pan is folded into the image position, and "
+                    "Scale-Polygons-Image magnified fills are baked in "
+                    "at each polygon's location. Tilt / warp / sharpness "
+                    "are already applied."
                 ),
             }
 
