@@ -394,6 +394,12 @@ class MosaicCanvas(QWidget):
         # Interaction state.
         self.selected_index = -1
         self._dragging_polygon = False
+        # Shift+click copy workflow — holding Shift and clicking a
+        # polygon sets it as the SOURCE for subsequent Shift+clicks,
+        # each of which drops a copy of the source centred on the
+        # clicked world point. Releasing Shift clears the source so
+        # the next Shift+click starts a fresh selection.
+        self._shift_copy_src_index: int = -1
         self._drag_start_world = (0.0, 0.0)
         self._drag_start_points: list[tuple[float, float]] = []
         self._drag_start_bbox: tuple | None = None
@@ -1586,11 +1592,15 @@ class MosaicCanvas(QWidget):
             painter.drawPolygon(qpoly)
         # 'none' → nothing filled
 
-        # Outline (thicker + red when selected). Skipped entirely when
-        # `show_polygon_lines` is off — unless the polygon is the
-        # selected one, whose red outline is always drawn so the user
-        # can still see what they're editing.
-        if i == self.selected_index:
+        # Outline (thicker + red when selected, thicker + magenta
+        # when it's the Shift+copy source so the user can see what
+        # is about to be duplicated). Skipped otherwise when
+        # `show_polygon_lines` is off.
+        if i == self._shift_copy_src_index:
+            painter.setPen(QPen(QColor(255, 0, 220), 3))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPolygon(qpoly)
+        elif i == self.selected_index:
             painter.setPen(QPen(QColor(255, 30, 30), 3))
             painter.setBrush(Qt.NoBrush)
             painter.drawPolygon(qpoly)
@@ -1617,10 +1627,26 @@ class MosaicCanvas(QWidget):
 
     # ── zoom / pan ────────────────────────────────────────────────────
     def wheelEvent(self, ev):
-        # Zoom around cursor.
+        # Alt + wheel on a selected polygon rotates it around its
+        # centroid in 1° steps instead of zooming the view. Qt on
+        # some platforms re-routes a wheel-with-Alt into the
+        # HORIZONTAL axis — if angleDelta().y() is 0, fall through
+        # to .x() so the rotation still fires on those systems.
+        alt_held = bool(ev.modifiers() & Qt.AltModifier)
+        if alt_held and 0 <= self.selected_index < len(self.polygons):
+            ang = ev.angleDelta()
+            d = ang.y() if ang.y() != 0 else ang.x()
+            if d == 0:
+                ev.accept()
+                return
+            step_deg = 1.0 if d > 0 else -1.0
+            self._rotate_selected_polygon(step_deg)
+            ev.accept()
+            return
         delta = ev.angleDelta().y()
         if delta == 0:
             return
+        # Zoom around cursor (default behavior).
         factor = 1.25 if delta > 0 else (1.0 / 1.25)
         # Keep world point under cursor fixed.
         cx, cy = ev.x(), ev.y()
@@ -1629,6 +1655,58 @@ class MosaicCanvas(QWidget):
         # Reset pan so (wx, wy) still maps to (cx, cy).
         self.pan_x = cx - wx * self.zoom_factor
         self.pan_y = cy - wy * self.zoom_factor
+        self.update()
+
+    def _rotate_selected_polygon(self, angle_deg: float) -> None:
+        """Rotate the selected polygon around its own centroid.
+
+        Only `points` moves — `orig_points` and `orig_fill_qimg` are
+        the stable warp reference, so leaving them alone and running
+        `warp_fill_piecewise_affine(orig → new_points)` after every
+        notch keeps the fill image resampled from the ORIGINAL each
+        time. That way repeated rotations don't accumulate blur the
+        way "rotate the pixels in place" would — the fill quality is
+        identical whether you spin 15° once or 15° × 24 and back to
+        the start."""
+        import math
+        i = self.selected_index
+        if not (0 <= i < len(self.polygons)):
+            return
+        poly = self.polygons[i]
+        pts = poly.get('points') or []
+        if len(pts) < 3:
+            return
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        ang = math.radians(angle_deg)
+        cos_a = math.cos(ang)
+        sin_a = math.sin(ang)
+
+        def _rot(x, y):
+            dx = x - cx
+            dy = y - cy
+            return (cx + dx * cos_a - dy * sin_a,
+                    cy + dx * sin_a + dy * cos_a)
+
+        self._push_undo()
+        new_pts = [_rot(float(x), float(y)) for (x, y) in pts]
+        poly['points'] = new_pts
+
+        # Image-filled polygons need their fill resampled to the new
+        # shape. Solid / none fills just need the outline update that
+        # comes with the point change.
+        if poly.get('fill_type') == 'image':
+            orig_qimg = poly.get('orig_fill_qimg')
+            orig_bbox = poly.get('orig_fill_bbox')
+            orig_pts  = poly.get('orig_points')
+            if orig_qimg is not None and orig_bbox is not None \
+                    and orig_pts and len(orig_pts) == len(new_pts):
+                new_qimg, new_bbox = warp_fill_piecewise_affine(
+                    orig_qimg, orig_bbox, orig_pts, new_pts,
+                )
+                if new_qimg is not None:
+                    poly['fill_qimg'] = new_qimg
+                    poly['fill_bbox'] = new_bbox
         self.update()
 
     def mousePressEvent(self, ev):
@@ -1658,6 +1736,28 @@ class MosaicCanvas(QWidget):
             self._erase_polygons_under(wx, wy)
             return
         if ev.button() == Qt.LeftButton:
+            # Shift+LMB — copy workflow. First Shift+click sets the
+            # SOURCE polygon; every subsequent Shift+click drops a
+            # copy centred on the clicked world point. Keeps running
+            # until Shift is released. Takes priority over vertex-
+            # drag / normal pick so holding Shift doesn't accidentally
+            # grab a handle on the source polygon.
+            if ev.modifiers() & Qt.ShiftModifier:
+                wx, wy = self.screen_to_world(ev.x(), ev.y())
+                if self._shift_copy_src_index < 0:
+                    # Source-pick phase: must click INSIDE a polygon.
+                    idx = self._pick_polygon_at(wx, wy)
+                    if idx >= 0:
+                        self._shift_copy_src_index = idx
+                        self.selected_index = idx
+                        self.update()
+                    return
+                # Copy phase: drop a translated copy of the source at
+                # (wx, wy). Stays in copy mode so repeat clicks keep
+                # placing copies.
+                self._shift_copy_duplicate_at(wx, wy)
+                return
+
             # Priority: if a polygon is currently selected and the click
             # landed near one of its vertices, enter vertex-drag mode
             # BEFORE running the polygon-pick logic (so users can grab
@@ -1917,6 +2017,20 @@ class MosaicCanvas(QWidget):
             self.zoom_polygon_image(factor)
             return
 
+    def keyReleaseEvent(self, ev):
+        """Releasing Shift ends the Shift+click copy workflow — the
+        next Shift+press picks a fresh source instead of pasting onto
+        the stale one. Doesn't affect selection; the user may still
+        want to see / edit the polygon that was serving as the
+        source."""
+        if ev.key() in (Qt.Key_Shift, Qt.Key_unknown) \
+                and not (ev.modifiers() & Qt.ShiftModifier) \
+                and self._shift_copy_src_index != -1:
+            self._shift_copy_src_index = -1
+            self.update()
+            return
+        super().keyReleaseEvent(ev)
+
     def erase_affected(self) -> tuple[int, int]:
         """Delete every polygon that belongs to a layer whose ⇢
         (affected) checkbox is on, then remove those layer groups
@@ -2095,6 +2209,69 @@ class MosaicCanvas(QWidget):
         self._restretch_fill_to_current_shape(poly)
         self.update()
         return True
+
+    def _shift_copy_duplicate_at(self, wx: float, wy: float) -> None:
+        """Drop a copy of `self.polygons[self._shift_copy_src_index]`
+        with its CENTROID at world (wx, wy).
+
+        Everything the source carries is cloned (points, fill image &
+        bbox, orig_* warp reference, source_points, image_zoom, color,
+        fill_type, group_id). QImage buffers are shared by reference
+        because the editor only ever REPLACES these fields during
+        edits, never mutates the underlying pixel data in place — a
+        cheap, safe share. Points and bboxes are translated by the
+        (click − centroid) delta so the shape lands exactly where the
+        user clicked. Pushes undo so Ctrl+Z backs out the copy."""
+        i = self._shift_copy_src_index
+        if not (0 <= i < len(self.polygons)):
+            # Source got deleted or indices shifted underneath us;
+            # fall out of copy mode so the next Shift+click re-picks.
+            self._shift_copy_src_index = -1
+            return
+        src = self.polygons[i]
+        pts = src.get('points') or []
+        if len(pts) < 3:
+            return
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        dx = wx - cx
+        dy = wy - cy
+
+        def _shift_pts(seq):
+            return [(float(x) + dx, float(y) + dy) for (x, y) in seq]
+
+        def _shift_bbox(bb):
+            if bb is None:
+                return None
+            x0, y0, w, h = bb
+            return (float(x0) + dx, float(y0) + dy,
+                    float(w), float(h))
+
+        self._push_undo()
+        new_poly = {
+            'points':         _shift_pts(pts),
+            'color':          QColor(src['color']),
+            'fill_type':      src.get('fill_type', 'none'),
+            'fill_qimg':      src.get('fill_qimg'),
+            'fill_bbox':      _shift_bbox(src.get('fill_bbox')),
+            'orig_points':    _shift_pts(src.get('orig_points')
+                                         or pts),
+            'orig_fill_qimg': src.get('orig_fill_qimg'),
+            'orig_fill_bbox': _shift_bbox(src.get('orig_fill_bbox')),
+            'image_zoom':     float(src.get('image_zoom', 1.0)),
+            'group_id':       src['group_id'],
+        }
+        # source_points lives in BG-pixel coords (not world coords), so
+        # it is NOT translated by (dx, dy). The copy samples the same
+        # source region as the original — exactly what the user wants
+        # when duplicating a tile pattern. CSV-only polygons store the
+        # key as None (no backing image to resample from), so guard
+        # against that before trying to list() it.
+        sp = src.get('source_points')
+        if sp:
+            new_poly['source_points'] = list(sp)
+        self.polygons.append(new_poly)
+        self.update()
 
     def _pick_polygon_at(self, wx: float, wy: float) -> int:
         # Iterate from top (last drawn) to bottom, respecting group vis.

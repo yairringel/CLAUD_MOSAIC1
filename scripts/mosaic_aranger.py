@@ -106,8 +106,62 @@ class ArrangerCanvas(QWidget):
         # ESC (or clicking the same cell twice) clears the selection.
         self.selected_placed_index: int = -1
 
+        # Undo stack — snapshots of (placed_tiles, selected index)
+        # pushed BEFORE every mutation (place / move / copy / rotate /
+        # delete / load). Shallow-copies each tile dict so later
+        # in-place rotations on a dropped tile don't retroactively
+        # mutate an earlier snapshot. Capped so a long session can't
+        # bloat memory indefinitely.
+        self._undo_stack: list[dict] = []
+        self._UNDO_LIMIT = 200
+
         # Widget needs keyboard focus for the ESC-to-release shortcut.
         self.setFocusPolicy(Qt.StrongFocus)
+
+    # ── undo plumbing ──────────────────────────────────────────────────
+    def _snapshot_state(self) -> dict:
+        """Snapshot the state Undo restores.
+
+        Tile dicts are shallow-copied (so later in-place field
+        changes — rotation, row/col — don't rewrite history), but
+        the QPixmap inside each dict is a reference share: pixmaps
+        are only replaced by Undo, never mutated in place, so sharing
+        is safe. Pending placement state is NOT snapshotted — Undo
+        only reverts the committed placed_tiles list; whatever tile
+        was armed stays armed."""
+        return {
+            'tiles':    [dict(t) for t in self.placed_tiles],
+            'selected': self.selected_placed_index,
+        }
+
+    def push_undo(self) -> None:
+        """Record the current committed state. Callers invoke this
+        BEFORE a mutation they want to be undoable."""
+        self._undo_stack.append(self._snapshot_state())
+        if len(self._undo_stack) > self._UNDO_LIMIT:
+            # Drop oldest frames rather than refuse new ones — stale
+            # history is less valuable than the most recent actions.
+            del self._undo_stack[: len(self._undo_stack) - self._UNDO_LIMIT]
+
+    def undo(self) -> bool:
+        """Pop the newest snapshot and restore it. Returns True if an
+        undo actually happened. ESC-only side state (pending tile /
+        batch / export pick) is cleared so a tile armed between the
+        snapshot and now doesn't paste over the restored canvas on
+        the next click."""
+        if not self._undo_stack:
+            return False
+        snap = self._undo_stack.pop()
+        self.placed_tiles = snap['tiles']
+        self.selected_placed_index = int(snap['selected'])
+        self.pending_tile  = None
+        self.pending_batch = None
+        self._export_stage = None
+        self._export_tl = None
+        self._export_callback = None
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+        return True
 
     def set_show_grid(self, on: bool) -> None:
         on = bool(on)
@@ -463,7 +517,11 @@ class ArrangerCanvas(QWidget):
     def keyPressEvent(self, ev):
         """ESC releases: clears any pending placement AND any current
         placed-tile selection. Del / Backspace erases the currently
-        selected placed tile. Other keys fall through."""
+        selected placed tile. Space rotates it 90°. Ctrl+Z undoes the
+        last mutating action. Other keys fall through."""
+        if ev.key() == Qt.Key_Z and (ev.modifiers() & Qt.ControlModifier):
+            self.undo()
+            return
         if ev.key() == Qt.Key_Escape:
             changed = (self.pending_tile is not None
                        or self.pending_batch is not None
@@ -481,6 +539,7 @@ class ArrangerCanvas(QWidget):
             return
         if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             if 0 <= self.selected_placed_index < len(self.placed_tiles):
+                self.push_undo()
                 del self.placed_tiles[self.selected_placed_index]
                 self.selected_placed_index = -1
                 self.update()
@@ -490,6 +549,7 @@ class ArrangerCanvas(QWidget):
             # 0 / 90 / 180 / 270. Rotation persists on the tile so
             # subsequent moves / copies / saves carry it too.
             if 0 <= self.selected_placed_index < len(self.placed_tiles):
+                self.push_undo()
                 tile = self.placed_tiles[self.selected_placed_index]
                 tile['rotation'] = (int(tile.get('rotation', 0)) + 90) % 360
                 self.update()
@@ -533,6 +593,7 @@ class ArrangerCanvas(QWidget):
 
         # Batch placement wins over single tile when armed.
         if self.pending_batch is not None:
+            self.push_undo()
             # Clear any existing tiles from every cell the batch will
             # touch, so the batch fully replaces prior content there.
             targets = {(row + int(item.get('dr', 0)),
@@ -553,6 +614,7 @@ class ArrangerCanvas(QWidget):
             return
 
         if self.pending_tile is not None:
+            self.push_undo()
             # Replace anything already sitting on this cell.
             self._remove_tiles_at(row, col)
             self.placed_tiles.append({
@@ -578,6 +640,12 @@ class ArrangerCanvas(QWidget):
             sel_idx = self.selected_placed_index
             tile = self.placed_tiles[sel_idx]
             shift = bool(ev.modifiers() & Qt.ShiftModifier)
+            same_cell = (tile['row'] == row and tile['col'] == col)
+            # Only a shift-copy or a true move counts as a mutation
+            # worth remembering; a same-cell click without shift just
+            # deselects and doesn't touch placed_tiles.
+            if shift or not same_cell:
+                self.push_undo()
             if shift:
                 # Copy: clear the target cell (any pre-existing tiles
                 # there — but NOT the source, which stays put) then
@@ -593,7 +661,7 @@ class ArrangerCanvas(QWidget):
                     'col':         col,
                 })
             else:
-                if not (tile['row'] == row and tile['col'] == col):
+                if not same_cell:
                     # Move: erase anything else at the destination, then
                     # relocate this tile there. _remove_tiles_at may
                     # renumber the list, so re-fetch the tile via the
@@ -669,6 +737,18 @@ class SidePanel(QFrame):
         self.export_btn.clicked.connect(self._on_export_image)
         layout.addWidget(self.export_btn)
 
+        # Undo — reverts the last canvas-mutating action (place,
+        # move, shift-copy, batch paste, delete, rotate, or Load
+        # Project). Also wired to Ctrl+Z inside the canvas. Does
+        # nothing when the stack is empty.
+        self.undo_btn = QPushButton("Undo")
+        self.undo_btn.setToolTip(
+            "Revert the last action on the canvas (place / move / "
+            "copy / rotate / delete / load). Shortcut: Ctrl+Z."
+        )
+        self.undo_btn.clicked.connect(self._on_undo)
+        layout.addWidget(self.undo_btn)
+
         # ── Grid section ──────────────────────────────────────────────
         # Two direct-input spinboxes for the grid's column × row count.
         # Value changes push straight to the canvas, which clamps to
@@ -726,6 +806,12 @@ class SidePanel(QFrame):
             self.cols_spin.value(),
             self.rows_spin.value(),
         )
+
+    def _on_undo(self) -> None:
+        """Button click → canvas.undo(). Pulls focus back to the canvas
+        so Ctrl+Z keeps working after the mouse touched the sidebar."""
+        self.canvas.undo()
+        self.canvas.setFocus(Qt.OtherFocusReason)
 
     # ── project save / load ──────────────────────────────────────────
     def _on_save_project(self) -> None:
@@ -1419,6 +1505,9 @@ class MosaicArrangerWindow(QMainWindow):
                 'row':         int(t.get('row', 0)),
                 'col':         int(t.get('col', 0)),
             })
+        # Loading replaces the whole arrangement — snapshot the
+        # pre-load state so Ctrl+Z backs out of an unintended Load.
+        self.canvas.push_undo()
         self.canvas.placed_tiles = new_tiles
         self.canvas.clear_pending_tile()
         # Fresh scene → no placed-tile selection carried over.

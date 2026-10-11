@@ -123,8 +123,120 @@ class ImageCanvas(QWidget):
         self.dragging_circle_index = None   # moving a circle by its center
         self.dragging_circle_offset = (0, 0)
         self.resizing_circle_index = None   # resizing by dragging the edge
+
+        # Freehand eraser — same model as mosaic_editor's Delete tool.
+        # When eraser_mode is on, LMB drag deletes any polygon whose
+        # centroid OR any vertex is within eraser_radius image-pixels
+        # of the cursor. paintEvent draws a translucent red circle at
+        # the live cursor so the user can see the erase footprint at
+        # the current view zoom.
+        self.eraser_mode: bool = False
+        self.eraser_radius: float = 20.0        # image pixels
+        self._eraser_pressed: bool = False
+        self._eraser_mouse_screen: tuple = (0, 0)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumSize(400, 400)
+
+    # ── freehand eraser ────────────────────────────────────────────────
+    def set_eraser_mode(self, on: bool) -> None:
+        """Toggle the eraser tool. ON turns the cursor into a cross and
+        starts drawing the live erase circle; OFF restores the arrow
+        cursor. Entering eraser mode exits every other interactive mode
+        (stretch / draw polygon / draw circle / fill / sample-paste /
+        copy workflow) so the LMB has a single, unambiguous meaning
+        while the user is erasing."""
+        self.eraser_mode = bool(on)
+        if self.eraser_mode:
+            # Exit any mode that would also claim LMB.
+            self.selecting_mode        = False
+            self.drawing_polygon       = False
+            self.drawing_circle        = False
+            self.fill_mode             = False
+            self.sample_polygon_mode   = False
+            self.paste_polygon_mode    = False
+            self.copy_polygon_workflow = False
+            self.setCursor(Qt.CrossCursor)
+            self.setMouseTracking(True)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+            self._eraser_pressed = False
+        self.update()
+
+    def _erase_polygons_under(self, x: float, y: float) -> int:
+        """Delete every polygon whose centroid OR any vertex is within
+        `eraser_radius` image-pixels of (x, y). After the deletions,
+        re-key `polygon_fill_images` and `polygon_image_zoom` so the
+        per-polygon Scale-Polygons-Image overlays stay pointed at the
+        surviving polygons. Also fixes up `selected_polygon_index` so
+        the status-bar readout and vertex handles don't trail a stale
+        index. Returns the number of polygons removed."""
+        if not self.polygons:
+            return 0
+        r  = float(self.eraser_radius)
+        r2 = r * r
+        to_remove: list[int] = []
+        for i, poly in enumerate(self.polygons):
+            if not poly:
+                continue
+            # Centroid distance.
+            cx = sum(p[0] for p in poly) / len(poly)
+            cy = sum(p[1] for p in poly) / len(poly)
+            if (cx - x) ** 2 + (cy - y) ** 2 <= r2:
+                to_remove.append(i)
+                continue
+            # Any-vertex distance — catches polygons much larger than
+            # the eraser radius, where the centroid is far from the
+            # cursor but the user is clearly chewing on an edge.
+            for (px, py) in poly:
+                if (px - x) ** 2 + (py - y) ** 2 <= r2:
+                    to_remove.append(i)
+                    break
+        if not to_remove:
+            return 0
+
+        removed = set(to_remove)
+        # Build old-index → new-index map BEFORE mutating the list so
+        # the per-polygon fill / zoom dicts can be re-keyed to match
+        # the compacted polygon list.
+        remap: dict[int, int] = {}
+        new_idx = 0
+        for old_idx in range(len(self.polygons)):
+            if old_idx in removed:
+                continue
+            remap[old_idx] = new_idx
+            new_idx += 1
+
+        # Delete from highest index to lowest so earlier indices stay
+        # valid.
+        for idx in sorted(to_remove, reverse=True):
+            self.polygons.pop(idx)
+
+        old_fill = getattr(self, 'polygon_fill_images', None)
+        if isinstance(old_fill, dict) and old_fill:
+            self.polygon_fill_images = {
+                remap[k]: v for k, v in old_fill.items()
+                if k in remap
+            }
+        old_zoom = getattr(self, 'polygon_image_zoom', None)
+        if isinstance(old_zoom, dict) and old_zoom:
+            self.polygon_image_zoom = {
+                remap[k]: v for k, v in old_zoom.items()
+                if k in remap
+            }
+
+        # Fix up the selected-polygon index + sidebar signal.
+        if self.selected_polygon_index in removed:
+            self.selected_polygon_index = None
+            self.dragging_point_index = None
+            self.selection_changed.emit(-1)
+        elif self.selected_polygon_index is not None:
+            new_sel = remap.get(self.selected_polygon_index)
+            if new_sel != self.selected_polygon_index:
+                self.selected_polygon_index = new_sel
+                self.selection_changed.emit(
+                    new_sel if new_sel is not None else -1)
+        self.update()
+        return len(to_remove)
 
     def set_target_resolution(self, width, height):
         self.target_width = width
@@ -303,6 +415,18 @@ class ImageCanvas(QWidget):
         self.update()
 
     def mousePressEvent(self, event):
+        # Eraser mode takes the LMB over every other tool. First
+        # press starts a sweep; mouseMove with LMB held continues it;
+        # release stops it.
+        if self.eraser_mode and event.button() == Qt.LeftButton:
+            pos = event.pos()
+            self._eraser_mouse_screen = (pos.x(), pos.y())
+            self._eraser_pressed = True
+            label_offset = 30
+            img_x = (pos.x() - label_offset * self.scale_factor) / self.scale_factor
+            img_y = (pos.y() - label_offset * self.scale_factor) / self.scale_factor
+            self._erase_polygons_under(img_x, img_y)
+            return
         if self.image:
             pos = event.pos()
             # Account for label offset (30 pixels for grid labels)
@@ -497,6 +621,20 @@ class ImageCanvas(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event):
+        # Eraser cursor tracking — update the stored screen position
+        # every move so paintEvent can redraw the live circle, and
+        # if the user is holding LMB continue erasing under the
+        # cursor as it moves.
+        if self.eraser_mode:
+            pos = event.pos()
+            self._eraser_mouse_screen = (pos.x(), pos.y())
+            if self._eraser_pressed:
+                label_offset = 30
+                img_x = (pos.x() - label_offset * self.scale_factor) / self.scale_factor
+                img_y = (pos.y() - label_offset * self.scale_factor) / self.scale_factor
+                self._erase_polygons_under(img_x, img_y)
+            self.update()
+            return
         if self.selecting_mode and self.stretch_drag_start is not None:
             # Update current drag position for stretch rectangle
             pos = event.pos()
@@ -559,6 +697,9 @@ class ImageCanvas(QWidget):
              self.update()
 
     def mouseReleaseEvent(self, event):
+        if self.eraser_mode and self._eraser_pressed:
+            self._eraser_pressed = False
+            return
         if self.selecting_mode and self.stretch_drag_start is not None and self.stretch_drag_current is not None:
             # Convert rectangle to 4 points and perform stretch
             x1, y1 = self.stretch_drag_start
@@ -1235,6 +1376,26 @@ class ImageCanvas(QWidget):
             painter.setPen(QPen(Qt.yellow, 9))
             painter.drawPoint(QPointF(cx, cy))
 
+        # Eraser cursor — translucent red circle sitting on top of
+        # everything so the user always sees exactly how big the
+        # erase footprint is. Converted from the stored SCREEN cursor
+        # position to image-coord space each paint so panning / zoom
+        # changes between moves can't leave a stale circle behind.
+        # A cosmetic pen keeps the outline 2 px on screen at any zoom.
+        if self.eraser_mode:
+            sx, sy = self._eraser_mouse_screen
+            label_offset = 30
+            img_x = (sx - label_offset * self.scale_factor) / self.scale_factor
+            img_y = (sy - label_offset * self.scale_factor) / self.scale_factor
+            pen = QPen(QColor(255, 60, 60), 2)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(255, 60, 60, 60)))
+            painter.drawEllipse(
+                QPointF(img_x, img_y),
+                self.eraser_radius, self.eraser_radius,
+            )
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1526,6 +1687,32 @@ class MainWindow(QMainWindow):
         )
         erase_gridbox_btn.clicked.connect(self.erase_gridbox_polygons)
         cleanup_layout.addRow(erase_gridbox_btn)
+
+        # Freehand eraser — mosaic_editor's Delete tool, ported. Toggle
+        # on, LMB-drag the red circle over polygons to delete anything
+        # inside it. Radius is in image pixels so it scales naturally
+        # with the view zoom.
+        eraser_row = QHBoxLayout()
+        self.eraser_btn = QPushButton("Eraser")
+        self.eraser_btn.setCheckable(True)
+        self.eraser_btn.setToolTip(
+            "Freehand eraser. Toggle on, then LMB-drag the red "
+            "circle over polygons to delete anything whose centroid "
+            "or any vertex lands inside the circle."
+        )
+        self.eraser_btn.toggled.connect(self.on_eraser_toggled)
+        eraser_row.addWidget(self.eraser_btn)
+        self.eraser_radius_spin = QDoubleSpinBox()
+        self.eraser_radius_spin.setRange(1.0, 10000.0)
+        self.eraser_radius_spin.setDecimals(0)
+        self.eraser_radius_spin.setValue(self.canvas.eraser_radius)
+        self.eraser_radius_spin.setSuffix(" px")
+        self.eraser_radius_spin.setToolTip(
+            "Eraser radius in image pixels.")
+        self.eraser_radius_spin.valueChanged.connect(
+            self.on_eraser_radius_changed)
+        eraser_row.addWidget(self.eraser_radius_spin)
+        cleanup_layout.addRow("Freehand:", eraser_row)
 
         cleanup_group.setLayout(cleanup_layout)
         sidebar_layout.addWidget(cleanup_group)
@@ -1997,6 +2184,22 @@ class MainWindow(QMainWindow):
             predicate=lambda p: self._polygon_area(p) > n,
             description=f"area larger than {n} px²",
         )
+
+    def on_eraser_toggled(self, checked: bool) -> None:
+        """Sidebar toggle → canvas eraser mode. Status bar hint shows
+        what to do while the tool is on."""
+        self.canvas.set_eraser_mode(checked)
+        if checked:
+            self.statusBar().showMessage(
+                "Eraser ON — LMB-drag the red circle over polygons "
+                "to delete them. Toggle the button off when done."
+            )
+        else:
+            self.statusBar().clearMessage()
+
+    def on_eraser_radius_changed(self, v: float) -> None:
+        self.canvas.eraser_radius = float(v)
+        self.canvas.update()
 
     def erase_gridbox_polygons(self):
         """Open a grid checkbox dialog (same one Save Tile Image uses),
