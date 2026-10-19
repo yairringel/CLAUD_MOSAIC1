@@ -3111,6 +3111,21 @@ class MosaicEditorWindow(QMainWindow):
             return
         inverse_scale = current_cell_px / max(1e-9, target_cell_px)
 
+        # Final scale factor applied to every saved PNG once all tiles
+        # are written (e.g. 1.023 to pre-compensate firing shrinkage).
+        post_scale, ok = QInputDialog.getDouble(
+            self,
+            "Result Image Scale",
+            "Scale factor for the result images.\n\n"
+            "After all tiles are saved, every PNG is resized by this "
+            "factor (1.0 = no change).",
+            value=1.023,
+            min=0.001, max=100.0, decimals=4,
+        )
+        if not ok:
+            self.statusBar().showMessage("Save Tile Image cancelled.")
+            return
+
         mm  = float(self.tile_size_spin.value())
         dpi = int  (self.dpi_spin.value())
         try:
@@ -3118,6 +3133,13 @@ class MosaicEditorWindow(QMainWindow):
                 ox, oy, selected, dxf_dir, out_dir,
                 inverse_scale, current_cell_px, mm, dpi,
             )
+            if abs(post_scale - 1.0) > 1e-9:
+                failed = self._scale_saved_tiles(
+                    out_dir, saved, post_scale, dpi,
+                )
+                for label in failed:
+                    saved.remove(label)
+                    other.append(label)
         except Exception as e:
             QMessageBox.critical(
                 self, "Save Tile Image",
@@ -3130,6 +3152,8 @@ class MosaicEditorWindow(QMainWindow):
             f"was cut with that box's OFFSET boundary (color 5) from "
             f"the DXF, and carries DPI ({dpi}) in its pHYs metadata."
         )
+        if abs(post_scale - 1.0) > 1e-9:
+            msg += f"\n\nAll result images were scaled × {post_scale:g}."
         if no_dxf:
             msg += (f"\n\nSkipped (no box_<label>.dxf found or unreadable): "
                     f"{', '.join(no_dxf)}")
@@ -3463,6 +3487,46 @@ class MosaicEditorWindow(QMainWindow):
                         file=sys.stderr,
                     )
         return saved, no_dxf, other
+
+    def _scale_saved_tiles(self, out_dir: str, labels: list,
+                           factor: float, dpi: int) -> list:
+        """Resize every `<out_dir>/<label>.png` by `factor` (Lanczos),
+        keeping DPI in pHYs and rescaling the `mosaic_box_corners`
+        metadata (png_size_px + corners_px) so it still matches the
+        pixel content. Returns the labels that failed."""
+        from PIL import Image as _PILImage
+        from PIL.PngImagePlugin import PngInfo as _PngInfo
+
+        failed: list = []
+        for label in labels:
+            path = os.path.join(out_dir, f"{label}.png")
+            try:
+                with _PILImage.open(path) as im:
+                    im.load()
+                    raw_meta = im.info.get("mosaic_box_corners")
+                    new_w = max(1, int(round(im.width  * factor)))
+                    new_h = max(1, int(round(im.height * factor)))
+                    scaled = im.resize((new_w, new_h),
+                                       _PILImage.LANCZOS)
+                pnginfo = _PngInfo()
+                if raw_meta:
+                    meta = json.loads(raw_meta)
+                    meta["png_size_px"] = [new_w, new_h]
+                    meta["corners_px"] = [
+                        [float(round(x * factor, 3)),
+                         float(round(y * factor, 3))]
+                        for (x, y) in meta.get("corners_px", [])
+                    ]
+                    meta["post_scale"] = float(factor)
+                    pnginfo.add_text("mosaic_box_corners", json.dumps(meta))
+                scaled.save(
+                    path, format="PNG",
+                    dpi=(float(dpi), float(dpi)),
+                    pnginfo=pnginfo,
+                )
+            except Exception:
+                failed.append(label)
+        return failed
 
     def _write_tile_debug(self, out_dir: str, label: str,
                           dxf_path: str, polygon_world,
