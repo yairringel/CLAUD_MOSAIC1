@@ -1515,11 +1515,11 @@ class PhotoEditor(QMainWindow):
         # ceiling, red-square marker, background-fill). Those addenda
         # bring a lot of "self-check → regenerate" language that pushes
         # the image model past Gemini's per-request deadline. delete_gaps
-        # is a simple restyle, not a per-tile edit, so it doesn't need
-        # any of them.
+        # and widen_gaps_black are simple grout restyles, not per-tile
+        # edits, so they don't need any of them.
         stem = (self.current_prompt_path.stem.lower()
                 if self.current_prompt_path is not None else "")
-        if stem in {"delete_gaps"}:
+        if stem in {"delete_gaps", "widen_gaps_black"}:
             prompt_with_sizes = self.current_prompt_text or ""
         else:
             prompt_with_sizes = self._build_final_prompt()
@@ -1554,14 +1554,14 @@ class PhotoEditor(QMainWindow):
             aspect = GENERATION_ASPECT
 
         # Per-prompt output-size override: certain prompts (currently
-        # delete_gaps) do fine-grained local editing that regularly
-        # blows past the Gemini per-request deadline at 4K. Drop them
-        # to 2K for reliability. Every other prompt keeps the default
-        # GENERATION_IMAGE_SIZE ("4K").
+        # delete_gaps, widen_gaps_black) do fine-grained local editing
+        # that regularly blows past the Gemini per-request deadline at
+        # 4K. Drop them to 2K for reliability. Every other prompt keeps
+        # the default GENERATION_IMAGE_SIZE ("4K").
         image_size = GENERATION_IMAGE_SIZE
         if self.current_prompt_path is not None:
             stem = self.current_prompt_path.stem.lower()
-            if stem in {"delete_gaps"}:
+            if stem in {"delete_gaps", "widen_gaps_black"}:
                 image_size = "2K"
 
         self.worker = GenerationWorker(

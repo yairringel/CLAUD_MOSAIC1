@@ -1,0 +1,18 @@
+The supplied image is a mosaic — many stone tesserae separated by grout lines. Re-render it so the ONLY change is the grout: the gaps between stones become WIDER and are filled with SOLID PURE BLACK (#000000).
+
+What to keep EXACTLY:
+- Every stone: same position, same shape, same orientation, same color, same surface texture and veining. No stone is added, removed, moved, merged, split, recolored or restyled.
+- The overall subject, composition, aspect ratio and framing.
+- Even, diffuse top-down lighting.
+
+What to change:
+- Widen every gap between adjacent stones to roughly 2-3 times its current width, by trimming a thin even margin from each stone's edge. Each stone keeps its silhouette, only slightly smaller, still centered where it was.
+- Fill ALL gaps with flat solid pure black (#000000): no gray, no texture, no grout sand, no shadows, no highlights, no gradients inside the gaps.
+- Every stone must be fully surrounded by a continuous black gap — no two stones touch.
+- Gap width should be consistent across the whole image.
+
+Style:
+- Sharp, crisp edges between each stone and the black gap; no glow, no blur, no anti-aliased gray halo.
+- Matte surface, no perspective.
+
+Output the same mosaic, just with wider, solid-black gaps.
