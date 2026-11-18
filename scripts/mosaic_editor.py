@@ -37,9 +37,9 @@ from PyQt5.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QMessageBox, QScrollArea, QColorDialog,
     QInputDialog, QDialog, QDialogButtonBox,
 )
-from PyQt5.QtCore import Qt, QRectF, QPointF, QBuffer
+from PyQt5.QtCore import Qt, QRectF, QPointF, QBuffer, pyqtSignal
 from PyQt5.QtGui import (
-    QPainter, QColor, QPen, QBrush, QPixmap, QImage, QPolygonF,
+    QPainter, QColor, QPen, QBrush, QPixmap, QImage, QPolygonF, QCursor,
 )
 
 
@@ -337,6 +337,10 @@ def warp_fill_piecewise_affine(src_qimg: QImage, src_bbox, src_points,
 class MosaicCanvas(QWidget):
     """Zoom + pan + grid + polygon rendering + click/drag/delete."""
 
+    # Transfer Fill mode → main window (status bar text / button state).
+    transfer_status = pyqtSignal(str)
+    transfer_ended  = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(600, 500)
@@ -400,6 +404,13 @@ class MosaicCanvas(QWidget):
         # clicked world point. Releasing Shift clears the source so
         # the next Shift+click starts a fresh selection.
         self._shift_copy_src_index: int = -1
+        # Transfer Fill mode (right-toolbar button): 0 = off,
+        # 1 = picking the SOURCE polygon (cross cursor),
+        # 2 = picking TARGET polygons (cross-in-circle cursor). Each
+        # target click gets the source's fill scaled to cover it;
+        # stays in phase 2 until Escape.
+        self._transfer_phase: int = 0
+        self._transfer_src_index: int = -1
         self._drag_start_world = (0.0, 0.0)
         self._drag_start_points: list[tuple[float, float]] = []
         self._drag_start_bbox: tuple | None = None
@@ -1596,7 +1607,7 @@ class MosaicCanvas(QWidget):
         # when it's the Shift+copy source so the user can see what
         # is about to be duplicated). Skipped otherwise when
         # `show_polygon_lines` is off.
-        if i == self._shift_copy_src_index:
+        if i == self._shift_copy_src_index or i == self._transfer_src_index:
             painter.setPen(QPen(QColor(255, 0, 220), 3))
             painter.setBrush(Qt.NoBrush)
             painter.drawPolygon(qpoly)
@@ -1726,6 +1737,11 @@ class MosaicCanvas(QWidget):
             self.cancel_origin_pick()
             if cb is not None:
                 cb(ox, oy)
+            return
+        # Transfer Fill mode — LMB only picks source / target polygons.
+        if ev.button() == Qt.LeftButton and self._transfer_phase:
+            wx, wy = self.screen_to_world(ev.x(), ev.y())
+            self._transfer_fill_click(self._pick_polygon_at(wx, wy))
             return
         # Eraser tool wins over everything else while active — LMB
         # starts an erase pass, drag continues it.
@@ -1928,6 +1944,224 @@ class MosaicCanvas(QWidget):
             self.setCursor(Qt.ArrowCursor)
             self.update()
 
+    # ── Transfer Fill mode ────────────────────────────────────────────
+    @staticmethod
+    def _circle_cross_cursor() -> QCursor:
+        """Cross inside a circle, drawn twice (white under black) so it
+        reads on both light and dark fills."""
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        for color, width in ((QColor(255, 255, 255), 3), (QColor(0, 0, 0), 1)):
+            p.setPen(QPen(color, width))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(QPointF(16, 16), 10, 10)
+            p.drawLine(16, 2, 16, 30)
+            p.drawLine(2, 16, 30, 16)
+        p.end()
+        return QCursor(pm, 16, 16)
+
+    def start_transfer_fill(self) -> None:
+        """Enter Transfer Fill mode, phase 1 (pick the source)."""
+        self.cancel_origin_pick()
+        self._transfer_phase = 1
+        self._transfer_src_index = -1
+        self.setCursor(Qt.CrossCursor)
+        self.setFocus()             # so Escape reaches keyPressEvent
+        self.transfer_status.emit(
+            "Transfer Fill — click the SOURCE polygon. Esc to cancel."
+        )
+        self.update()
+
+    def cancel_transfer_fill(self) -> None:
+        """Leave Transfer Fill mode (Escape or toolbar button)."""
+        if not self._transfer_phase:
+            return
+        self._transfer_phase = 0
+        self._transfer_src_index = -1
+        self.setCursor(Qt.ArrowCursor)
+        self.transfer_status.emit("Transfer Fill off.")
+        self.transfer_ended.emit()
+        self.update()
+
+    def _transfer_fill_click(self, idx: int) -> None:
+        if idx < 0:
+            return
+        if self._transfer_phase == 1:
+            src = self.polygons[idx]
+            has_img = (src.get('fill_type') == 'image'
+                       and src.get('fill_qimg') is not None)
+            has_col = (src.get('fill_type') == 'solid'
+                       and src['color'].alpha() > 0)
+            if not (has_img or has_col):
+                self.transfer_status.emit(
+                    "That polygon has no fill to transfer — pick another."
+                )
+                return
+            self._transfer_src_index = idx
+            self._transfer_phase = 2
+            self.setCursor(self._circle_cross_cursor())
+            self.transfer_status.emit(
+                "Transfer Fill — click TARGET polygon(s) to fill them. "
+                "Esc to finish."
+            )
+            self.update()
+            return
+        src_i = self._transfer_src_index
+        if not (0 <= src_i < len(self.polygons)):
+            # Source vanished (undo / delete) — back to picking a source.
+            self._transfer_phase = 0
+            self.start_transfer_fill()
+            return
+        if idx == src_i:
+            return
+        if self.transfer_fill(src_i, idx):
+            self.transfer_status.emit(
+                "Fill transferred. Click another target, or Esc to finish."
+            )
+
+    def transfer_fill(self, src_i: int, dst_i: int) -> bool:
+        """Give polygon `dst_i` the fill of polygon `src_i`.
+
+        Solid source → target becomes the same solid colour.
+        Image source → the source polygon (its opaque fill pixels) is
+        scaled UNIFORMLY (no distortion) and positioned so the target
+        polygon lies completely INSIDE it, at the smallest scale that
+        achieves that. Every target pixel therefore samples real source
+        pixels — nothing is invented or left empty — and the result is
+        masked to the target outline. Undoable. Returns True if the
+        target changed."""
+        src = self.polygons[src_i]
+        dst = self.polygons[dst_i]
+        pts = dst.get('points') or []
+        if len(pts) < 3:
+            return False
+
+        if src.get('fill_type') != 'image' or src.get('fill_qimg') is None:
+            self._push_undo()
+            dst['fill_type'] = 'solid'
+            dst['color'] = QColor(src['color'])
+            for key in ('fill_qimg', 'fill_bbox',
+                        'orig_fill_qimg', 'orig_fill_bbox'):
+                dst[key] = None
+            dst['orig_points'] = list(pts)
+            dst['image_zoom'] = 1.0
+            self.update()
+            return True
+
+        s_rgba = _qimage_to_numpy_rgba(src['fill_qimg'])
+        if s_rgba is None or src.get('fill_bbox') is None:
+            return False
+        sx0, sy0, sw, sh = (float(v) for v in src['fill_bbox'])
+        H, W = s_rgba.shape[:2]
+        if sw <= 0 or sh <= 0:
+            return False
+        sdx, sdy = W / sw, H / sh              # source px per world unit
+
+        rgb = np.ascontiguousarray(s_rgba[:, :, :3])
+        # Usable source pixels: fully opaque, eroded by 1 px so bilinear
+        # sampling never blends in a transparent / black neighbour.
+        valid = cv2.erode((s_rgba[:, :, 3] == 255).astype(np.uint8),
+                          np.ones((3, 3), np.uint8))
+        if not valid.any():
+            return False
+
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        tx0, ty0 = min(xs), min(ys)
+        tw = max(1e-6, max(xs) - tx0)
+        th = max(1e-6, max(ys) - ty0)
+        tcx, tcy = tx0 + tw / 2.0, ty0 + th / 2.0
+        d = max(sdx, sdy, 1.0)                 # output px per world unit
+        ow = max(1, int(round(tw * d)))
+        oh = max(1, int(round(th * d)))
+
+        from PIL import Image as _PILImage, ImageDraw as _ImageDraw
+        mask_img = _PILImage.new('L', (ow, oh), 0)
+        _ImageDraw.Draw(mask_img).polygon(
+            [((px - tx0) * d, (py - ty0) * d) for (px, py) in pts], fill=255,
+        )
+        mask_arr = np.array(mask_img, dtype=np.uint8)
+
+        # Test points (world coords, relative to the target centre): the
+        # target's covered output pixels (subsampled) plus its vertices.
+        vy, vx = np.nonzero(mask_arr)
+        step = max(1, len(vx) // 8000)
+        tpx = np.concatenate([tx0 + (vx[::step] + 0.5) / d,
+                              np.array(xs, dtype=np.float64)]) - tcx
+        tpy = np.concatenate([ty0 + (vy[::step] + 0.5) / d,
+                              np.array(ys, dtype=np.float64)]) - tcy
+
+        # A target point p maps to source pixel  c + (p - t_centre) * sd / s,
+        # i.e. the source polygon is scaled by s around centre c. Find
+        # the (c, s) with the SMALLEST s for which every test point lands
+        # on a usable source pixel → target fully inside the source.
+        def _inside(cx, cy, s):
+            qx = np.floor(cx + tpx * sdx / s).astype(np.int64)
+            qy = np.floor(cy + tpy * sdy / s).astype(np.int64)
+            if qx.min() < 0 or qy.min() < 0 or qx.max() >= W or qy.max() >= H:
+                return False
+            return bool(valid[qy, qx].all())
+
+        # Candidate centres: the most interior source pixel + a grid of
+        # usable pixels across the source.
+        dist = cv2.distanceTransform(valid, cv2.DIST_L2, 3)
+        my, mx = np.unravel_index(int(np.argmax(dist)), dist.shape)
+        cands = [(mx + 0.5, my + 0.5)]
+        for gy in np.linspace(0, H - 1, 9):
+            for gx in np.linspace(0, W - 1, 9):
+                if valid[int(gy), int(gx)]:
+                    cands.append((int(gx) + 0.5, int(gy) + 0.5))
+
+        best = None                            # (s, cx, cy)
+        for cx, cy in cands:
+            lo, hi = 1e-4, 1e6                 # hi: target shrunk to ~a point
+            if not _inside(cx, cy, hi):
+                continue
+            if best is not None and not _inside(cx, cy, best[0]):
+                continue                       # can't beat the current best
+            for _ in range(40):                # bisect in log space
+                mid = (lo * hi) ** 0.5
+                if _inside(cx, cy, mid):
+                    hi = mid
+                else:
+                    lo = mid
+            if best is None or hi < best[0]:
+                best = (hi, cx, cy)
+        if best is None:
+            return False
+        s, cx, cy = best[0] * 1.01, best[1], best[2]   # 1 % safety margin
+
+        # Affine mapping each OUTPUT pixel centre to SOURCE sample coords.
+        M = np.array([
+            [sdx / (d * s), 0.0,
+             cx + (tx0 + 0.5 / d - tcx) * sdx / s - 0.5],
+            [0.0, sdy / (d * s),
+             cy + (ty0 + 0.5 / d - tcy) * sdy / s - 0.5],
+        ], dtype=np.float64)
+        out_rgb = cv2.warpAffine(
+            rgb, M, (ow, oh),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        out = np.dstack([out_rgb, mask_arr])
+        out = np.ascontiguousarray(out)
+        new_qimg = QImage(out.data, ow, oh, ow * 4,
+                          QImage.Format_RGBA8888).copy()
+
+        self._push_undo()
+        bbox = (tx0, ty0, ow / d, oh / d)
+        dst['fill_type'] = 'image'
+        dst['fill_qimg'] = new_qimg
+        dst['fill_bbox'] = bbox
+        dst['orig_fill_qimg'] = new_qimg.copy()
+        dst['orig_fill_bbox'] = bbox
+        dst['orig_points'] = list(pts)
+        dst['image_zoom'] = 1.0
+        self.update()
+        return True
+
     def set_eraser_mode(self, on: bool) -> None:
         """Toggle the eraser tool. When on, the mouse cursor becomes a
         blank pointer (we draw our own eraser-radius circle on top of
@@ -1996,6 +2230,9 @@ class MosaicCanvas(QWidget):
         if ev.key() == Qt.Key_Escape and self._picking_origin:
             self.cancel_origin_pick()
             return
+        if ev.key() == Qt.Key_Escape and self._transfer_phase:
+            self.cancel_transfer_fill()
+            return
         # Delete / Backspace removes the single currently-selected
         # polygon. The sidebar's "Erase Affected" button erases whole
         # layers instead — that's a heavier operation, so it's not
@@ -2016,6 +2253,48 @@ class MosaicCanvas(QWidget):
                                    else 1.25
             self.zoom_polygon_image(factor)
             return
+        # D → selected polygon 10 % darker, L → 10 % lighter. Lighter
+        # is the exact inverse (÷ 0.9) so D then L restores the colour
+        # (except where L clipped a channel at 255).
+        if ev.key() in (Qt.Key_D, Qt.Key_L):
+            factor = 0.9 if ev.key() == Qt.Key_D else 1.0 / 0.9
+            self.adjust_polygon_brightness(factor)
+            return
+
+    def adjust_polygon_brightness(self, factor: float) -> bool:
+        """Multiply the RGB of the selected polygon's fill by `factor`
+        (alpha untouched). Solid fills scale `color`; image fills scale
+        both `fill_qimg` and `orig_fill_qimg` so later vertex drags /
+        P-zooms (which re-derive from the original) keep the change.
+        Undoable. Returns True if a polygon was changed."""
+        if not (0 <= self.selected_index < len(self.polygons)):
+            return False
+        poly = self.polygons[self.selected_index]
+        self._push_undo()
+
+        c = poly.get('color')
+        if c is not None:
+            poly['color'] = QColor(
+                min(255, round(c.red()   * factor)),
+                min(255, round(c.green() * factor)),
+                min(255, round(c.blue()  * factor)),
+                c.alpha(),
+            )
+
+        def _scaled(qimg):
+            arr = _qimage_to_numpy_rgba(qimg)
+            if arr is None:
+                return qimg
+            rgb = arr[:, :, :3].astype(np.float32) * factor
+            arr[:, :, :3] = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+            h, w = arr.shape[:2]
+            return QImage(arr.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
+
+        for key in ('fill_qimg', 'orig_fill_qimg'):
+            if poly.get(key) is not None:
+                poly[key] = _scaled(poly[key])
+        self.update()
+        return True
 
     def keyReleaseEvent(self, ev):
         """Releasing Shift ends the Shift+click copy workflow — the
@@ -2727,6 +3006,26 @@ class MosaicEditorWindow(QMainWindow):
             self.on_eraser_radius_changed
         )
         rb.addWidget(self.eraser_radius_spin)
+
+        rb.addSpacing(10)
+
+        # Transfer Fill — click a source polygon, then target polygon(s);
+        # each target gets the source fill scaled to cover it. Esc ends.
+        self.transfer_fill_btn = QPushButton("Transfer\nFill")
+        self.transfer_fill_btn.setCheckable(True)
+        self.transfer_fill_btn.setFixedHeight(48)
+        self.transfer_fill_btn.setToolTip(
+            "Click a SOURCE polygon (cross cursor), then click TARGET\n"
+            "polygons (circled cross). Each target is filled with the\n"
+            "source image, scaled to cover it completely.\n"
+            "Esc to finish. Ctrl+Z to undo."
+        )
+        self.transfer_fill_btn.toggled.connect(self.on_transfer_fill_toggled)
+        self.canvas.transfer_status.connect(self.statusBar().showMessage)
+        self.canvas.transfer_ended.connect(
+            lambda: self.transfer_fill_btn.setChecked(False)
+        )
+        rb.addWidget(self.transfer_fill_btn)
 
         rb.addSpacing(10)
 
@@ -3676,8 +3975,20 @@ class MosaicEditorWindow(QMainWindow):
         png_path = os.path.join(out_dir, f"{label}_debug.png")
         base.save(png_path, format="PNG")
 
+    def on_transfer_fill_toggled(self, checked: bool) -> None:
+        """Toggle Transfer Fill mode from the right toolbar. Turns the
+        eraser off first — only one canvas tool at a time."""
+        if checked:
+            if self.delete_tool_btn.isChecked():
+                self.delete_tool_btn.setChecked(False)
+            self.canvas.start_transfer_fill()
+        else:
+            self.canvas.cancel_transfer_fill()
+
     def on_delete_tool_toggled(self, checked: bool) -> None:
         """Toggle the on-canvas eraser tool from the right toolbar."""
+        if checked and self.transfer_fill_btn.isChecked():
+            self.transfer_fill_btn.setChecked(False)
         self.canvas.set_eraser_mode(checked)
         if checked:
             self.statusBar().showMessage(
