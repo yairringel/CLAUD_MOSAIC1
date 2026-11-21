@@ -411,6 +411,8 @@ class MosaicCanvas(QWidget):
         # stays in phase 2 until Escape.
         self._transfer_phase: int = 0
         self._transfer_src_index: int = -1
+        # D / L scope — True = all polygons (toolbar checkbox).
+        self.brightness_all: bool = False
         self._drag_start_world = (0.0, 0.0)
         self._drag_start_points: list[tuple[float, float]] = []
         self._drag_start_bbox: tuple | None = None
@@ -2267,19 +2269,17 @@ class MosaicCanvas(QWidget):
         both `fill_qimg` and `orig_fill_qimg` so later vertex drags /
         P-zooms (which re-derive from the original) keep the change.
         Undoable. Returns True if a polygon was changed."""
-        if not (0 <= self.selected_index < len(self.polygons)):
+        # "All polygons" checkbox → apply to every polygon (one undo step);
+        # otherwise only the selected one.
+        if self.brightness_all:
+            targets = list(self.polygons)
+        elif 0 <= self.selected_index < len(self.polygons):
+            targets = [self.polygons[self.selected_index]]
+        else:
             return False
-        poly = self.polygons[self.selected_index]
+        if not targets:
+            return False
         self._push_undo()
-
-        c = poly.get('color')
-        if c is not None:
-            poly['color'] = QColor(
-                min(255, round(c.red()   * factor)),
-                min(255, round(c.green() * factor)),
-                min(255, round(c.blue()  * factor)),
-                c.alpha(),
-            )
 
         def _scaled(qimg):
             arr = _qimage_to_numpy_rgba(qimg)
@@ -2290,9 +2290,18 @@ class MosaicCanvas(QWidget):
             h, w = arr.shape[:2]
             return QImage(arr.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
 
-        for key in ('fill_qimg', 'orig_fill_qimg'):
-            if poly.get(key) is not None:
-                poly[key] = _scaled(poly[key])
+        for poly in targets:
+            c = poly.get('color')
+            if c is not None:
+                poly['color'] = QColor(
+                    min(255, round(c.red()   * factor)),
+                    min(255, round(c.green() * factor)),
+                    min(255, round(c.blue()  * factor)),
+                    c.alpha(),
+                )
+            for key in ('fill_qimg', 'orig_fill_qimg'):
+                if poly.get(key) is not None:
+                    poly[key] = _scaled(poly[key])
         self.update()
         return True
 
@@ -3026,6 +3035,20 @@ class MosaicEditorWindow(QMainWindow):
             lambda: self.transfer_fill_btn.setChecked(False)
         )
         rb.addWidget(self.transfer_fill_btn)
+
+        rb.addSpacing(10)
+
+        # D / L scope: checked → D/L darken/lighten ALL polygons,
+        # unchecked → only the selected polygon.
+        self.brightness_all_chk = QCheckBox("D/L: all\npolygons")
+        self.brightness_all_chk.setToolTip(
+            "Checked: D darkens / L lightens ALL polygons by 10%.\n"
+            "Unchecked: only the selected polygon. Ctrl+Z undoes."
+        )
+        self.brightness_all_chk.toggled.connect(
+            lambda on: setattr(self.canvas, 'brightness_all', bool(on))
+        )
+        rb.addWidget(self.brightness_all_chk)
 
         rb.addSpacing(10)
 

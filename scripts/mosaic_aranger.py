@@ -37,6 +37,13 @@ PROJECT_EXT = ".aranger"
 PROJECT_VERSION = 2
 
 
+def _half(v) -> float | int:
+    """Round to the nearest 0.5; return an int when whole so existing
+    integer-cell logic (equality checks, JSON) stays unchanged."""
+    v = round(float(v) * 2.0) / 2.0
+    return int(v) if v == int(v) else v
+
+
 class ArrangerCanvas(QWidget):
     """Central canvas — plain white background with an independently-
     sized cols × rows grid overlay. Cells are square (kept equal by
@@ -105,6 +112,9 @@ class ArrangerCanvas(QWidget):
         # topmost one there; the next click on any grid cell moves it.
         # ESC (or clicking the same cell twice) clears the selection.
         self.selected_placed_index: int = -1
+        # Side-panel "Click to Move" checkbox: when False, a click with
+        # a tile selected does NOT move it — it just re-selects.
+        self.click_move_enabled: bool = True
 
         # Undo stack — snapshots of (placed_tiles, selected index)
         # pushed BEFORE every mutation (place / move / copy / rotate /
@@ -554,6 +564,40 @@ class ArrangerCanvas(QWidget):
                 tile['rotation'] = (int(tile.get('rotation', 0)) + 90) % 360
                 self.update()
             return
+        # Arrow keys nudge the selected placed tile by HALF a grid cell
+        # in that direction. The tile stays selected so repeated presses
+        # keep moving it. row/col may become x.5 values.
+        if ev.key() == Qt.Key_F:
+            # Bring the selected tile to the TOP of the stack (drawn
+            # last) so it shows over any tiles sharing its place.
+            i = self.selected_placed_index
+            if 0 <= i < len(self.placed_tiles) - 1:
+                self.push_undo()
+                self.placed_tiles.append(self.placed_tiles.pop(i))
+                self.selected_placed_index = len(self.placed_tiles) - 1
+                self.update()
+            return
+        if ev.key() == Qt.Key_B:
+            # Send the selected tile to the BACK of the stack (drawn
+            # first) so other tiles sharing its place show over it.
+            i = self.selected_placed_index
+            if 0 < i < len(self.placed_tiles):
+                self.push_undo()
+                self.placed_tiles.insert(0, self.placed_tiles.pop(i))
+                self.selected_placed_index = 0
+                self.update()
+            return
+        _nudge = {Qt.Key_Left: (0, -0.5), Qt.Key_Right: (0, 0.5),
+                  Qt.Key_Up: (-0.5, 0), Qt.Key_Down: (0.5, 0)}
+        if ev.key() in _nudge:
+            if 0 <= self.selected_placed_index < len(self.placed_tiles):
+                self.push_undo()
+                tile = self.placed_tiles[self.selected_placed_index]
+                dr, dc = _nudge[ev.key()]
+                tile['row'] = _half(float(tile['row']) + dr)
+                tile['col'] = _half(float(tile['col']) + dc)
+                self.update()
+            return
         super().keyPressEvent(ev)
 
     def mousePressEvent(self, ev):
@@ -636,10 +680,11 @@ class ArrangerCanvas(QWidget):
         # stays put). Same-cell click without shift just deselects.
         # Otherwise, pick the topmost placed tile sitting on the
         # clicked cell and select it.
-        if 0 <= self.selected_placed_index < len(self.placed_tiles):
+        shift = bool(ev.modifiers() & Qt.ShiftModifier)
+        if (0 <= self.selected_placed_index < len(self.placed_tiles)
+                and (self.click_move_enabled or shift)):
             sel_idx = self.selected_placed_index
             tile = self.placed_tiles[sel_idx]
-            shift = bool(ev.modifiers() & Qt.ShiftModifier)
             same_cell = (tile['row'] == row and tile['col'] == col)
             # Only a shift-copy or a true move counts as a mutation
             # worth remembering; a same-cell click without shift just
@@ -680,13 +725,23 @@ class ArrangerCanvas(QWidget):
         # Nothing selected → try to pick the top tile at this cell.
         # Iterate in REVERSE so the last-drawn (visually topmost) tile
         # wins when several were dropped on the same cell.
+        # Hit-test against each tile's one-cell box so tiles nudged by
+        # half a cell (arrow keys) are still pickable.
+        cell, ox, oy, _gw, _gh = self._grid_layout()
+        fc = ((ev.x() - self.pan_x) / self.zoom_factor - ox) / cell
+        fr = ((ev.y() - self.pan_y) / self.zoom_factor - oy) / cell
         for idx in range(len(self.placed_tiles) - 1, -1, -1):
             t = self.placed_tiles[idx]
-            if t['row'] == row and t['col'] == col:
+            if (t['row'] <= fr < t['row'] + 1
+                    and t['col'] <= fc < t['col'] + 1):
                 self.selected_placed_index = idx
                 self.update()
                 return
-        # Empty cell click — nothing to do.
+        # Empty cell click — release any selection (only reachable with
+        # a selection when "Click to Move" is off).
+        if self.selected_placed_index != -1:
+            self.selected_placed_index = -1
+            self.update()
 
 
 class SidePanel(QFrame):
@@ -791,6 +846,19 @@ class SidePanel(QFrame):
         )
         self.show_grid_chk.toggled.connect(self.canvas.set_show_grid)
         layout.addWidget(self.show_grid_chk)
+
+        # Enable / disable "click another box to move the selected
+        # tile there". Off = clicking just selects (arrows / F / Space /
+        # Del still act on the selection; Shift+click still copies).
+        self.click_move_chk = QCheckBox("Click to Move")
+        self.click_move_chk.setChecked(canvas.click_move_enabled)
+        self.click_move_chk.setToolTip(
+            "On: with a tile selected, clicking another box moves the "
+            "tile there.\nOff: clicking only selects tiles."
+        )
+        self.click_move_chk.toggled.connect(
+            lambda on: setattr(self.canvas, 'click_move_enabled', bool(on)))
+        layout.addWidget(self.click_move_chk)
 
         layout.addStretch(1)
 
@@ -1433,8 +1501,8 @@ class MosaicArrangerWindow(QMainWindow):
                 'corners_px':  tile.get('corners_px'),
                 'label':       tile.get('label', ''),
                 'rotation':    int(tile.get('rotation', 0)) % 360,
-                'row':         int(tile.get('row', 0)),
-                'col':         int(tile.get('col', 0)),
+                'row':         _half(tile.get('row', 0)),
+                'col':         _half(tile.get('col', 0)),
             })
 
         payload = {
@@ -1502,8 +1570,8 @@ class MosaicArrangerWindow(QMainWindow):
                 'label':       t.get('label', ''),
                 'source_path': str(src),
                 'rotation':    int(t.get('rotation', 0)) % 360,
-                'row':         int(t.get('row', 0)),
-                'col':         int(t.get('col', 0)),
+                'row':         _half(t.get('row', 0)),
+                'col':         _half(t.get('col', 0)),
             })
         # Loading replaces the whole arrangement — snapshot the
         # pre-load state so Ctrl+Z backs out of an unintended Load.
